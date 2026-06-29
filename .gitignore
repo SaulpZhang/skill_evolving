@@ -40,3 +40,4 @@ refine-logs/
 
 config/
 docs/
+wandb/

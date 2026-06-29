@@ -28,22 +28,17 @@ REFLECT_PROMPT = """You completed a task and {outcome}.
 
 Task: {task}
 Skills used: {skills_used}
-All existing skills: {existing_skills}
-Trajectory:
-{trajectory}
+Existing skills: {existing_skills}
+Last actions: {trajectory}
 
-Review the skills above. You can suggest changes:
+Review skills. Options:
+- SKILL: name | description | content
+- UPDATE: name | description | content
+- DELETE: name
+- NO CHANGE
 
-- SKILL: name | description | content          (create a new skill)
-- UPDATE: name | description | content           (improve an existing skill)
-- DELETE: name                                    (remove useless skill)
-
-A good skill has:
-- name: short identifier
-- description: what this skill IS and WHEN to use it
-- content: step-by-step instructions
-
-If no changes needed: NO CHANGE"""
+Description must say what the skill IS and WHEN to use it.
+Your response:"""
 
 
 class SimpleAgent(BaseSkillEvolving):
@@ -81,10 +76,11 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=200):
+    def _chat(self, messages, max_tokens=128000):
         self._total_calls += 1
         return self._client.chat.completions.create(
             model=self._model, messages=messages, max_tokens=max_tokens,
+            temperature=0.3,
         ).choices[0].message.content.strip()
 
     def _available_skills(self) -> str:
@@ -135,11 +131,11 @@ class SimpleAgent(BaseSkillEvolving):
             outcome=outcome, task=goal, trajectory=traj,
             skills_used=skills_used, existing_skills=existing,
         )
-        result = self._chat([{"role": "user", "content": prompt}], max_tokens=300)
+        result = self._chat([{"role": "user", "content": prompt}])
         result_upper = result.upper().strip()
 
-        if result_upper == "NO CHANGE":
-            print(f"  >>> Reflection: no changes needed", flush=True)
+        if not result or result_upper == "NO CHANGE":
+            print(f"  >>> Reflection: {'no response' if not result else 'no changes needed'}", flush=True)
             return
 
         for line in result.split("\n"):
@@ -171,6 +167,7 @@ class SimpleAgent(BaseSkillEvolving):
 
     def execute(self, task_id: int) -> dict:
         goal = self._dataset.get_task_goal(task_id)
+        print(f"\n  --- Executing task {task_id}: {goal}", flush=True)
         env, env_id = self._dataset.create_env(task_id)
         obs_tuple, info = env.reset()
         obs = obs_tuple[0]
@@ -196,6 +193,7 @@ class SimpleAgent(BaseSkillEvolving):
             action = self._chat(messages + [{"role": "user", "content": msg}])
             actions.append(action)
             traj_lines.append(f"Agent: {action}")
+            print(f"    [{step}] {action}", flush=True)
 
             # Handle USE SKILL request
             if action.upper().startswith("USE SKILL:") and self._skills_dir:
@@ -225,9 +223,11 @@ class SimpleAgent(BaseSkillEvolving):
                 won_flag = isinstance(won, (list, tuple)) and len(won) > 0 and won[0]
                 if done_flag or won_flag or "You win!" in ob:
                     ALFWorldDataset.close_env(env, env_id)
+                    print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
                     traj = "\n".join(traj_lines)
                     return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
+                print(f"    -> {ob}", flush=True)
                 traj_lines.append(f"Obs: {ob}")
                 messages.append({"role": "assistant", "content": action})
                 messages.append({"role": "user", "content": f"Observation: {ob}\n\nValid commands: {admissible}"})
