@@ -207,7 +207,9 @@ class SimpleAgent(BaseSkillEvolving):
                     print(f"  >>> Loaded skill: {name}", flush=True)
                     continue
                 else:
-                    available = [d.name for d in self._skills_dir.iterdir() if d.is_dir()]
+                    available = []
+                    if self._skills_dir and self._skills_dir.exists():
+                        available = [d.name for d in self._skills_dir.iterdir() if d.is_dir()]
                     messages.append({"role": "assistant", "content": action})
                     messages.append({"role": "user", "content": f"Skill not found. Available: {', '.join(available)}"})
                     continue
