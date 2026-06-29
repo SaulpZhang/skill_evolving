@@ -1,0 +1,114 @@
+"""ALFWorld dataset implementation."""
+
+import json
+import os
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+import textworld
+import textworld.gym
+from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInfos
+
+from spg_bandit.modules.dataset.base import BaseDataset, TaskPool
+
+
+TASK_TYPES = [
+    "pick_and_place_simple", "look_at_obj_in_light",
+    "pick_clean_then_place_in_recep", "pick_heat_then_place_in_recep",
+    "pick_cool_then_place_in_recep", "pick_two_obj_and_place",
+]
+
+TYPE_TO_DIM = {t: i for i, t in enumerate(TASK_TYPES)}
+K = len(TASK_TYPES)
+
+
+def _get_embedding(text: str, model: str = "nomic-embed-text") -> list[float]:
+    data = json.dumps({"model": model, "input": text}).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/embed", data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    result = json.loads(resp.read())
+    return result["embeddings"][0]
+
+
+class ALFWorldDataset(BaseDataset):
+    """ALFWorld dataset: loads tasks from valid_seen split."""
+
+    def __init__(self, config: dict):
+        self.max_turns = config.get("max_turns", 30)
+        self._pool: TaskPool | None = None
+        self._task_list: list[dict] = []
+
+    @property
+    def task_pool(self) -> TaskPool:
+        if self._pool is None:
+            self.load()
+        return self._pool
+
+    def get_task_goal(self, task_id: int) -> str:
+        return self._task_list[task_id]["goal"]
+
+    def create_env(self, task_id: int):
+        task = self._task_list[task_id]
+        wrappers = [AlfredDemangler(shuffle=False), AlfredInfos]
+        req = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
+        env_id = textworld.gym.register_games(
+            [task["game_file"]], req, batch_size=1,
+            asynchronous=True, max_episode_steps=self.max_turns,
+            wrappers=wrappers,
+        )
+        return textworld.gym.make(env_id), env_id
+
+    @staticmethod
+    def close_env(env, env_id: str):
+        env.close()
+        try:
+            import gym
+            reg = gym.envs.registration.registry
+            if isinstance(reg, dict) and env_id in reg:
+                del reg[env_id]
+            elif hasattr(reg, "env_specs") and env_id in reg.env_specs:
+                del reg.env_specs[env_id]
+        except Exception:
+            pass
+
+    def load(self):
+        cache = Path.home() / ".cache" / "alfworld"
+        data_dir = cache / "json_2.1.1" / "valid_seen"
+        task_list = []
+
+        for root, dirs, files in os.walk(data_dir):
+            if "traj_data.json" not in files:
+                continue
+            game_file = os.path.join(root, "game.tw-pddl")
+            if not os.path.exists(game_file):
+                continue
+            with open(os.path.join(root, "traj_data.json")) as f:
+                data = json.load(f)
+            tt = data["task_type"]
+            if tt not in TYPE_TO_DIM:
+                continue
+            goal = data["turk_annotations"]["anns"][0]["task_desc"]
+            task_list.append({
+                "id": len(task_list),
+                "game_file": game_file,
+                "task_type": tt,
+                "dim": TYPE_TO_DIM[tt],
+                "goal": goal,
+            })
+
+        self._task_list = task_list
+        print(f"ALFWorld: {len(task_list)} tasks loaded")
+        print("  Generating embeddings (nomic-embed-text)...")
+        embeddings = []
+        for t in task_list:
+            emb = _get_embedding(t["goal"])
+            embeddings.append(emb)
+        self._pool = TaskPool(
+            embeddings=np.array(embeddings),
+            metadata=task_list,
+        )
+        print(f"  TaskPool: {self._pool.M} tasks, {self._pool.d_c} dims")
