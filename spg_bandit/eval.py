@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SPG-Bandit experiment runner."""
+"""Evaluate selector performance — no reflection, just task execution."""
 
 import argparse
 import os
@@ -14,20 +14,19 @@ load_dotenv()
 
 from spg_bandit.utils.config_loader import load_config
 from spg_bandit.utils.logger import setup_logger
-from spg_bandit.utils.wandb import init_wandb, finish_wandb
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
 from spg_bandit.modules.skill_evolving import SimpleAgent
 from spg_bandit.modules.selector import UniformSelector, SPGBanditSelector
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="SPG-Bandit experiment runner")
+    p = argparse.ArgumentParser(description="SPG-Bandit evaluation (no reflection)")
     p.add_argument("--config", "-c", default="default")
     p.add_argument("--run_id", default=None)
     p.add_argument("--run_name", default=None)
-    p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--log-file", action="store_true")
+    p.add_argument("--skills", default=None, help="Path to pre-existing skills directory")
     return p
 
 
@@ -55,18 +54,15 @@ def main():
         config.setdefault("experiment", {})["seed"] = args.seed
 
     selectors_enabled = config.get("selectors", {}).get("enabled", ["uniform"])
-    agent_name = config.get("skill_evolving", {}).get("name", "unknown")
     sel_tag = "_".join(selectors_enabled)
-
-    run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{sel_tag}_{agent_name}"
+    run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_eval_{sel_tag}"
     if not args.run_name:
         args.run_name = run_id
 
     logger = setup_logger(run_id, args.run_name, log_file_enabled=args.log_file)
     logger.info(f"Config: {args.config}")
+    logger.info(f"EVAL mode — no reflection")
     logger.info(f"Selectors: {selectors_enabled}")
-
-    wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb)
 
     logger.info("Loading dataset...")
     dataset = ALFWorldDataset(config.get("alfworld", {}))
@@ -81,9 +77,13 @@ def main():
         logger.info(f"Selector: {sel_name}")
         logger.info(f"{'='*60}")
 
-        skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
         method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30))
-        method.load_skills(skills_dir)
+
+        # Load pre-existing skills if provided
+        if args.skills:
+            method.load_skills(args.skills)
+            logger.info(f"  Skills loaded from: {args.skills}")
+
         selector = create_selector(sel_name, task_pool, config)
 
         total_steps = n_bandit
@@ -99,7 +99,7 @@ def main():
             t0 = time.time()
             result = method.execute(task_id)
             elapsed = time.time() - t0
-            method.reflect(task_id, result)
+            # No reflect() call — eval mode
             selector.update(task_id, result)
 
             is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
@@ -112,9 +112,9 @@ def main():
                 "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
             })
 
-
-            logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
-                        f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+            if step % 5 == 0 or step == total_steps - 1:
+                logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
+                           f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
         bandit_steps = [r for r in step_records if not r["is_warmup"]]
         bandit_success = sum(1 for r in bandit_steps if r["success"])
@@ -135,9 +135,6 @@ def main():
     logger.info("-" * 45)
     for r in results:
         logger.info(f"{r['name']:20s}  {r['success']}/{r['total']:>7d}        {r['api_calls']:>6d}")
-
-    finish_wandb()
-    logger.info("\nDone.")
 
 
 if __name__ == "__main__":

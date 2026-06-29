@@ -49,8 +49,7 @@ If no changes needed: NO CHANGE"""
 class SimpleAgent(BaseSkillEvolving):
     """ALFWorld agent with ReAct loop and post-task skill evolution."""
 
-    def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30,
-                 skills_dir: str = None):
+    def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30):
         self._dataset = dataset
         self.max_turns = max_turns
         self._client = OpenAI(
@@ -60,8 +59,20 @@ class SimpleAgent(BaseSkillEvolving):
         )
         self._model = os.getenv("LLM_MODEL")
         self._total_calls = 0
-        self._skills_dir = Path(skills_dir) if skills_dir else None
+        self._skills_dir = None
         self._loaded_skill = None
+        self._loaded_skills_list = []
+
+    def load_skills(self, skills_dir: str):
+        """Load skills from a directory for later use."""
+        self._skills_dir = Path(skills_dir)
+        self._loaded_skills_list = []
+        if self._skills_dir.exists():
+            for d in sorted(self._skills_dir.iterdir()):
+                if d.is_dir() and (d / "SKILL.md").exists():
+                    self._loaded_skills_list.append(d.name)
+            if self._loaded_skills_list:
+                print(f"  >>> Loaded {len(self._loaded_skills_list)} skills from {skills_dir}", flush=True)
 
     def get_usage(self) -> dict:
         return {"api_calls": self._total_calls}
@@ -78,21 +89,19 @@ class SimpleAgent(BaseSkillEvolving):
 
     def _available_skills(self) -> str:
         """List available skills for system prompt."""
-        if not self._skills_dir or not self._skills_dir.exists():
-            return ""
-        skills = sorted(self._skills_dir.iterdir())
-        if not skills:
+        if not self._skills_dir or not self._loaded_skills_list:
             return ""
         lines = ["\n\nAvailable skills:"]
-        for s in skills:
-            if s.is_dir() and (s / "SKILL.md").exists():
-                meta = (s / "SKILL.md").read_text().split("---")
+        for name in self._loaded_skills_list:
+            sf = self._skills_dir / name / "SKILL.md"
+            if sf.exists():
+                meta = sf.read_text().split("---")
                 desc = ""
                 if len(meta) > 1:
                     for line in meta[1].split("\n"):
                         if line.startswith("description:"):
                             desc = line.split(":", 1)[1].strip()
-                lines.append(f"  {s.name}: {desc}")
+                lines.append(f"  {name}: {desc}")
         lines.append("\nTo use: USE SKILL: <name>")
         return "\n".join(lines)
 
@@ -114,11 +123,13 @@ class SimpleAgent(BaseSkillEvolving):
         names = sorted(d.name for d in self._skills_dir.iterdir() if d.is_dir())
         return ", ".join(names) if names else "(none)"
 
-    def _reflect(self, goal, success, traj):
-        """Reflect on task and optionally create/update/delete skills.
-        traj: trajectory text with actions and observations."""
+    def reflect(self, task_id: int, result: dict):
+        """Reflect on task execution and evolve skills."""
+        goal = self._dataset.get_task_goal(task_id)
+        success = result["success"]
+        traj = result["trajectory"]
         outcome = "succeeded" if success else "failed"
-        skills_used = self._loaded_skill if self._loaded_skill else "(none)"
+        skills_used = result.get("loaded_skill", "(none)")
         existing = self._existing_skills_str()
         prompt = REFLECT_PROMPT.format(
             outcome=outcome, task=goal, trajectory=traj,
@@ -216,8 +227,7 @@ class SimpleAgent(BaseSkillEvolving):
                     ALFWorldDataset.close_env(env, env_id)
                     traj_lines.append(f"Obs: {ob}")
                     traj = "\n".join(traj_lines)
-                    self._reflect(goal, True, traj)
-                    return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls}
+                    return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
                 traj_lines.append(f"Obs: {ob}")
                 messages.append({"role": "assistant", "content": action})
                 messages.append({"role": "user", "content": f"Observation: {ob}\n\nValid commands: {admissible}"})
@@ -228,5 +238,4 @@ class SimpleAgent(BaseSkillEvolving):
 
         ALFWorldDataset.close_env(env, env_id)
         traj = "\n".join(traj_lines)
-        self._reflect(goal, False, traj)
-        return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls}
+        return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}

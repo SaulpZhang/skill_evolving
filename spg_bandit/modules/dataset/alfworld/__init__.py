@@ -35,10 +35,13 @@ def _get_embedding(text: str, model: str = "nomic-embed-text") -> list[float]:
 
 
 class ALFWorldDataset(BaseDataset):
-    """ALFWorld dataset: loads tasks from valid_seen split."""
+    """ALFWorld dataset with configurable task filtering."""
 
     def __init__(self, config: dict):
         self.max_turns = config.get("max_turns", 30)
+        self._task_types = config.get("task_types", TASK_TYPES)  # list or "all"
+        self._tasks_per_type = config.get("tasks_per_type", 0)    # 0 = all
+        self._split = config.get("split", "valid_seen")           # valid_seen/valid_unseen/train
         self._pool: TaskPool | None = None
         self._task_list: list[dict] = []
 
@@ -77,9 +80,16 @@ class ALFWorldDataset(BaseDataset):
 
     def load(self):
         cache = Path.home() / ".cache" / "alfworld"
-        data_dir = cache / "json_2.1.1" / "valid_seen"
-        task_list = []
 
+        types_to_include = TASK_TYPES if self._task_types == "all" else [t for t in self._task_types if t in TYPE_TO_DIM]
+        type_count = {t: 0 for t in types_to_include}
+
+        data_dir = cache / "json_2.1.1" / self._split
+        if not data_dir.exists():
+            print(f"  Split '{self._split}' not found, using valid_seen")
+            data_dir = cache / "json_2.1.1" / "valid_seen"
+
+        task_list = []
         for root, dirs, files in os.walk(data_dir):
             if "traj_data.json" not in files:
                 continue
@@ -89,8 +99,11 @@ class ALFWorldDataset(BaseDataset):
             with open(os.path.join(root, "traj_data.json")) as f:
                 data = json.load(f)
             tt = data["task_type"]
-            if tt not in TYPE_TO_DIM:
+            if tt not in types_to_include:
                 continue
+            if self._tasks_per_type > 0 and type_count[tt] >= self._tasks_per_type:
+                continue
+            type_count[tt] = type_count[tt] + 1
             goal = data["turk_annotations"]["anns"][0]["task_desc"]
             task_list.append({
                 "id": len(task_list),
@@ -101,7 +114,7 @@ class ALFWorldDataset(BaseDataset):
             })
 
         self._task_list = task_list
-        print(f"ALFWorld: {len(task_list)} tasks loaded")
+        print(f"ALFWorld ({self._split}): {len(task_list)} tasks loaded")
         print("  Generating embeddings (nomic-embed-text)...")
         embeddings = []
         for t in task_list:
