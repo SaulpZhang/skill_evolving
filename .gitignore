@@ -34,3 +34,8 @@ Thumbs.db
 results/
 refine-logs/
 *.pdf
+
+# Environment
+.env
+
+config/
