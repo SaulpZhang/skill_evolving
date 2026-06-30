@@ -12,8 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+import yaml
 from spg_bandit.utils.config_loader import load_config
 from spg_bandit.utils.logger import setup_logger
+from spg_bandit.utils.recorder import Recorder
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
 from spg_bandit.modules.skill_evolving import SimpleAgent
 from spg_bandit.modules.selector import UniformSelector
@@ -46,6 +48,12 @@ def main():
     logger.info(f"EVAL mode — no reflection, Uniform selection")
     if args.skills:
         logger.info(f"Skills: {args.skills}")
+
+    log_base = Path(__file__).parent.parent / "logs" / run_id
+    recorder = Recorder(str(log_base / "records"))
+    config_path = str(log_base / "records" / "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
 
     logger.info("Loading dataset...")
     dataset = ALFWorldDataset(config.get("alfworld", {}))
@@ -87,6 +95,14 @@ def main():
                         f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
     total_api = sum(r["api_calls"] for r in step_records)
+
+    # Save records
+    for rec in step_records:
+        recorder.append_jsonl(f"{args.label}_steps", rec)
+    recorder.save_json("result", {
+        "label": args.label, "success": success_count,
+        "total": n_bandit, "api_calls": total_api,
+    })
     logger.info(f"\n  [{args.label}] Done: {success_count}/{n_bandit} "
                 f"success | {total_api} API calls")
     logger.info(f"{'='*60}")
