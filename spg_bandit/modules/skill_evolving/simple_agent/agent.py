@@ -1,7 +1,7 @@
 """Simple skill evolving agent for ALFWorld.
 
 After each task, reflects on the trajectory and saves skills
-in Anthropic SKILL.md format under skills/<run_id>/<sel_name>/.
+in Anthropic SKILL.md format under spg_bandit/skills/<run_id>/.
 """
 
 import json
@@ -29,17 +29,23 @@ you have access to the following skills to help you complete the task:
 REFLECT_PROMPT = """You completed a task and {outcome}.
 
 Task: {task}
+
 Skills used: {skills_used}
+
 Existing skills: {existing_skills}
+
 Last actions: {trajectory}
 
-Review skills. Options:
+You can learn something from the above information, especially the trace. You have four options:
 - SKILL: name | description | content
 - UPDATE: name | description | content
 - DELETE: name
 - NO CHANGE
 
 Description must say what the skill IS and WHEN to use it.
+
+You should only output one of the four options above. If you want to create a new skill, use SKILL. If you want to update an existing skill, use UPDATE. If you want to delete an existing skill, use DELETE. If you don't want to change anything, use NO CHANGE.
+
 Your response:"""
 
 

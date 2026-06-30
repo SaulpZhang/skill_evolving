@@ -37,8 +37,7 @@ for sel_dir in "$SKILLS_BASE"/*/; do
     echo "--- Eval with ${sel_name} skills ---"
     python3 spg_bandit/eval.py --config "$CONFIG" \
         --label "$sel_name" \
-        --skills "$sel_dir" \
-        $WANDB
+        --skills "$sel_dir"
 done
 
 echo ""

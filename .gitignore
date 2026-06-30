@@ -45,3 +45,4 @@ wandb/
 logs/
 
 skills/
+spg_bandit/skills/

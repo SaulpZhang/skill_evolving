@@ -85,7 +85,7 @@ def main():
 
     n_bandit = config.get("experiment", {}).get("n_bandit", 50)
 
-    skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
+    skills_dir = str(Path(__file__).parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
                          records_dir=records_dir)
