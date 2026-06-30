@@ -21,15 +21,6 @@ def init_wandb(config: dict, run_id: str = None, run_name: str = None,
             config=config,
             resume="allow",
         )
-        wandb.define_metric("evolving_step", hidden=True)
-        wandb.define_metric("eval_step", hidden=True)
-        wandb.define_metric("mirt_step", hidden=True)
-        wandb.define_metric("spg_step", hidden=True)
-        wandb.define_metric("evolving/*", step_metric="evolving_step")
-        wandb.define_metric("eval/*", step_metric="eval_step")
-        wandb.define_metric("mirt/*", step_metric="mirt_step")
-        wandb.define_metric("spg/*", step_metric="spg_step")
-        wandb.define_metric("profile/*", step_metric="evolving_step")
         print(f"W&B: initialized (run: {run_id})")
         return True
     except Exception as e:

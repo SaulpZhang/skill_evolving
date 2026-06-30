@@ -126,7 +126,7 @@ def main():
             if result["success"]:
                 success_count += 1
             bandit_done = step - warmup_steps + 1
-            log_metrics({"evolving/success_rate": success_count / bandit_done, "evolving_step": bandit_done})
+            log_metrics({"evolving/success_rate": success_count / bandit_done})
 
         record = {
             "step": step, "selector": sel_name, "task_id": task_id,
@@ -168,7 +168,7 @@ def main():
             elapsed = time.time() - t0
             if result["success"]:
                 eval_success += 1
-            log_metrics({"eval/success_rate": eval_success / (step + 1), "eval_step": step + 1})
+            log_metrics({"eval/success_rate": eval_success / (step + 1)})
             eval_records.append({
                 "step": step, "task_id": task_id,
                 "success": result["success"], "api_calls": result["api_calls"],
