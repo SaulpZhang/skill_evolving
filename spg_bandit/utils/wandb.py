@@ -42,8 +42,8 @@ def log_metrics(metrics: dict):
         import wandb
         if wandb.run is not None:
             wandb.log(metrics)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"W&B log error: {e}")
 
 
 def finish_wandb():
