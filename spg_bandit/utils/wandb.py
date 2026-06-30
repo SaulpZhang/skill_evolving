@@ -21,6 +21,12 @@ def init_wandb(config: dict, run_id: str = None, run_name: str = None,
             config=config,
             resume="allow",
         )
+        # Independent step axes to avoid cross-phase conflicts
+        wandb.define_metric("evolving/*", step_metric="evolving/step")
+        wandb.define_metric("eval/*", step_metric="eval/step")
+        wandb.define_metric("mirt/*", step_metric="mirt/iter")
+        wandb.define_metric("spg/*", step_metric="spg/epoch")
+        wandb.define_metric("profile/*", step_metric="evolving/step")
         print(f"W&B: initialized (run: {run_id})")
         return True
     except Exception as e:
