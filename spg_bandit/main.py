@@ -32,7 +32,7 @@ def build_parser():
     p.add_argument("--log-file", action="store_true")
     p.add_argument("--warmup-data", default=None,
                    help="Path to warmup data JSON. Skip task execution, load data for MIRT+MLP.")
-    p.add_argument("--eval", action="store_true",
+    p.add_argument("--evaluating", action="store_true",
                    help="Run evaluation after main experiment (Uniform, no reflection)")
     return p
 
@@ -126,7 +126,7 @@ def main():
             if result["success"]:
                 success_count += 1
             bandit_done = step - warmup_steps + 1
-            log_metrics({"evolving/success_rate": success_count / bandit_done})
+            log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
 
         record = {
             "step": step, "selector": sel_name, "task_id": task_id,
@@ -150,43 +150,43 @@ def main():
         selector.save_warmup_data(warmup_path)
         logger.info("Warmup data saved to %s", warmup_path)
 
-    # ── Eval phase ──────────────────────────────────────────────────────────
-    if args.eval:
+    # ── Evaluating phase ────────────────────────────────────────────────────
+    if args.evaluating:
         logger.info(f"\n{'='*60}")
-        logger.info(f"Eval: Uniform, no reflection")
+        logger.info(f"Evaluating: Uniform, no reflection")
         logger.info(f"{'='*60}")
 
         method.reset()
-        eval_selector = UniformSelector()
-        eval_success = 0
-        eval_records = []
+        evaluating_selector = UniformSelector()
+        evaluating_success = 0
+        evaluating_records = []
 
         for step in range(n_bandit):
-            task_id = eval_selector.select(task_pool)
+            task_id = evaluating_selector.select(task_pool)
             t0 = time.time()
             result = method.execute(task_id)
             elapsed = time.time() - t0
             if result["success"]:
-                eval_success += 1
-            log_metrics({"eval/success_rate": eval_success / (step + 1)})
-            eval_records.append({
+                evaluating_success += 1
+            log_metrics({"evaluating/success_rate": evaluating_success / (step + 1), "_step_evaluating": step + 1})
+            evaluating_records.append({
                 "step": step, "task_id": task_id,
                 "success": result["success"], "api_calls": result["api_calls"],
                 "duration_s": round(elapsed, 1),
             })
             if step % 5 == 0 or step == n_bandit - 1:
-                logger.info(f"  eval step {step+1}/{n_bandit}: task {task_id} -> "
+                logger.info(f"  evaluating step {step+1}/{n_bandit}: task {task_id} -> "
                             f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
-        eval_api = sum(r["api_calls"] for r in eval_records)
-        for rec in eval_records:
-            recorder.append_jsonl("eval_steps", rec)
-        recorder.save_json("eval_result", {
-            "label": sel_name, "success": eval_success,
-            "total": n_bandit, "api_calls": eval_api,
+        evaluating_api = sum(r["api_calls"] for r in evaluating_records)
+        for rec in evaluating_records:
+            recorder.append_jsonl("evaluating_steps", rec)
+        recorder.save_json("evaluating_result", {
+            "label": sel_name, "success": evaluating_success,
+            "total": n_bandit, "api_calls": evaluating_api,
         })
-        logger.info(f"\n  [eval] Done: {eval_success}/{n_bandit} "
-                    f"success | {eval_api} API calls")
+        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{n_bandit} "
+                    f"success | {evaluating_api} API calls")
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
     bandit_success = sum(1 for r in bandit_steps if r["success"])
