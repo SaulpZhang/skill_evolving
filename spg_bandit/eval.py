@@ -86,17 +86,12 @@ def main():
             method.load_skills(args.skills)
             logger.info(f"  Skills loaded from: {args.skills}")
 
-        selector = create_selector(sel_name, task_pool, config)
-
-        total_steps = n_bandit
-        if selector.needs_warmup:
-            total_steps += config.get("experiment", {}).get("n_warm", 30)
-            logger.info(f"  (warmup: {config.get('experiment', {}).get('n_warm', 30)} steps)")
+        selector = UniformSelector()
 
         success_count = 0
         step_records = []
 
-        for step in range(total_steps):
+        for step in range(n_bandit):
             task_id = selector.select(task_pool)
             t0 = time.time()
             result = method.execute(task_id)
