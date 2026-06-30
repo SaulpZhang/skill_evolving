@@ -223,7 +223,7 @@ class SPGBanditSelector(BaseSelector):
         wb = {f"profile/dim_{i}": float(self._profile[i]) for i in range(len(self._profile))}
         wb["profile/mean"] = float(np.mean(self._profile))
         wb["profile/min"] = float(np.min(self._profile))
-        wb["profile/entropy"] = float(-np.sum(g * np.log(g + 1e-10)))
+        wb["profile/max"] = float(np.max(self._profile))
         log_metrics(wb, step=self._step)
 
         A_inv = np.linalg.inv(self._A)
