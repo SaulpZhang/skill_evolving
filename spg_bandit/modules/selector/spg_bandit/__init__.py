@@ -52,9 +52,7 @@ class MLPFeaturizer:
             loss_history.append(avg_loss)
             if epoch % 10 == 9:
                 print(f"  MLP epoch {epoch+1}: MSE = {avg_loss:.6f}")
-            if epoch == 0 or epoch == epochs - 1 or epoch % 10 == 9:
-                log_metrics({f"{wandb_prefix}/mse": avg_loss, f"{wandb_prefix}/epoch": epoch})
-        log_metrics({f"{wandb_prefix}/final_mse": loss_history[-1], f"{wandb_prefix}/min_mse": min(loss_history)})
+            log_metrics({f"{wandb_prefix}/mse": avg_loss, f"{wandb_prefix}/epoch": epoch})
         return loss_history
 
     def _train_step(self, X_batch, y_batch):
@@ -290,7 +288,7 @@ class SPGBanditSelector(BaseSelector):
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         for i, ll_val in enumerate(ll_history):
-            log_metrics({"mirt/ll": ll_val, "mirt/iter": i, "mirt/final_ll": ll})
+            log_metrics({"mirt/ll": ll_val, "mirt/iter": i})
 
         # MLP training
         self._mlp = MLPFeaturizer(task_pool.d_c, self._d_h, self._d_f, self._seed)
