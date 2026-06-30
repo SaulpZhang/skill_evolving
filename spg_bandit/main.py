@@ -117,11 +117,10 @@ def main():
 
             is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
             if not is_warmup:
-                bandit_step = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0)
                 if result["success"]:
                     success_count += 1
-                rate = success_count / (bandit_step + 1)
-                log_metrics({f"{sel_name}/success_rate": rate, f"{sel_name}/bandit_step": bandit_step})
+                bandit_done = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0) + 1
+                log_metrics({f"{sel_name}/success_rate": success_count / bandit_done})
 
             record = {
                 "step": step, "selector": sel_name, "task_id": task_id,
