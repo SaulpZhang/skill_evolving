@@ -53,7 +53,7 @@ class MLPFeaturizer:
             loss_history.append(avg_loss)
             if epoch % 10 == 9:
                 print(f"  MLP epoch {epoch+1}: MSE = {avg_loss:.6f}")
-            log_metrics({f"{wandb_prefix}/mse": avg_loss})
+            log_metrics({f"{wandb_prefix}/mse": avg_loss, "_step_spg": epoch})
         return loss_history
 
     def _train_step(self, X_batch, y_batch):
@@ -319,7 +319,7 @@ class SPGBanditSelector(BaseSelector):
         self._d_fit = np.zeros(task_pool.M)
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
         for i, ll_val in enumerate(ll_history):
-            log_metrics({"mirt/ll": ll_val})
+            log_metrics({"mirt/ll": ll_val, "_step_mirt": i})
 
         # MLP training with proper sequential deltas
         self._warmup_deltas = deltas
