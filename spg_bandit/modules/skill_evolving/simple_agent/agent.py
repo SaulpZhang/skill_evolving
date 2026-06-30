@@ -139,6 +139,17 @@ class SimpleAgent(BaseSkillEvolving):
             self._loaded_skills_list.append(name)
         print(f"  >>> Skill saved: {name}", flush=True)
 
+    def _delete_skill(self, name):
+        if not self._skills_dir or not name:
+            return
+        d = self._skills_dir / name
+        if d.exists():
+            import shutil
+            shutil.rmtree(d)
+            if name in self._loaded_skills_list:
+                self._loaded_skills_list.remove(name)
+            print(f"  >>> Skill deleted: {name}", flush=True)
+
     def _existing_skills_str(self) -> str:
         if not self._skills_dir or not self._skills_dir.exists():
             return "(none)"
@@ -189,13 +200,8 @@ class SimpleAgent(BaseSkillEvolving):
                         self._save_skill(name, desc, content)  # same as create
                         print(f"  >>> Skill updated: {name}", flush=True)
             elif upper.startswith("DELETE:"):
-                name = line[len("DELETE:"):].strip()
-                if self._skills_dir:
-                    d = self._skills_dir / name
-                    if d.exists():
-                        import shutil
-                        shutil.rmtree(d)
-                        print(f"  >>> Skill deleted: {name}", flush=True)
+                name = line[len("DELETE:"):].strip().split("|")[0].strip().replace(" ", "_")[:64]
+                self._delete_skill(name)
 
         print(f"  >>> Reflection: {result_text[:200]}", flush=True)
 
