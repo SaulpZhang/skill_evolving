@@ -126,6 +126,8 @@ class SimpleAgent(BaseSkillEvolving):
         (d / "assets").mkdir(exist_ok=True)
         text = f"---\nname: {name}\ndescription: {description}\n---\n\n{content.strip()}\n"
         (d / "SKILL.md").write_text(text)
+        if name not in self._loaded_skills_list:
+            self._loaded_skills_list.append(name)
         print(f"  >>> Skill saved: {name}", flush=True)
 
     def _existing_skills_str(self) -> str:
@@ -189,6 +191,8 @@ class SimpleAgent(BaseSkillEvolving):
     def execute(self, task_id: int) -> dict:
         goal = self._dataset.get_task_goal(task_id)
         print(f"\n  --- Executing task {task_id}: {goal}", flush=True)
+        if self._skills_dir:
+            self.load_skills(str(self._skills_dir))
         env, env_id = self._dataset.create_env(task_id)
         obs_tuple, info = env.reset()
         obs = obs_tuple[0]
