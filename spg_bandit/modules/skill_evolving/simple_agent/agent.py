@@ -82,7 +82,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=128000):
+    def _chat(self, messages, max_tokens=32*1024):
         self._total_calls += 1
         return self._client.chat.completions.create(
             model=self._model, messages=messages, max_tokens=max_tokens,
@@ -204,7 +204,8 @@ class SimpleAgent(BaseSkillEvolving):
                 f"Valid commands: {admissible}\n\n"
                 "you can use the skills to assist you or give the next command to complete the task. If you want to use a skill, type 'USE SKILL: <name>' to load it. If you want give a command, type the command exactly as it appears in the valid commands list."
             )
-            action = self._chat(messages + [{"role": "user", "content": msg}])
+            messages.append({"role": "user", "content": msg})
+            action = self._chat(messages)
             actions.append(action)
             traj_lines.append(f"Agent: {action}")
             print(f"    [{step}] {action}", flush=True)
@@ -234,10 +235,9 @@ class SimpleAgent(BaseSkillEvolving):
             try:
                 obs2, r, done, info2 = env.step([action])
                 ob = obs2[0]
-                done_flag = isinstance(done, (tuple, list)) and len(done) > 0 and done[0]
                 won = info2.get("won", [False])
                 won_flag = isinstance(won, (list, tuple)) and len(won) > 0 and won[0]
-                if done_flag or won_flag or "You win!" in ob:
+                if won_flag or "You win!" in ob:
                     ALFWorldDataset.close_env(env, env_id)
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
@@ -247,7 +247,6 @@ class SimpleAgent(BaseSkillEvolving):
                 print(f"    -> {ob}", flush=True)
                 traj_lines.append(f"Obs: {ob}")
                 messages.append({"role": "assistant", "content": action})
-                messages.append({"role": "user", "content": f"Observation: {ob}\n\nValid commands: {admissible}"})
                 obs = ob
                 info = info2
             except Exception:

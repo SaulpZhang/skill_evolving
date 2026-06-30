@@ -41,3 +41,7 @@ refine-logs/
 config/
 docs/
 wandb/
+
+logs/
+
+skills/
