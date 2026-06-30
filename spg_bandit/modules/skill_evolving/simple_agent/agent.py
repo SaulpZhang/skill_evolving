@@ -191,7 +191,7 @@ class SimpleAgent(BaseSkillEvolving):
                 rest = rest.replace("｜", "|").replace("│", "|")
                 parts = rest.split("|", 2)
                 if len(parts) >= 2:
-                    name = parts[0].strip().replace(" ", "_")[:64]
+                    name = parts[0].strip().replace(" ", "_")[:15]
                     desc = parts[1].strip()
                     content = parts[2].strip() if len(parts) > 2 else ""
                     if upper.startswith("SKILL:"):
@@ -200,7 +200,7 @@ class SimpleAgent(BaseSkillEvolving):
                         self._save_skill(name, desc, content)  # same as create
                         print(f"  >>> Skill updated: {name}", flush=True)
             elif upper.startswith("DELETE:"):
-                name = line[len("DELETE:"):].strip().split("|")[0].strip().replace(" ", "_")[:64]
+                name = line[len("DELETE:"):].strip().split("|")[0].strip().replace(" ", "_")[:15]
                 self._delete_skill(name)
 
         print(f"  >>> Reflection: {result_text[:200]}", flush=True)
