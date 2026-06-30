@@ -186,13 +186,14 @@ class SimpleAgent(BaseSkillEvolving):
                         shutil.rmtree(d)
                         print(f"  >>> Skill deleted: {name}", flush=True)
 
-        print(f"  >>> Reflection: {result}", flush=True)
+        print(f"  >>> Reflection: {result_text[:200]}", flush=True)
 
     def execute(self, task_id: int) -> dict:
         goal = self._dataset.get_task_goal(task_id)
         print(f"\n  --- Executing task {task_id}: {goal}", flush=True)
         if self._skills_dir:
             self.load_skills(str(self._skills_dir))
+        calls_before = self._total_calls
         env, env_id = self._dataset.create_env(task_id)
         obs_tuple, info = env.reset()
         obs = obs_tuple[0]
@@ -255,7 +256,7 @@ class SimpleAgent(BaseSkillEvolving):
                     traj = "\n".join(traj_lines)
                     messages.append({"role": "user", "content": f"Result: {ob}"})
                     self._save_messages(task_id, messages)
-                    return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
+                    return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls - calls_before, "loaded_skill": self._loaded_skill}
                 print(f"    -> {ob}", flush=True)
                 traj_lines.append(f"Obs: {ob}")
                 messages.append({"role": "assistant", "content": action})
@@ -267,4 +268,4 @@ class SimpleAgent(BaseSkillEvolving):
         ALFWorldDataset.close_env(env, env_id)
         traj = "\n".join(traj_lines)
         self._save_messages(task_id, messages)
-        return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
+        return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls - calls_before, "loaded_skill": self._loaded_skill}
