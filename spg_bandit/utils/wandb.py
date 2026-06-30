@@ -41,5 +41,5 @@ def finish_wandb():
         import wandb
         if wandb.run is not None:
             wandb.finish()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"W&B finish error: {e}")
