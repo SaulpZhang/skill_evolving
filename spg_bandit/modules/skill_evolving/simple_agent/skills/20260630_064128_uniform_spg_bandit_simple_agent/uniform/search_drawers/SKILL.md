@@ -1,6 +1,6 @@
 ---
 name: search_drawers
-description: Opens each drawer in sequence and checks its contents to find a specific object. Use this skill when you need to locate an item that might be stored in one of the drawers in the kitchen.
+description: Searches all drawers and cabinets for objects. Use when you need to locate objects that are stored in drawers or cabinets.
 ---
 
-Go to drawer 1, open it, observe contents; repeat for each subsequent drawer until the desired object is found or all drawers have been checked.
+[Updated content: open each drawer and cabinet sequentially, inspect contents, and report findings]

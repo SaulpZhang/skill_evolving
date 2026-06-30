@@ -82,7 +82,9 @@ def main():
         logger.info(f"{'='*60}")
 
         skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
-        method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30))
+        records_dir = Path(__file__).parent.parent / "logs" / run_id / sel_name / "messages"
+        method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
+                             records_dir=str(records_dir))
         method.load_skills(skills_dir)
         selector = create_selector(sel_name, task_pool, config)
 

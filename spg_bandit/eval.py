@@ -77,7 +77,9 @@ def main():
         logger.info(f"Selector: {sel_name}")
         logger.info(f"{'='*60}")
 
-        method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30))
+        records_dir = Path(__file__).parent.parent / "logs" / run_id / sel_name / "messages"
+        method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
+                             records_dir=str(records_dir))
 
         # Load pre-existing skills if provided
         if args.skills:

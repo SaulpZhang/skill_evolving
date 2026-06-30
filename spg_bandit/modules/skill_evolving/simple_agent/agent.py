@@ -4,7 +4,9 @@ After each task, reflects on the trajectory and saves skills
 in Anthropic SKILL.md format under skills/<run_id>/<sel_name>/.
 """
 
+import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,9 +46,13 @@ Your response:"""
 class SimpleAgent(BaseSkillEvolving):
     """ALFWorld agent with ReAct loop and post-task skill evolution."""
 
-    def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30):
+    def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30,
+                 records_dir: str = None):
         self._dataset = dataset
         self.max_turns = max_turns
+        self._records_dir = Path(records_dir) if records_dir else None
+        if self._records_dir:
+            self._records_dir.mkdir(parents=True, exist_ok=True)
         self._client = OpenAI(
             base_url=os.getenv("LLM_BASE_URL"),
             api_key=os.getenv("LLM_API_KEY"),
@@ -82,6 +88,14 @@ class SimpleAgent(BaseSkillEvolving):
             model=self._model, messages=messages, max_tokens=max_tokens,
             temperature=0.3,
         ).choices[0].message.content.strip()
+
+    def _save_messages(self, task_id: int, messages: list):
+        """Save messages history as JSON."""
+        if not self._records_dir:
+            return
+        path = self._records_dir / f"task_{task_id}_{int(time.time())}.json"
+        with open(path, "w") as f:
+            json.dump(messages, f, indent=2, ensure_ascii=False)
 
     def _available_skills(self) -> str:
         """List available skills for system prompt."""
@@ -228,6 +242,7 @@ class SimpleAgent(BaseSkillEvolving):
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
                     traj = "\n".join(traj_lines)
+                    self._save_messages(task_id, messages)
                     return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
                 print(f"    -> {ob}", flush=True)
                 traj_lines.append(f"Obs: {ob}")
@@ -240,4 +255,5 @@ class SimpleAgent(BaseSkillEvolving):
 
         ALFWorldDataset.close_env(env, env_id)
         traj = "\n".join(traj_lines)
+        self._save_messages(task_id, messages)
         return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
