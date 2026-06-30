@@ -9,10 +9,7 @@ from typing import Any
 def load_config(config_path: str, default_name: str = "default") -> dict:
     config_dir = Path(__file__).parents[1] / "config"
     default_file = config_dir / f"{default_name}.yaml"
-    if not default_file.exists():
-        raise FileNotFoundError(f"Default config not found: {default_file}")
-    with open(default_file) as f:
-        config = yaml.safe_load(f) or {}
+    config = {} if not default_file.exists() else (yaml.safe_load(default_file.read_text()) or {})
     cfg_path = Path(config_path)
     if not cfg_path.exists():
         cfg_path = config_dir / f"{cfg_path.stem}.yaml"
