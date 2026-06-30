@@ -88,7 +88,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=4096):
+    def _chat(self, messages, max_tokens=256):
         self._total_calls += 1
         return self._client.chat.completions.create(
             model=self._model, messages=messages, max_tokens=max_tokens,
@@ -168,7 +168,7 @@ class SimpleAgent(BaseSkillEvolving):
             outcome=outcome, task=goal, trajectory=traj,
             skills_used=skills_used, existing_skills=existing,
         )
-        result_text = self._chat([{"role": "user", "content": prompt}])
+        result_text = self._chat([{"role": "user", "content": prompt}], max_tokens=1024)
         result_upper = result_text.upper().strip()
 
         # Save reflection messages
