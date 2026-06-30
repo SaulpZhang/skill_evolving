@@ -187,6 +187,9 @@ class SPGBanditSelector(BaseSelector):
         # Internal profile (SPG own concept)
         self._profile = np.zeros(len(TASK_TYPES))
 
+        # Metrics for logging
+        self._metrics = {}
+
         # Warmup data
         self._warmup_task_ids = []
         self._warmup_successes = []
@@ -200,6 +203,9 @@ class SPGBanditSelector(BaseSelector):
     @property
     def needs_warmup(self):
         return True
+
+    def get_metrics(self) -> dict:
+        return dict(self._metrics)
 
     def select(self, task_pool: TaskPool) -> int:
         if self._step < self._n_warm:
@@ -279,6 +285,7 @@ class SPGBanditSelector(BaseSelector):
         self._profile = s_hist[-1].copy()
         self._A_fit = A
         self._d_fit = np.zeros(task_pool.M)
+        self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "mirt/iter": i, "mirt/final_ll": ll}, step=i)
@@ -286,6 +293,7 @@ class SPGBanditSelector(BaseSelector):
         # MLP training
         self._mlp = MLPFeaturizer(task_pool.d_c, self._d_h, self._d_f, self._seed)
         loss_hist = self._mlp.train(np.array(self._warmup_embeds), np.array(self._warmup_deltas), 50, wandb_prefix="spg")
+        self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
 
         self._A = self._lambda * np.eye(self._d_f)
