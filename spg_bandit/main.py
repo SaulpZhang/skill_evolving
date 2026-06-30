@@ -32,6 +32,8 @@ def build_parser():
     p.add_argument("--log-file", action="store_true")
     p.add_argument("--warmup-data", default=None,
                    help="Path to warmup data JSON. Skip task execution, load data for MIRT+MLP.")
+    p.add_argument("--eval", action="store_true",
+                   help="Run evaluation after main experiment (Uniform, no reflection)")
     return p
 
 
@@ -147,6 +149,44 @@ def main():
         warmup_path = str(log_base / "records" / f"{sel_name}_warmup_data.json")
         selector.save_warmup_data(warmup_path)
         logger.info("Warmup data saved to %s", warmup_path)
+
+    # ── Eval phase ──────────────────────────────────────────────────────────
+    if args.eval:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Eval: Uniform, no reflection")
+        logger.info(f"{'='*60}")
+
+        method.reset()
+        eval_selector = UniformSelector()
+        eval_success = 0
+        eval_records = []
+
+        for step in range(n_bandit):
+            task_id = eval_selector.select(task_pool)
+            t0 = time.time()
+            result = method.execute(task_id)
+            elapsed = time.time() - t0
+            if result["success"]:
+                eval_success += 1
+            log_metrics({"eval/success_rate": eval_success / (step + 1)})
+            eval_records.append({
+                "step": step, "task_id": task_id,
+                "success": result["success"], "api_calls": result["api_calls"],
+                "duration_s": round(elapsed, 1),
+            })
+            if step % 5 == 0 or step == n_bandit - 1:
+                logger.info(f"  eval step {step+1}/{n_bandit}: task {task_id} -> "
+                            f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+
+        eval_api = sum(r["api_calls"] for r in eval_records)
+        for rec in eval_records:
+            recorder.append_jsonl("eval_steps", rec)
+        recorder.save_json("eval_result", {
+            "label": sel_name, "success": eval_success,
+            "total": n_bandit, "api_calls": eval_api,
+        })
+        logger.info(f"\n  [eval] Done: {eval_success}/{n_bandit} "
+                    f"success | {eval_api} API calls")
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
     bandit_success = sum(1 for r in bandit_steps if r["success"])
