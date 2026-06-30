@@ -13,7 +13,7 @@ import yaml
 from dotenv import load_dotenv
 load_dotenv()
 
-from spg_bandit.utils.config_loader import load_config
+from spg_bandit.utils.config_loader import load_config, get_param
 from spg_bandit.utils.logger import setup_logger
 from spg_bandit.utils.recorder import Recorder
 from spg_bandit.utils.wandb import init_wandb, log_metrics, finish_wandb
@@ -34,7 +34,7 @@ def build_parser():
 
 
 def create_selector(name, task_pool, config):
-    params = config.get("selectors", {}).get(name, {})
+    params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
     elif name == "spg_bandit":
@@ -57,21 +57,19 @@ def main():
     if args.seed is not None:
         config.setdefault("experiment", {})["seed"] = args.seed
 
-    selectors_enabled = config.get("selectors", {}).get("enabled", ["uniform"])
+    sel_name = config.get("selector", "uniform")
     agent_name = config.get("skill_evolving", {}).get("name", "unknown")
-    sel_tag = "_".join(selectors_enabled)
 
-    run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{sel_tag}_{agent_name}"
+    run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{sel_name}_{agent_name}"
     if not args.run_name:
         args.run_name = run_id
 
     logger = setup_logger(run_id, args.run_name, log_file_enabled=args.log_file)
     logger.info(f"Config: {args.config}")
-    logger.info(f"Selectors: {selectors_enabled}")
+    logger.info(f"Selector: {sel_name}")
 
     wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb)
 
-    # ── Init recorder and save config backup ──
     log_base = Path(__file__).parent.parent / "logs" / run_id
     recorder = Recorder(str(log_base / "records"))
     config_path = str(log_base / "records" / "config.yaml")
@@ -83,89 +81,76 @@ def main():
     dataset = ALFWorldDataset(config.get("alfworld", {}))
     task_pool = dataset.task_pool
 
-    enabled = selectors_enabled
     n_bandit = config.get("experiment", {}).get("n_bandit", 50)
-    results = []
 
-    for sel_name in enabled:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Selector: {sel_name}")
-        logger.info(f"{'='*60}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Selector: {sel_name}")
+    logger.info(f"{'='*60}")
 
-        skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
-        records_dir = str(log_base / sel_name / "messages")
-        method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
-                             records_dir=records_dir)
-        method.load_skills(skills_dir)
-        selector = create_selector(sel_name, task_pool, config)
+    skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
+    records_dir = str(log_base / sel_name / "messages")
+    method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
+                         records_dir=records_dir)
+    method.load_skills(skills_dir)
+    selector = create_selector(sel_name, task_pool, config)
 
-        total_steps = n_bandit
-        if selector.needs_warmup:
-            total_steps += config.get("experiment", {}).get("n_warm", 30)
-            logger.info(f"  (warmup: {config.get('experiment', {}).get('n_warm', 30)} steps)")
+    total_steps = n_bandit
+    if selector.needs_warmup:
+        total_steps += config.get("experiment", {}).get("n_warm", 30)
+        logger.info(f"  (warmup: {config.get('experiment', {}).get('n_warm', 30)} steps)")
 
-        success_count = 0
-        step_records = []
+    success_count = 0
+    step_records = []
 
-        for step in range(total_steps):
-            task_id = selector.select(task_pool)
-            t0 = time.time()
-            result = method.execute(task_id)
-            elapsed = time.time() - t0
-            method.reflect(task_id, result)
-            selector.update(task_id, result)
+    for step in range(total_steps):
+        task_id = selector.select(task_pool)
+        t0 = time.time()
+        result = method.execute(task_id)
+        elapsed = time.time() - t0
+        method.reflect(task_id, result)
+        selector.update(task_id, result)
 
-            is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
-            if not is_warmup:
-                if result["success"]:
-                    success_count += 1
-                bandit_done = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0) + 1
-                log_metrics({f"{sel_name}/success_rate": success_count / bandit_done})
+        is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
+        if not is_warmup:
+            if result["success"]:
+                success_count += 1
+            bandit_done = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0) + 1
+            log_metrics({f"{sel_name}/success_rate": success_count / bandit_done})
 
-            record = {
-                "step": step, "selector": sel_name, "task_id": task_id,
-                "success": result["success"], "api_calls": result["api_calls"],
-                "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
-            }
-            step_records.append(record)
-            recorder.append_jsonl(f"{sel_name}_steps", record)
-
-            logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
-                        f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
-
-        # Save SPG metrics if available
-        if hasattr(selector, "get_metrics"):
-            metrics = selector.get_metrics()
-            if metrics:
-                recorder.save_json(f"{sel_name}_spg_metrics", metrics)
-
-        bandit_steps = [r for r in step_records if not r["is_warmup"]]
-        bandit_success = sum(1 for r in bandit_steps if r["success"])
-        total_api = sum(r["api_calls"] for r in bandit_steps)
-
-        result_entry = {
-            "name": sel_name, "success": bandit_success,
-            "total": len(bandit_steps), "api_calls": total_api,
+        record = {
+            "step": step, "selector": sel_name, "task_id": task_id,
+            "success": result["success"], "api_calls": result["api_calls"],
+            "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
         }
-        results.append(result_entry)
+        step_records.append(record)
+        recorder.append_jsonl(f"{sel_name}_steps", record)
 
-        logger.info(f"  [{sel_name}] Done: {bandit_success}/{len(bandit_steps)} "
-                    f"success | {total_api} API calls")
+        logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
+                    f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
-    # ── Save comparison ──
+    if hasattr(selector, "get_metrics"):
+        metrics = selector.get_metrics()
+        if metrics:
+            recorder.save_json(f"{sel_name}_spg_metrics", metrics)
+
+    bandit_steps = [r for r in step_records if not r["is_warmup"]]
+    bandit_success = sum(1 for r in bandit_steps if r["success"])
+    total_api = sum(r["api_calls"] for r in bandit_steps)
+
+    result_entry = {
+        "name": sel_name, "success": bandit_success,
+        "total": len(bandit_steps), "api_calls": total_api,
+    }
+
     recorder.save_json("comparison", {
         "run_id": run_id,
         "config": args.config,
-        "results": results,
+        "results": [result_entry],
     })
 
     logger.info(f"\n{'='*60}")
-    logger.info("COMPARISON")
-    logger.info(f"{'='*60}")
-    logger.info(f"{'Selector':20s}  {'Success':>10s}  {'API Calls':>10s}")
-    logger.info("-" * 45)
-    for r in results:
-        logger.info(f"{r['name']:20s}  {r['success']}/{r['total']:>7d}        {r['api_calls']:>6d}")
+    logger.info(f"[{sel_name}] Done: {bandit_success}/{len(bandit_steps)} "
+                f"success | {total_api} API calls")
 
     finish_wandb()
     logger.info("\nDone.")
