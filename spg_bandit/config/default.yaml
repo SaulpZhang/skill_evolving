@@ -1,0 +1,17 @@
+alfworld:
+  embedding_model: all-MiniLM-L6-v2
+  embedding_type: local
+  max_turns: 51
+  split: valid_seen
+  task_types: all
+  tasks_per_type: 10
+
+dataset: alfworld
+
+skill_evolving:
+  name: simple_agent
+
+experiment:
+  n_warm: 30
+  n_bandit: 50
+  seed: 42
