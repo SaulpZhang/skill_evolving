@@ -23,14 +23,27 @@ TYPE_TO_DIM = {t: i for i, t in enumerate(TASK_TYPES)}
 K = len(TASK_TYPES)
 
 
-def _get_embedding(text: str, model: str = "nomic-embed-text") -> list[float]:
+_embedder = None
+
+def _get_embedding(text: str, model: str = "all-MiniLM-L6-v2",
+                   api_url: str = "", api_type: str = "local") -> list[float]:
+    """Get embedding: local (sentence-transformers), OpenAI-compatible, or Ollama."""
+    if api_type == "local":
+        global _embedder
+        if _embedder is None:
+            from sentence_transformers import SentenceTransformer
+            _embedder = SentenceTransformer(model, trust_remote_code=True)
+        return _embedder.encode(text).tolist()
+
     data = json.dumps({"model": model, "input": text}).encode()
     req = urllib.request.Request(
-        "http://localhost:11434/api/embed", data=data,
+        api_url or "http://localhost:11434/api/embed", data=data,
         headers={"Content-Type": "application/json"},
     )
     resp = urllib.request.urlopen(req, timeout=30)
     result = json.loads(resp.read())
+    if api_type == "openai":
+        return result["data"][0]["embedding"]
     return result["embeddings"][0]
 
 
@@ -42,6 +55,9 @@ class ALFWorldDataset(BaseDataset):
         self._task_types = config.get("task_types", TASK_TYPES)  # list or "all"
         self._tasks_per_type = config.get("tasks_per_type", 0)    # 0 = all
         self._split = config.get("split", "valid_seen")           # valid_seen/valid_unseen/train
+        self._embedding_model = config.get("embedding_model", "all-MiniLM-L6-v2")
+        self._embedding_type = config.get("embedding_type", "local")  # local / ollama / openai
+        self._embedding_url = config.get("embedding_url", "")
         self._pool: TaskPool | None = None
         self._task_list: list[dict] = []
 
@@ -115,10 +131,10 @@ class ALFWorldDataset(BaseDataset):
 
         self._task_list = task_list
         print(f"ALFWorld ({self._split}): {len(task_list)} tasks loaded")
-        print("  Generating embeddings (nomic-embed-text)...")
+        print(f"  Generating embeddings ({self._embedding_type}: {self._embedding_model})...")
         embeddings = []
         for t in task_list:
-            emb = _get_embedding(t["goal"])
+            emb = _get_embedding(t["goal"], self._embedding_model, self._embedding_url, self._embedding_type)
             embeddings.append(emb)
         self._pool = TaskPool(
             embeddings=np.array(embeddings),
