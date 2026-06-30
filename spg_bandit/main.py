@@ -29,7 +29,7 @@ def build_parser():
     p.add_argument("--run_name", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--log-file", action="store_true")
+    p.add_argument("--log-file", action="store_true")e
     p.add_argument("--warmup-data", default=None,
                    help="Path to warmup data JSON. Skip task execution, load data for MIRT+MLP.")
     p.add_argument("--eval", action="store_true",
@@ -126,7 +126,7 @@ def main():
             if result["success"]:
                 success_count += 1
             bandit_done = step - warmup_steps + 1
-            log_metrics({f"{sel_name}/success_rate": success_count / bandit_done})
+            log_metrics({"evolving/success_rate": success_count / bandit_done})
 
         record = {
             "step": step, "selector": sel_name, "task_id": task_id,
