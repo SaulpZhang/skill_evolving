@@ -16,7 +16,7 @@ load_dotenv()
 from spg_bandit.utils.config_loader import load_config
 from spg_bandit.utils.logger import setup_logger
 from spg_bandit.utils.recorder import Recorder
-from spg_bandit.utils.wandb import init_wandb, finish_wandb
+from spg_bandit.utils.wandb import init_wandb, log_metrics, finish_wandb
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
 from spg_bandit.modules.skill_evolving import SimpleAgent
 from spg_bandit.modules.selector import UniformSelector, SPGBanditSelector
@@ -116,8 +116,12 @@ def main():
             selector.update(task_id, result)
 
             is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
-            if not is_warmup and result["success"]:
-                success_count += 1
+            if not is_warmup:
+                bandit_step = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0)
+                if result["success"]:
+                    success_count += 1
+                rate = success_count / (bandit_step + 1)
+                log_metrics({f"{sel_name}/success_rate": rate, f"{sel_name}/bandit_step": bandit_step})
 
             record = {
                 "step": step, "selector": sel_name, "task_id": task_id,
