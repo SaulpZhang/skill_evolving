@@ -30,6 +30,8 @@ def build_parser():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--log-file", action="store_true")
+    p.add_argument("--warmup-data", default=None,
+                   help="Path to warmup data JSON. Skip task execution, load data for MIRT+MLP.")
     return p
 
 
@@ -83,10 +85,6 @@ def main():
 
     n_bandit = config.get("experiment", {}).get("n_bandit", 50)
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Selector: {sel_name}")
-    logger.info(f"{'='*60}")
-
     skills_dir = str(Path(__file__).parent / "modules" / "skill_evolving" / "simple_agent" / "skills" / run_id / sel_name)
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
@@ -94,10 +92,21 @@ def main():
     method.load_skills(skills_dir)
     selector = create_selector(sel_name, task_pool, config)
 
-    total_steps = n_bandit
-    if selector.needs_warmup:
-        total_steps += config.get("experiment", {}).get("n_warm", 30)
-        logger.info(f"  (warmup: {config.get('experiment', {}).get('n_warm', 30)} steps)")
+    n_warm_config = config.get("experiment", {}).get("n_warm", 30)
+    if args.warmup_data:
+        if not hasattr(selector, "load_warmup_data"):
+            logger.warning("Selector %s does not support warmup loading, ignoring --warmup-data", sel_name)
+            warmup_steps = selector.needs_warmup * n_warm_config
+        else:
+            selector.load_warmup_data(args.warmup_data, task_pool)
+            warmup_steps = 0
+            logger.info("Warmup task execution skipped, loaded data from %s", args.warmup_data)
+    else:
+        warmup_steps = n_warm_config if selector.needs_warmup else 0
+
+    total_steps = n_bandit + warmup_steps
+    if warmup_steps > 0:
+        logger.info(f"  (warmup: {warmup_steps} steps)")
 
     success_count = 0
     step_records = []
@@ -110,11 +119,11 @@ def main():
         method.reflect(task_id, result)
         selector.update(task_id, result)
 
-        is_warmup = selector.needs_warmup and step < config.get("experiment", {}).get("n_warm", 30)
+        is_warmup = step < warmup_steps
         if not is_warmup:
             if result["success"]:
                 success_count += 1
-            bandit_done = step - (config.get("experiment", {}).get("n_warm", 30) if selector.needs_warmup else 0) + 1
+            bandit_done = step - warmup_steps + 1
             log_metrics({f"{sel_name}/success_rate": success_count / bandit_done})
 
         record = {
@@ -132,6 +141,12 @@ def main():
         metrics = selector.get_metrics()
         if metrics:
             recorder.save_json(f"{sel_name}_spg_metrics", metrics)
+
+    # Save warmup data for future --warmup-data runs
+    if warmup_steps > 0 and hasattr(selector, "save_warmup_data"):
+        warmup_path = str(log_base / "records" / f"{sel_name}_warmup_data.json")
+        selector.save_warmup_data(warmup_path)
+        logger.info("Warmup data saved to %s", warmup_path)
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
     bandit_success = sum(1 for r in bandit_steps if r["success"])

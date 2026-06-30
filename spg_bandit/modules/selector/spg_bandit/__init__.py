@@ -3,6 +3,7 @@
 Maintains its own skill profile internally, independent of skill evolving method.
 """
 
+import json
 import numpy as np
 from scipy.special import expit as sigmoid
 from scipy.optimize import minimize
@@ -207,6 +208,27 @@ class SPGBanditSelector(BaseSelector):
     def get_metrics(self) -> dict:
         return dict(self._metrics)
 
+    def save_warmup_data(self, path: str):
+        """Save warmup data to JSON for future --warmup-data runs."""
+        data = {
+            "task_ids": self._warmup_task_ids,
+            "successes": self._warmup_successes,
+            "deltas": [d.tolist() for d in self._warmup_deltas],
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load_warmup_data(self, path: str, task_pool: TaskPool):
+        """Load warmup data, skip task execution, run MIRT EM + MLP."""
+        with open(path) as f:
+            data = json.load(f)
+        self._warmup_task_ids = data["task_ids"]
+        self._warmup_successes = data["successes"]
+        self._warmup_deltas = [np.array(d) for d in data["deltas"]]
+        self._n_warm = len(self._warmup_task_ids)
+        self._finalize_warmup(task_pool)
+        self._step = self._n_warm
+
     def select(self, task_pool: TaskPool) -> int:
         if self._step < self._n_warm:
             tid = self._step % task_pool.M
@@ -281,16 +303,25 @@ class SPGBanditSelector(BaseSelector):
         for t, tid in enumerate(self._warmup_task_ids):
             R[t, tid] = float(self._warmup_successes[t])
 
-        s_hist, A, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
+        # Sequential MIRT EM: run EM with cumulative data to compute per-step deltas
+        profile = np.zeros(self._K)
+        deltas = []
+        for t in range(N):
+            s_hist_t, *_ = fit_mirt_em(R[:t + 1], self._K, verbose=False)
+            new_profile = s_hist_t[-1]  # sigmoid-transformed ability, (K,)
+            deltas.append(new_profile - profile)
+            profile = new_profile
+
+        # Final EM on all N (verbose, for logging + item params)
+        s_hist, self._A_fit, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
         self._profile = s_hist[-1].copy()
-        self._A_fit = A
         self._d_fit = np.zeros(task_pool.M)
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
-
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "mirt/iter": i})
 
-        # MLP training
+        # MLP training with proper sequential deltas
+        self._warmup_deltas = deltas
         self._mlp = MLPFeaturizer(task_pool.d_c, self._d_h, self._d_f, self._seed)
         loss_hist = self._mlp.train(np.array(self._warmup_embeds), np.array(self._warmup_deltas), 50, wandb_prefix="spg")
         self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]

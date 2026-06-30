@@ -82,7 +82,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=32*1024):
+    def _chat(self, messages, max_tokens=4096):
         self._total_calls += 1
         return self._client.chat.completions.create(
             model=self._model, messages=messages, max_tokens=max_tokens,
