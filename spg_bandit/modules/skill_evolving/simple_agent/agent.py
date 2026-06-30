@@ -125,6 +125,9 @@ class SimpleAgent(BaseSkillEvolving):
     def _save_skill(self, name, description, content):
         if not self._skills_dir:
             return
+        name = name.strip().replace(" ", "_")[:64]
+        if not name:
+            return
         d = self._skills_dir / name
         d.mkdir(parents=True, exist_ok=True)
         (d / "scripts").mkdir(exist_ok=True)
@@ -173,9 +176,11 @@ class SimpleAgent(BaseSkillEvolving):
             if upper.startswith("SKILL:") or upper.startswith("UPDATE:"):
                 prefix = "SKILL:" if upper.startswith("SKILL:") else "UPDATE:"
                 rest = line[len(prefix):].strip()
+                # Normalize Unicode pipe variants to ASCII
+                rest = rest.replace("｜", "|").replace("│", "|")
                 parts = rest.split("|", 2)
                 if len(parts) >= 2:
-                    name = parts[0].strip().replace(" ", "_")
+                    name = parts[0].strip().replace(" ", "_")[:64]
                     desc = parts[1].strip()
                     content = parts[2].strip() if len(parts) > 2 else ""
                     if upper.startswith("SKILL:"):
