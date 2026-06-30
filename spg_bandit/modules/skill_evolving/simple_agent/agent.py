@@ -249,6 +249,7 @@ class SimpleAgent(BaseSkillEvolving):
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
                     traj = "\n".join(traj_lines)
+                    messages.append({"role": "user", "content": f"Result: {ob}"})
                     self._save_messages(task_id, messages)
                     return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls, "loaded_skill": self._loaded_skill}
                 print(f"    -> {ob}", flush=True)
