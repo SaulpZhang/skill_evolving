@@ -45,6 +45,7 @@ def create_selector(name, task_pool, config):
             alpha=params.get("alpha", 0.1),
             tau=params.get("tau", 0.1),
             d_f=params.get("d_f", 16),
+            K=params.get("K", 6),
             seed=config.get("experiment", {}).get("seed", 42),
         )
     raise ValueError(f"Unknown selector: {name}")

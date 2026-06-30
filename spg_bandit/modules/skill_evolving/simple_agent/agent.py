@@ -89,11 +89,12 @@ class SimpleAgent(BaseSkillEvolving):
             temperature=0.3,
         ).choices[0].message.content.strip()
 
-    def _save_messages(self, task_id: int, messages: list):
+    def _save_messages(self, task_id: int, messages: list, prefix: str = ""):
         """Save messages history as JSON."""
         if not self._records_dir:
             return
-        path = self._records_dir / f"task_{task_id}_{int(time.time())}.json"
+        tag = f"{prefix}task_{task_id}" if prefix else f"task_{task_id}"
+        path = self._records_dir / f"{tag}_{int(time.time())}.json"
         with open(path, "w") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
 
@@ -145,14 +146,20 @@ class SimpleAgent(BaseSkillEvolving):
             outcome=outcome, task=goal, trajectory=traj,
             skills_used=skills_used, existing_skills=existing,
         )
-        result = self._chat([{"role": "user", "content": prompt}])
-        result_upper = result.upper().strip()
+        result_text = self._chat([{"role": "user", "content": prompt}])
+        result_upper = result_text.upper().strip()
 
-        if not result or result_upper == "NO CHANGE":
-            print(f"  >>> Reflection: {'no response' if not result else 'no changes needed'}", flush=True)
+        # Save reflection messages
+        self._save_messages(task_id, [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": result_text},
+        ], prefix="reflection_")
+
+        if not result_text or result_upper == "NO CHANGE":
+            print(f"  >>> Reflection: {'no response' if not result_text else 'no changes needed'}", flush=True)
             return
 
-        for line in result.split("\n"):
+        for line in result_text.split("\n"):
             line = line.strip()
             upper = line.upper()
             if upper.startswith("SKILL:") or upper.startswith("UPDATE:"):

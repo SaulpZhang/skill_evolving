@@ -169,7 +169,9 @@ class SPGBanditSelector(BaseSelector):
     def __init__(self, task_pool: TaskPool, n_warm: int = 30,
                  alpha: float = 0.1, tau: float = 0.1,
                  d_f: int = 16, d_h: int = 32,
-                 lambda_reg: float = 1.0, seed: int = 42):
+                 lambda_reg: float = 1.0, seed: int = 42,
+                 K: int = 6):
+        self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
         self._tau = tau
@@ -180,12 +182,12 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_ready = False
         self._mlp: MLPFeaturizer | None = None
         self._A = self._lambda * np.eye(d_f)
-        self._B = np.zeros((d_f, 6))
-        self._W = np.zeros((d_f, 6))
+        self._B = np.zeros((d_f, K))
+        self._W = np.zeros((d_f, K))
         self._last_phi = None
 
         # Internal profile (SPG own concept)
-        self._profile = np.zeros(len(TASK_TYPES))
+        self._profile = np.zeros(K)
 
         # Metrics for logging
         self._metrics = {}
@@ -245,7 +247,7 @@ class SPGBanditSelector(BaseSelector):
         if self._step <= self._n_warm and not self._warmup_ready:
             self._warmup_task_ids.append(task_id)
             self._warmup_successes.append(success)
-            self._warmup_deltas.append(result.get("delta", np.zeros(len(TASK_TYPES))))
+            self._warmup_deltas.append(result.get("delta", np.zeros(self._K)))
         elif self._warmup_ready:
             # MIRT Bayesian online update
             if self._A_fit is not None and task_id < len(self._A_fit):
@@ -261,7 +263,7 @@ class SPGBanditSelector(BaseSelector):
 
             # Ridge regression update
             if self._last_phi is not None:
-                delta = result.get("delta", np.zeros(len(TASK_TYPES)))
+                delta = result.get("delta", np.zeros(self._K))
                 self._A += np.outer(self._last_phi, self._last_phi)
                 self._B += np.outer(self._last_phi, delta)
                 self._W = np.linalg.solve(self._A, self._B)
@@ -281,7 +283,7 @@ class SPGBanditSelector(BaseSelector):
         for t, tid in enumerate(self._warmup_task_ids):
             R[t, tid] = float(self._warmup_successes[t])
 
-        s_hist, A, ll, ll_history = fit_mirt_em(R, len(TASK_TYPES), verbose=True)
+        s_hist, A, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
         self._profile = s_hist[-1].copy()
         self._A_fit = A
         self._d_fit = np.zeros(task_pool.M)
@@ -297,18 +299,18 @@ class SPGBanditSelector(BaseSelector):
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
 
         self._A = self._lambda * np.eye(self._d_f)
-        self._B = np.zeros((self._d_f, len(TASK_TYPES)))
-        self._W = np.zeros((self._d_f, len(TASK_TYPES)))
+        self._B = np.zeros((self._d_f, self._K))
+        self._W = np.zeros((self._d_f, self._K))
         self._warmup_ready = True
 
     def reset(self):
         self._step = 0
         self._warmup_ready = False
         self._mlp = None
-        self._profile = np.zeros(len(TASK_TYPES))
+        self._profile = np.zeros(self._K)
         self._A = self._lambda * np.eye(self._d_f)
-        self._B = np.zeros((self._d_f, len(TASK_TYPES)))
-        self._W = np.zeros((self._d_f, len(TASK_TYPES)))
+        self._B = np.zeros((self._d_f, self._K))
+        self._W = np.zeros((self._d_f, self._K))
         self._last_phi = None
         self._warmup_task_ids.clear()
         self._warmup_successes.clear()
