@@ -19,7 +19,7 @@ def init_wandb(config: dict, run_id: str = None, run_name: str = None,
             id=run_id,
             name=run_name,
             config=config,
-            resume="allow",
+            resume=None,
         )
         wandb.define_metric("_step_evolving", hidden=True)
         wandb.define_metric("_step_eval", hidden=True)
