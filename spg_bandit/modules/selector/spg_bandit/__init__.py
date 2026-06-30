@@ -246,7 +246,7 @@ class SPGBanditSelector(BaseSelector):
         wb["profile/mean"] = float(np.mean(self._profile))
         wb["profile/min"] = float(np.min(self._profile))
         wb["profile/max"] = float(np.max(self._profile))
-        log_metrics(wb, step=self._step)
+        log_metrics(wb)
 
         A_inv = np.linalg.inv(self._A)
         best_score, best_tid = -np.inf, 0
