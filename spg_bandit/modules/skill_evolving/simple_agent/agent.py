@@ -111,7 +111,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=1024, client=None, model=None):
+    def _chat(self, messages, max_tokens=128 * 1024, client=None, model=None):
         """Chat. Optionally override client/model (e.g. for reflection)."""
         self._total_calls += 1
         c = client or self._client
@@ -307,7 +307,7 @@ class SimpleAgent(BaseSkillEvolving):
             existing_titles=json.dumps(existing_titles),
         )
 
-        response = self._chat([{"role": "user", "content": prompt}], max_tokens=4096,
+        response = self._chat([{"role": "user", "content": prompt}],
                                client=self._reflect_client, model=self._reflect_model)
         self._save_reflection(task_id, prompt, response)
 
