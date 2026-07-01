@@ -21,25 +21,29 @@ from spg_bandit.modules.skill_evolving.simple_agent.skill_manager import SkillMa
 
 load_dotenv(Path(__file__).parents[4] / ".env")
 
-SYSTEM_PROMPT = """You are an expert agent operating in the ALFRED Embodied Environment.
-Your task is to: {task_goal}
-
-## Retrieved Relevant Experience
-{skill_section}"""
-
-USER_PROMPT = """## Current Progress
-
-Prior to this step, you have already taken {step_count} step(s).
-Below are the most recent observations and the corresponding actions you took:
-{history}
-
-You are now at step {current_step} and your current observation is:
-{obs}
-
+TEMPLATE_NO_HISTORY = """You are an expert agent operating in the ALFRED Embodied Environment.
+Your current observation is: {obs}
 Your admissible actions of the current situation are: [{admissible}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
+
+TEMPLATE_WITH_MEMORY = """You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_goal}
+
+## Retrieved Relevant Experience
+
+{skill_section}
+
+## Current Progress
+
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+You are now at step {current_step} and your current observation is: {obs}
+Your admissible actions of the current situation are: [{admissible}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
 REFLECT_PROMPT = """Analyze the trajectory below.
 
@@ -187,9 +191,9 @@ class SimpleAgent(BaseSkillEvolving):
         history_window = 2
         triplets = []  # collect (system, user, assistant) per step
 
-        # Build system prompt with skills
-        skill_section = self._skill_mgr.format_for_prompt() if self._skill_mgr else "(none)"
-        system = SYSTEM_PROMPT.format(task_goal=goal, skill_section=skill_section)
+        # Build skill section
+        skill_section = self._skill_mgr.format_for_prompt() if self._skill_mgr else ""
+        has_skills = bool(skill_section and skill_section != "(none)")
 
         for step in range(self.max_turns):
             cmds = info.get("admissible_commands", [])
@@ -197,24 +201,28 @@ class SimpleAgent(BaseSkillEvolving):
                 cmds = cmds[0]
             admissible = "; ".join(cmds) if cmds else ""
 
-            # Build user prompt with current progress (history embedded)
-            history_text = self._format_history(recent[-history_window:]) if recent else "(none)"
-            user = USER_PROMPT.format(
-                step_count=step,
-                current_step=step + 1,
-                obs=obs,
-                admissible=admissible,
-                history=history_text,
-            )
+            # Single user message per turn (SkillRL style — no system role)
+            if step == 0 and not has_skills and not recent:
+                prompt = TEMPLATE_NO_HISTORY.format(obs=obs, admissible=admissible)
+            else:
+                action_history = self._format_history(recent[-history_window:]) if recent else "(none)"
+                prompt = TEMPLATE_WITH_MEMORY.format(
+                    task_goal=goal,
+                    skill_section=skill_section,
+                    step_count=step,
+                    history_length=min(len(recent), history_window),
+                    action_history=action_history,
+                    current_step=step + 1,
+                    obs=obs,
+                    admissible=admissible,
+                )
 
-            # Each turn: system + fresh user message (no history accumulation)
-            turn_msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            turn_msgs = [{"role": "user", "content": prompt}]
             response = self._chat(turn_msgs)
             action = self._parse_action(response)
             triplets.append({
                 "step": step,
-                "system": system,
-                "user": user,
+                "user": prompt,
                 "assistant": response,
             })
 
