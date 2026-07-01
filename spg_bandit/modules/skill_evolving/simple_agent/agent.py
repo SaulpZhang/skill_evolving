@@ -1,11 +1,14 @@
-"""Simple skill evolving agent for ALFWorld.
+"""Simple skill evolving agent for ALFWorld — SkillRL-inspired design.
 
-After each task, reflects on the trajectory and saves skills
-in Anthropic SKILL.md format under spg_bandit/skills/<run_id>/.
+- Structured prompt: system with Retrieved Relevant Experience, per-turn Current Progress
+- Model outputs <think>reasoning</think><action>command</action>
+- Skills stored in skills.json (general, task_specific, common_mistakes)
+- Reflection: on failure, generate new skills via LLM
 """
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -14,43 +17,52 @@ from openai import OpenAI
 
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving
+from spg_bandit.modules.skill_evolving.simple_agent.skill_manager import SkillManager
 
 load_dotenv(Path(__file__).parents[4] / ".env")
 
-SYSTEM_PROMPT = """You are in a text-based household. Complete the task by issuing commands.
+SYSTEM_PROMPT = """You are an expert agent operating in the ALFRED Embodied Environment.
+Your task is to: {task_goal}
 
-Rules:
-- Output ONLY the command.
-- Use EXACT object names from the observation.
+## Retrieved Relevant Experience
+{skill_section}"""
 
-you have access to the following skills to help you complete the task:
-{skill_hint}"""
+USER_PROMPT = """## Current Progress
 
-REFLECT_PROMPT = """You completed a task and {outcome}.
+Prior to this step, you have already taken {step_count} step(s).
+Below are the most recent observations and the corresponding actions you took:
+{history}
 
-Task: {task}
+You are now at step {current_step} and your current observation is:
+{obs}
 
-Skills used: {skills_used}
+Your admissible actions of the current situation are: [{admissible}].
 
-Existing skills: {existing_skills}
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
-Last actions: {trajectory}
+REFLECT_PROMPT = """Analyze the failed agent trajectory below and suggest NEW skills to add to the skill bank.
 
-You can learn something from the above information, especially the trace. You have four options:
-- SKILL: name | description | content
-- UPDATE: name | description | content
-- DELETE: name
-- NO CHANGE
+TASK: {task}
+TASK TYPE: {task_type}
+TRAJECTORY (last 5 steps):
+{trajectory}
 
-Description must say what the skill IS and WHEN to use it.
+EXISTING SKILL TITLES (avoid duplicating these):
+{existing_titles}
 
-You should only output one of the four options above. If you want to create a new skill, use SKILL. If you want to update an existing skill, use UPDATE. If you want to delete an existing skill, use DELETE. If you don't want to change anything, use NO CHANGE.
+Generate 1-3 NEW actionable skills that would help avoid this failure in the future.
+Each skill must have: skill_id (use "dyn_001", "dyn_002" etc.), title (3-5 words), principle (1-2 sentences), when_to_apply (when to use this skill).
 
-Your response:"""
+Return ONLY a JSON array of skills, no other text.
+Example: ```json
+[{{"skill_id": "dyn_001", "title": "Verify Object Location First", "principle": "Before attempting to pick up an object, always verify its current location.", "when_to_apply": "When the task requires moving an object but its location is uncertain"}}]
+```
+"""
 
 
 class SimpleAgent(BaseSkillEvolving):
-    """ALFWorld agent with ReAct loop and post-task skill evolution."""
+    """ALFWorld agent with SkillRL-style prompt and skill evolution."""
 
     def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30,
                  records_dir: str = None):
@@ -67,19 +79,17 @@ class SimpleAgent(BaseSkillEvolving):
         self._model = os.getenv("LLM_MODEL")
         self._total_calls = 0
         self._skills_dir = None
+        self._skill_mgr: SkillManager | None = None
         self._loaded_skill = None
-        self._loaded_skills_list = []
 
     def load_skills(self, skills_dir: str):
-        """Load skills from a directory for later use."""
+        """Load skills from a directory (skills.json)."""
         self._skills_dir = Path(skills_dir)
-        self._loaded_skills_list = []
-        if self._skills_dir.exists():
-            for d in sorted(self._skills_dir.iterdir()):
-                if d.is_dir() and (d / "SKILL.md").exists():
-                    self._loaded_skills_list.append(d.name)
-            if self._loaded_skills_list:
-                print(f"  >>> Loaded {len(self._loaded_skills_list)} skills from {skills_dir}", flush=True)
+        self._skill_mgr = SkillManager(skills_dir)
+        c = self._skill_mgr.count
+        total = c["general"] + c["task_specific"] + c["common_mistakes"]
+        if total:
+            print(f"  >>> Loaded {total} skills from {skills_dir}", flush=True)
 
     def get_usage(self) -> dict:
         return {"api_calls": self._total_calls}
@@ -88,8 +98,8 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=256, max_context_pairs=8):
-        """Chat with context trimming: system + last N complete pairs + current user."""
+    def _chat(self, messages, max_tokens=512, max_context_pairs=6):
+        """Chat with context trimming. Returns raw response."""
         self._total_calls += 1
         keep_limit = max_context_pairs * 2 + 2
         if len(messages) > keep_limit:
@@ -103,7 +113,6 @@ class SimpleAgent(BaseSkillEvolving):
         ).choices[0].message.content.strip()
 
     def _save_messages(self, task_id: int, messages: list, prefix: str = ""):
-        """Save messages history as JSON."""
         if not self._records_dir:
             return
         tag = f"{prefix}task_{task_id}" if prefix else f"task_{task_id}"
@@ -111,111 +120,27 @@ class SimpleAgent(BaseSkillEvolving):
         with open(path, "w") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
 
-    def _available_skills(self) -> str:
-        """List available skills for system prompt."""
-        if not self._skills_dir or not self._loaded_skills_list:
-            return ""
-        lines = ["\n\nAvailable skills:"]
-        for name in self._loaded_skills_list:
-            sf = self._skills_dir / name / "SKILL.md"
-            if sf.exists():
-                meta = sf.read_text().split("---")
-                desc = ""
-                if len(meta) > 1:
-                    for line in meta[1].split("\n"):
-                        if line.startswith("description:"):
-                            desc = line.split(":", 1)[1].strip()
-                lines.append(f"  {name}: {desc}")
-        lines.append("\nTo use: USE SKILL: <name>")
+    def _parse_action(self, response: str) -> str:
+        """Extract action from <action> or [action] tags."""
+        for pattern in [r"<action>(.*?)</action>", r"\[action\](.*?)\[/action\]"]:
+            m = re.search(pattern, response, re.DOTALL)
+            if m:
+                return m.group(1).strip()
+        return response.strip()
+
+    def _format_history(self, recent: list) -> str:
+        """Format recent (obs, action) pairs for the history section."""
+        lines = []
+        for i, (obs, act) in enumerate(recent, 1):
+            lines.append(f"[Observation {i}: '{obs}', Action {i}: '{act}']")
         return "\n".join(lines)
 
-    def _save_skill(self, name, description, content):
-        if not self._skills_dir:
-            return
-        name = name.strip().replace(" ", "_")[:64]
-        if not name:
-            return
-        d = self._skills_dir / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "scripts").mkdir(exist_ok=True)
-        (d / "references").mkdir(exist_ok=True)
-        (d / "assets").mkdir(exist_ok=True)
-        text = f"---\nname: {name}\ndescription: {description}\n---\n\n{content.strip()}\n"
-        (d / "SKILL.md").write_text(text)
-        if name not in self._loaded_skills_list:
-            self._loaded_skills_list.append(name)
-        print(f"  >>> Skill saved: {name}", flush=True)
-
-    def _delete_skill(self, name):
-        if not self._skills_dir or not name:
-            return
-        d = self._skills_dir / name
-        if d.exists():
-            import shutil
-            shutil.rmtree(d)
-            if name in self._loaded_skills_list:
-                self._loaded_skills_list.remove(name)
-            print(f"  >>> Skill deleted: {name}", flush=True)
-
-    def _existing_skills_str(self) -> str:
-        if not self._skills_dir or not self._skills_dir.exists():
-            return "(none)"
-        names = sorted(d.name for d in self._skills_dir.iterdir() if d.is_dir())
-        return ", ".join(names) if names else "(none)"
-
-    def reflect(self, task_id: int, result: dict):
-        """Reflect on task execution and evolve skills."""
-        goal = self._dataset.get_task_goal(task_id)
-        success = result["success"]
-        traj = result["trajectory"]
-        outcome = "succeeded" if success else "failed"
-        skills_used = result.get("loaded_skill", "(none)")
-        existing = self._existing_skills_str()
-        prompt = REFLECT_PROMPT.format(
-            outcome=outcome, task=goal, trajectory=traj,
-            skills_used=skills_used, existing_skills=existing,
-        )
-        result_text = self._chat([{"role": "user", "content": prompt}], max_tokens=1024)
-        result_upper = result_text.upper().strip()
-
-        # Save reflection messages
-        self._save_messages(task_id, [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": result_text},
-        ], prefix="reflection_")
-
-        if not result_text or result_upper == "NO CHANGE":
-            print(f"  >>> Reflection: {'no response' if not result_text else 'no changes needed'}", flush=True)
-            return
-
-        for line in result_text.split("\n"):
-            line = line.strip()
-            upper = line.upper()
-            if upper.startswith("SKILL:") or upper.startswith("UPDATE:"):
-                prefix = "SKILL:" if upper.startswith("SKILL:") else "UPDATE:"
-                rest = line[len(prefix):].strip()
-                # Normalize Unicode pipe variants to ASCII
-                rest = rest.replace("｜", "|").replace("│", "|")
-                parts = rest.split("|", 2)
-                if len(parts) >= 2:
-                    name = parts[0].strip().replace(" ", "_")[:15]
-                    desc = parts[1].strip()
-                    content = parts[2].strip() if len(parts) > 2 else ""
-                    if upper.startswith("SKILL:"):
-                        self._save_skill(name, desc, content)
-                    else:
-                        self._save_skill(name, desc, content)  # same as create
-                        print(f"  >>> Skill updated: {name}", flush=True)
-            elif upper.startswith("DELETE:"):
-                name = line[len("DELETE:"):].strip().split("|")[0].strip().replace(" ", "_")[:15]
-                self._delete_skill(name)
-
-        print(f"  >>> Reflection: {result_text[:200]}", flush=True)
+    # ── Execution ─────────────────────────────────────────────────────
 
     def execute(self, task_id: int) -> dict:
         goal = self._dataset.get_task_goal(task_id)
         print(f"\n  --- Executing task {task_id}: {goal}", flush=True)
-        if self._skills_dir:
+        if self._skill_mgr:
             self.load_skills(str(self._skills_dir))
         calls_before = self._total_calls
         env, env_id = self._dataset.create_env(task_id)
@@ -223,11 +148,13 @@ class SimpleAgent(BaseSkillEvolving):
         obs = obs_tuple[0]
         actions = []
         traj_lines = []
+        recent = []  # recent (obs, action) pairs for history
+        history_window = 2
 
-        hint = self._available_skills()
-        system = SYSTEM_PROMPT.format(skill_hint=hint)
+        # Build system prompt with skills
+        skill_section = self._skill_mgr.format_for_prompt() if self._skill_mgr else "(none)"
+        system = SYSTEM_PROMPT.format(task_goal=goal, skill_section=skill_section)
         messages = [{"role": "system", "content": system}]
-        skill_injected = False
 
         for step in range(self.max_turns):
             cmds = info.get("admissible_commands", [])
@@ -235,35 +162,28 @@ class SimpleAgent(BaseSkillEvolving):
                 cmds = cmds[0]
             admissible = "; ".join(cmds) if cmds else ""
 
-            msg = (
-                f"Task: {goal}\n\n{obs}\n\n"
-                f"Valid commands: {admissible}\n\n"
-                "you can use the skills to assist you or give the next command to complete the task. If you want to use a skill, type 'USE SKILL: <name>' to load it. If you want give a command, type the command exactly as it appears in the valid commands list."
+            # Build user prompt with current progress
+            history_text = self._format_history(recent[-history_window:]) if recent else "(none)"
+            user = USER_PROMPT.format(
+                step_count=step,
+                current_step=step + 1,
+                obs=obs,
+                admissible=admissible,
+                history=history_text,
             )
-            messages.append({"role": "user", "content": msg})
-            action = self._chat(messages)
+            messages.append({"role": "user", "content": user})
+
+            response = self._chat(messages)
+            action = self._parse_action(response)
+
+            # Save the reasoning for logging
+            think_m = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+            reasoning = think_m.group(1).strip() if think_m else ""
+
+            messages.append({"role": "assistant", "content": response})
             actions.append(action)
             traj_lines.append(f"Agent: {action}")
-            print(f"    [{step}] {action}", flush=True)
-
-            # Handle USE SKILL request
-            if action.upper().startswith("USE SKILL:") and self._skills_dir:
-                name = action.split(":", 1)[-1].strip()
-                sf = self._skills_dir / name / "SKILL.md"
-                if sf.exists():
-                    self._loaded_skill = name
-                    content = sf.read_text()
-                    messages.append({"role": "assistant", "content": action})
-                    messages.append({"role": "user", "content": f"--- SKILL: {name} ---\n{content}\n---"})
-                    print(f"  >>> Loaded skill: {name}", flush=True)
-                    continue
-                else:
-                    available = []
-                    if self._skills_dir and self._skills_dir.exists():
-                        available = [d.name for d in self._skills_dir.iterdir() if d.is_dir()]
-                    messages.append({"role": "assistant", "content": action})
-                    messages.append({"role": "user", "content": f"Skill not found. Available: {', '.join(available)}"})
-                    continue
+            print(f"    [{step}] {action}" + (f"  (reasoning: {reasoning[:80]})" if reasoning else ""), flush=True)
 
             if not action or len(action) < 3:
                 continue
@@ -273,23 +193,120 @@ class SimpleAgent(BaseSkillEvolving):
                 ob = obs2[0]
                 won = info2.get("won", [False])
                 won_flag = isinstance(won, (list, tuple)) and len(won) > 0 and won[0]
+
                 if won_flag or "You win!" in ob:
                     ALFWorldDataset.close_env(env, env_id)
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
-                    traj = "\n".join(traj_lines)
                     messages.append({"role": "user", "content": f"Result: {ob}"})
                     self._save_messages(task_id, messages)
-                    return {"success": True, "trajectory": traj, "actions": actions, "api_calls": self._total_calls - calls_before, "loaded_skill": self._loaded_skill}
+                    return {
+                        "success": True, "trajectory": "\n".join(traj_lines),
+                        "actions": actions, "reasoning": reasoning,
+                        "api_calls": self._total_calls - calls_before,
+                        "loaded_skill": self._loaded_skill,
+                    }
+
                 print(f"    -> {ob}", flush=True)
                 traj_lines.append(f"Obs: {ob}")
-                messages.append({"role": "assistant", "content": action})
+                recent.append((obs, action))
                 obs = ob
                 info = info2
             except Exception:
                 continue
 
         ALFWorldDataset.close_env(env, env_id)
-        traj = "\n".join(traj_lines)
         self._save_messages(task_id, messages)
-        return {"success": False, "trajectory": traj, "actions": actions, "api_calls": self._total_calls - calls_before, "loaded_skill": self._loaded_skill}
+        return {
+            "success": False, "trajectory": "\n".join(traj_lines),
+            "actions": actions, "reasoning": reasoning,
+            "api_calls": self._total_calls - calls_before,
+            "loaded_skill": self._loaded_skill,
+        }
+
+    # ── Reflection (skill evolution) ───────────────────────────────────
+
+    def reflect(self, task_id: int, result: dict):
+        """Reflect on task execution and evolve skills via LLM analysis."""
+        if result["success"]:
+            # Success: optionally generate skills too, but for now skip
+            print(f"  >>> Reflection: task succeeded, no new skills needed", flush=True)
+            return
+
+        if not self._skill_mgr:
+            return
+
+        goal = self._dataset.get_task_goal(task_id)
+        traj = result.get("trajectory", "")
+        traj_lines = traj.split("\n")
+        last_steps = traj_lines[-10:]  # last 10 lines for context
+
+        # Build trajectory summary (last 5 action-obs pairs)
+        steps_text = "\n".join(last_steps)
+
+        existing_titles = self._skill_mgr.existing_titles()
+
+        prompt = REFLECT_PROMPT.format(
+            task=goal,
+            task_type=self._detect_task_type(goal),
+            trajectory=steps_text,
+            existing_titles=json.dumps(existing_titles),
+        )
+
+        response = self._chat([{"role": "user", "content": prompt}], max_tokens=2048)
+
+        # Parse JSON array from response
+        new_skills = self._parse_skills_response(response)
+        if not new_skills:
+            print(f"  >>> Reflection: no skills generated", flush=True)
+            return
+
+        # Determine category — try task-specific first
+        task_type = self._detect_task_type(goal)
+        if task_type in self._skill_mgr.skills.get("task_specific_skills", {}):
+            category = task_type
+        else:
+            category = "general"
+
+        added = 0
+        for skill in new_skills:
+            if self._skill_mgr.add_skill(skill, category):
+                added += 1
+
+        if added:
+            self._skill_mgr.save()
+            print(f"  >>> Reflection: added {added} new skill(s) ({category})", flush=True)
+        else:
+            print(f"  >>> Reflection: no new skills (duplicates)", flush=True)
+
+    def _detect_task_type(self, goal: str) -> str:
+        """Infer task category from goal string."""
+        goal = goal.lower()
+        if "look" in goal and "light" in goal:
+            return "look_at_obj_in_light"
+        if "clean" in goal:
+            return "clean"
+        if "heat" in goal or "microwave" in goal:
+            return "heat"
+        if "cool" in goal or "refrigerate" in goal or "fridge" in goal or "chill" in goal:
+            return "cool"
+        if "two" in goal:
+            return "pick_two_obj_and_place"
+        if "examine" in goal:
+            return "examine"
+        return "pick_and_place"
+
+    def _parse_skills_response(self, response: str) -> list:
+        """Parse JSON array from reflection LLM response."""
+        try:
+            start = response.find("[")
+            end = response.rfind("]") + 1
+            if start != -1 and end > start:
+                skills = json.loads(response[start:end])
+                return [
+                    s for s in skills
+                    if all(k in s for k in ["skill_id", "title", "principle"])
+                ]
+        except (json.JSONDecodeError, Exception):
+            pass
+        return []
