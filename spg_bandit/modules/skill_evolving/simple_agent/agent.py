@@ -122,11 +122,20 @@ class SimpleAgent(BaseSkillEvolving):
             }, f, indent=2, ensure_ascii=False)
 
     def _parse_action(self, response: str) -> str:
-        """Extract action from <action> or [action] tags."""
-        for pattern in [r"<action>(.*?)</action>", r"\[action\](.*?)\[/action\]"]:
-            m = re.search(pattern, response, re.DOTALL)
+        """Extract action from tags — handles various formats and malformed tags."""
+        # 1. Complete tags (HTML then BBCode)
+        for p in [r"<action>(.*?)</action>", r"\[action\](.*?)\[/action\]"]:
+            m = re.search(p, response, re.DOTALL)
             if m:
                 return m.group(1).strip()
+        # 2. Opening tag only — take the rest of the line
+        m = re.search(r"(?:<action>|\[action\])\s*(.*)", response, re.DOTALL)
+        if m:
+            a = m.group(1).strip()
+            # Remove any trailing closing tag remnant
+            a = re.sub(r"\s*(</action>|\[/action\]).*", "", a)
+            return a.strip()
+        # 3. Fallback: use the whole response, stripped
         return response.strip()
 
     def _format_history(self, recent: list) -> str:
