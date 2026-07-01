@@ -161,10 +161,13 @@ class SimpleAgent(BaseSkillEvolving):
         m = re.search(r"(?:<action>|\[action\])\s*(.*)", response, re.DOTALL)
         if m:
             a = m.group(1).strip()
-            # Remove any trailing closing tag remnant
             a = re.sub(r"\s*(</action>|\[/action\]).*", "", a)
             return a.strip()
-        # 3. Fallback: use the whole response, stripped
+        # 3. Fallback: strip <think> reasoning, then use the first meaningful line
+        clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+        clean = re.sub(r"</?[a-z]+>|\[/?[a-z]+\]", "", clean).strip()
+        if clean:
+            return clean.split("\n")[0].strip()
         return response.strip()
 
     def _format_history(self, recent: list) -> str:
