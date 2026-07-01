@@ -22,6 +22,12 @@ Skills stored in a single `skills.json` under `spg_bandit/skills/<run_id>/skills
     {"skill_id": "pnp_001", "title": "Direct Path Planning",
      "principle": "Navigate directly to the target receptacle after acquiring the object.",
      "when_to_apply": "After picking up the object, before exploring further."}
+  ],
+  "common_mistakes": [
+    {"skill_id": "mist_001", "title": "Revisiting Already Searched Locations",
+     "dont": "Repeatedly revisit the same already-searched containers.",
+     "instead": "Maintain an exploration map and prioritize unvisited candidates.",
+     "when_to_apply": "When the agent cannot find a target object."}
   ]
 }
 ```
@@ -40,8 +46,9 @@ Your task is to: {task_goal}
 Each category section:
 ```
 ### {category_name}
-- **{title}**: {principle}
-  *Apply when*: {when_to_apply}
+- General skills & task-specific use `**{title}**: {principle}`
+- Common mistakes use `**{title}**: Don't: {dont} Instead: {instead}`
+- All include `Apply when: {when_to_apply}`
 ```
 
 ### User Message (per turn)
