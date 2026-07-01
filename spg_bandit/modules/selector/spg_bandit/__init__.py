@@ -252,7 +252,8 @@ class SPGBanditSelector(BaseSelector):
         A_inv = np.linalg.inv(self._A)
         best_score, best_tid = -np.inf, 0
         for tau in range(task_pool.M):
-            phi = self._mlp.forward(task_pool.get_embedding(tau))
+            inp = np.concatenate([task_pool.get_embedding(tau), self._profile])
+            phi = self._mlp.forward(inp)
             delta_hat = self._W.T @ phi
             ucb = self._alpha * np.sqrt(max(phi @ A_inv @ phi, 1e-10))
             score = g @ delta_hat + ucb
@@ -296,8 +297,6 @@ class SPGBanditSelector(BaseSelector):
 
     def _finalize_warmup(self, task_pool: TaskPool):
         print(f"\n  [SPG] Finalizing warmup ({self._n_warm} tasks)...")
-        for tid in self._warmup_task_ids:
-            self._warmup_embeds.append(task_pool.get_embedding(tid))
 
         N = len(self._warmup_task_ids)
         R = np.full((N, task_pool.M), np.nan)
@@ -305,11 +304,13 @@ class SPGBanditSelector(BaseSelector):
             R[t, tid] = float(self._warmup_successes[t])
 
         # Sequential MIRT EM: run EM with cumulative data to compute per-step deltas
+        profiles_before = []
         profile = np.zeros(self._K)
         deltas = []
         for t in range(N):
             s_hist_t, *_ = fit_mirt_em(R[:t + 1], self._K, verbose=False)
-            new_profile = s_hist_t[-1]  # sigmoid-transformed ability, (K,)
+            new_profile = s_hist_t[-1]
+            profiles_before.append(profile.copy())
             deltas.append(new_profile - profile)
             profile = new_profile
 
@@ -321,10 +322,13 @@ class SPGBanditSelector(BaseSelector):
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i})
 
-        # MLP training with proper sequential deltas
+        # MLP training: X = [embedding(384) | profile_before(K)], y = delta(K)
+        embeds = [task_pool.get_embedding(tid) for tid in self._warmup_task_ids]
+        X = np.array([np.concatenate([e, p]) for e, p in zip(embeds, profiles_before)])
+        y = np.array(deltas)
         self._warmup_deltas = deltas
-        self._mlp = MLPFeaturizer(task_pool.d_c, self._d_h, self._d_f, self._seed)
-        loss_hist = self._mlp.train(np.array(self._warmup_embeds), np.array(self._warmup_deltas), 50, wandb_prefix="spg")
+        self._mlp = MLPFeaturizer(task_pool.d_c + self._K, self._d_h, self._d_f, self._seed)
+        loss_hist = self._mlp.train(X, y, 50, wandb_prefix="spg")
         self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
 
