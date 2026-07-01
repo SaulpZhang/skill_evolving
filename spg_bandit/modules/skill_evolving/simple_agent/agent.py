@@ -150,6 +150,14 @@ class SimpleAgent(BaseSkillEvolving):
                 "triplets": triplets,
             }, f, indent=2, ensure_ascii=False)
 
+    @staticmethod
+    def _clean_action(action: str) -> str:
+        """Strip tag remnants and trailing noise from an extracted action."""
+        a = action.strip()
+        # Remove trailing tag remnants like ;</action> or </action>
+        a = re.sub(r"\s*[;,]?\s*(</action>|\[/action\]|\])[\s\S]*$", "", a)
+        return a.strip()
+
     def _parse_action(self, response: str) -> str:
         """Extract action from tags — handles various formats and malformed tags."""
         # 1. Complete tags
@@ -160,13 +168,11 @@ class SimpleAgent(BaseSkillEvolving):
         ]:
             m = re.search(p, response, re.DOTALL)
             if m:
-                return m.group(1).strip()
+                return self._clean_action(m.group(1))
         # 2. Opening tag only — take the rest
         m = re.search(r"(?:<action>|\[action>|\[action\])\s*(.*)", response, re.DOTALL)
         if m:
-            a = m.group(1).strip()
-            a = re.sub(r"\s*(</action>|\[/action\]|\])[^a-z]*", "", a)
-            return a.strip()
+            return self._clean_action(m.group(1))
         # 3. Fallback: strip <think> reasoning, take first line
         clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         clean = re.sub(r"</?[a-z]+>|\[/?[a-z]+\>?|\[\/?[a-z]+\]", "", clean).strip()
