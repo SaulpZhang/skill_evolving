@@ -152,11 +152,12 @@ class SimpleAgent(BaseSkillEvolving):
 
     @staticmethod
     def _clean_action(action: str) -> str:
-        """Strip tag remnants and trailing noise from an extracted action."""
+        """Strip tag remnants, take only the first command if multi-action."""
         a = action.strip()
-        # Remove trailing tag remnants like ;</action> or </action>
         a = re.sub(r"\s*[;,]?\s*(</action>|\[/action\]|\])[\s\S]*$", "", a)
-        return a.strip()
+        # Take only the first command (before any ; or ,)
+        a = a.split(";")[0].split(",")[0].strip()
+        return a
 
     def _parse_action(self, response: str) -> str:
         """Extract action from tags — handles various formats and malformed tags."""
