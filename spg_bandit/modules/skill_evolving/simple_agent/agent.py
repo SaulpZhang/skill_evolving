@@ -111,7 +111,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=512, client=None, model=None):
+    def _chat(self, messages, max_tokens=1024, client=None, model=None):
         """Chat. Optionally override client/model (e.g. for reflection)."""
         self._total_calls += 1
         c = client or self._client
@@ -202,7 +202,7 @@ class SimpleAgent(BaseSkillEvolving):
         actions = []
         traj_lines = []
         recent = []  # recent (obs, action) pairs for history
-        history_window = 2
+        history_window = 5
         triplets = []  # collect (system, user, assistant) per step
 
         # Build skill section
