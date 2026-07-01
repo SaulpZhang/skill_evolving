@@ -98,18 +98,12 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=512, max_context_pairs=6):
-        """Chat with context trimming. Returns raw response."""
+    def _chat(self, messages, max_tokens=512):
+        """Chat. Saves messages before API call."""
         self._total_calls += 1
-        keep_limit = max_context_pairs * 2 + 2
-        if len(messages) > keep_limit:
-            n_keep = max_context_pairs * 2 + 1
-            msgs = [messages[0]] + messages[-n_keep:]
-        else:
-            msgs = messages
         return self._client.chat.completions.create(
-            model=self._model, messages=msgs, max_tokens=max_tokens,
-            temperature=0.3,
+            model=self._model, messages=messages, max_tokens=max_tokens,
+            temperature=0.0,
         ).choices[0].message.content.strip()
 
     def _save_messages(self, task_id: int, messages: list, prefix: str = ""):
@@ -119,6 +113,16 @@ class SimpleAgent(BaseSkillEvolving):
         path = self._records_dir / f"{tag}_{int(time.time())}.json"
         with open(path, "w") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
+
+    def _save_trace(self, task_id: int, trace: list):
+        """Save the full API call trace (each turn's messages) for a task."""
+        if not self._records_dir:
+            return
+        trace_dir = self._records_dir / "trace"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        path = trace_dir / f"task_{task_id}_{int(time.time())}.json"
+        with open(path, "w") as f:
+            json.dump({"task_id": task_id, "trace": trace}, f, indent=2, ensure_ascii=False)
 
     def _parse_action(self, response: str) -> str:
         """Extract action from <action> or [action] tags."""
@@ -150,11 +154,11 @@ class SimpleAgent(BaseSkillEvolving):
         traj_lines = []
         recent = []  # recent (obs, action) pairs for history
         history_window = 2
+        trace = []  # collect all turn messages for saving
 
         # Build system prompt with skills
         skill_section = self._skill_mgr.format_for_prompt() if self._skill_mgr else "(none)"
         system = SYSTEM_PROMPT.format(task_goal=goal, skill_section=skill_section)
-        messages = [{"role": "system", "content": system}]
 
         for step in range(self.max_turns):
             cmds = info.get("admissible_commands", [])
@@ -162,7 +166,7 @@ class SimpleAgent(BaseSkillEvolving):
                 cmds = cmds[0]
             admissible = "; ".join(cmds) if cmds else ""
 
-            # Build user prompt with current progress
+            # Build user prompt with current progress (history embedded)
             history_text = self._format_history(recent[-history_window:]) if recent else "(none)"
             user = USER_PROMPT.format(
                 step_count=step,
@@ -171,16 +175,16 @@ class SimpleAgent(BaseSkillEvolving):
                 admissible=admissible,
                 history=history_text,
             )
-            messages.append({"role": "user", "content": user})
 
-            response = self._chat(messages)
+            # Each turn: system + fresh user message (no history accumulation)
+            turn = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            trace.append({"step": step, "messages": turn})
+            response = self._chat(turn)
             action = self._parse_action(response)
 
-            # Save the reasoning for logging
             think_m = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
             reasoning = think_m.group(1).strip() if think_m else ""
 
-            messages.append({"role": "assistant", "content": response})
             actions.append(action)
             traj_lines.append(f"Agent: {action}")
             print(f"    [{step}] {action}" + (f"  (reasoning: {reasoning[:80]})" if reasoning else ""), flush=True)
@@ -198,8 +202,13 @@ class SimpleAgent(BaseSkillEvolving):
                     ALFWorldDataset.close_env(env, env_id)
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
-                    messages.append({"role": "user", "content": f"Result: {ob}"})
-                    self._save_messages(task_id, messages)
+                    self._save_trace(task_id, trace)
+                    self._save_messages(task_id, [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                        {"role": "assistant", "content": response},
+                        {"role": "user", "content": f"Result: {ob}"},
+                    ])
                     return {
                         "success": True, "trajectory": "\n".join(traj_lines),
                         "actions": actions, "reasoning": reasoning,
@@ -216,7 +225,12 @@ class SimpleAgent(BaseSkillEvolving):
                 continue
 
         ALFWorldDataset.close_env(env, env_id)
-        self._save_messages(task_id, messages)
+        self._save_trace(task_id, trace)
+        self._save_messages(task_id, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": response},
+        ])
         return {
             "success": False, "trajectory": "\n".join(traj_lines),
             "actions": actions, "reasoning": reasoning,
