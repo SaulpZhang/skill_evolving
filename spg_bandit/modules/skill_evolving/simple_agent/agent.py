@@ -118,7 +118,7 @@ class SimpleAgent(BaseSkillEvolving):
         m = model or self._model
         return c.chat.completions.create(
             model=m, messages=messages, max_tokens=max_tokens,
-            temperature=0.0,
+            temperature=0.3,
         ).choices[0].message.content.strip()
 
     def _save_reflection(self, task_id: int, prompt: str, response: str):
