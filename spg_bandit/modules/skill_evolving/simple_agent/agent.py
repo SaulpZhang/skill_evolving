@@ -297,7 +297,7 @@ class SimpleAgent(BaseSkillEvolving):
         outcome = "succeeded" if result["success"] else "failed"
         goal = self._dataset.get_task_goal(task_id)
         traj = result.get("trajectory", "")
-        steps_text = "\n".join(traj.split("\n")[-10:])
+        steps_text = traj
         existing_titles = self._skill_mgr.existing_titles()
 
         prompt = REFLECT_PROMPT.format(
