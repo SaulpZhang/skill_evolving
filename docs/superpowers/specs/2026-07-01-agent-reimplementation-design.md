@@ -24,13 +24,20 @@ Skills stored in a single `skills.json` under `spg_bandit/skills/<run_id>/skills
      "when_to_apply": "After picking up the object, before exploring further."}
   ],
   "common_mistakes": [
-    {"skill_id": "mist_001", "title": "Revisiting Already Searched Locations",
-     "dont": "Repeatedly revisit the same already-searched containers.",
-     "instead": "Maintain an exploration map and prioritize unvisited candidates.",
-     "when_to_apply": "When the agent cannot find a target object."}
+    {"skill_id": "mist_001",
+     "dont": "Repeatedly revisit the same already-searched locations or containers instead of exploring new ones.",
+     "instead": "Maintain an exploration map that records which rooms/containers have been fully inspected and prioritize unvisited or unopened candidates until all reasonable options are exhausted."}
   ]
 }
 ```
+
+## Category Name Mapping
+
+| JSON key | Prompt heading |
+|---|---|
+| `general` | `### General Principles` |
+| `task_specific` | `### Pick And Place Skills` |
+| `common_mistakes` | `### Mistakes to Avoid` |
 
 ## Prompt Structure
 
@@ -40,32 +47,33 @@ You are an expert agent operating in the ALFRED Embodied Environment.
 Your task is to: {task_goal}
 
 ## Retrieved Relevant Experience
-{formatted_categories}
-```
 
-Each category section:
-```
-### {category_name}
-- General skills & task-specific use `**{title}**: {principle}`
-- Common mistakes use `**{title}**: Don't: {dont} Instead: {instead}`
-- All include `Apply when: {when_to_apply}`
+### General Principles
+- **{title}**: {principle}
+
+### Pick And Place Skills
+- **{title}**: {principle} _Apply when: {when_to_apply}_
+
+### Mistakes to Avoid
+- **Don't**: {dont} **Instead**: {instead}
 ```
 
 ### User Message (per turn)
 ```
 ## Current Progress
+
 Prior to this step, you have already taken N step(s).
-Below are the most recent observations:
-[Structued recent history]
+Below are the most recent observations and the corresponding actions you took:
+[Observation 1: '{obs_1}', Action 1: '{action_1}']
+[Observation 2: '{obs_2}', Action 2: '{action_2}']
 
 You are now at step N and your current observation is:
 {obs}
 
-Your admissible actions are: [{admissible_actions}]
+Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step within <think> </think> tags.
-Then present your action within <action> </action> tags.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 ```
 
 ## Model Output Parsing
@@ -85,8 +93,9 @@ Trajectory: {trajectory}
 Based on this experience, generate new skills or update existing ones.
 Return JSON format:
 {"actions": [
-  {"type": "create", "category": "general|task_specific",
-   "skill_id": "...", "title": "...", "principle": "...", "when_to_apply": "..."},
+  {"type": "create", "category": "general|task_specific|common_mistakes",
+   "skill_id": "...", "title": "...", "principle": "...", "when_to_apply": "...",
+   "dont": "...", "instead": "..."},
   {"type": "update", ...},
   {"type": "delete", "skill_id": "..."}
 ]}
