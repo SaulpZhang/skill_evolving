@@ -41,8 +41,9 @@ Your admissible actions of the current situation are: [{admissible}].
 Now it's your turn to take an action.
 You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
-REFLECT_PROMPT = """Analyze the agent trajectory below. The outcome was: {outcome}
+REFLECT_PROMPT = """Analyze the trajectory below.
 
+OUTCOME: {outcome}
 TASK: {task}
 TASK TYPE: {task_type}
 TRAJECTORY (last steps):
@@ -51,13 +52,16 @@ TRAJECTORY (last steps):
 EXISTING SKILL TITLES (avoid duplicating these):
 {existing_titles}
 
-- If SUCCESS: extract the planning pattern as a reusable skill (title, principle, when_to_apply).
-- If FAILED: suggest new skills that would help avoid this failure.
+If SUCCESS → extract a planning_pattern (generalized execution template):
+- Abstract the trajectory into a high-level logical chain using " -> ".
+- NEVER use specific object names. Replace with [Object_1], [Object_2], [Location], [Target_Location].
+- Return JSON: {{"planning_pattern": "Search [Location] -> Acquire [Object] -> Use [Appliance] -> Place [Target]", "title": "3-5 word title", "principle": "1-2 sentence explanation"}}
 
-Generate 0-3 NEW actionable skills. Each skill must have: skill_id, title (3-5 words), principle (1-2 sentences), when_to_apply.
-For failed tasks, skills can also be {"skill_id": "mist_...", "description": "...", "how_to_avoid": "..."} for common mistakes.
+If FAILED → extract mistakes_to_avoid:
+- Use abstract terms only: [Target_Object], [Container], [Location].
+- Return JSON: {{"mistakes_to_avoid": [{{"trigger_condition": "abstract context", "bad_action": "abstract incorrect action"}}]}}
 
-Return ONLY a JSON array of skills, no other text."""
+Return ONLY the JSON object, no other text."""
 
 
 class SimpleAgent(BaseSkillEvolving):
@@ -76,6 +80,12 @@ class SimpleAgent(BaseSkillEvolving):
             timeout=120,
         )
         self._model = os.getenv("LLM_MODEL")
+        self._reflect_client = OpenAI(
+            base_url=os.getenv("REFLECTION_BASE_URL", os.getenv("LLM_BASE_URL")),
+            api_key=os.getenv("REFLECTION_API_KEY", os.getenv("LLM_API_KEY")),
+            timeout=120,
+        )
+        self._reflect_model = os.getenv("REFLECTION_MODEL", os.getenv("LLM_MODEL"))
         self._total_calls = 0
         self._skills_dir = None
         self._skill_mgr: SkillManager | None = None
@@ -97,11 +107,13 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=512):
-        """Chat. Saves messages before API call."""
+    def _chat(self, messages, max_tokens=512, client=None, model=None):
+        """Chat. Optionally override client/model (e.g. for reflection)."""
         self._total_calls += 1
-        return self._client.chat.completions.create(
-            model=self._model, messages=messages, max_tokens=max_tokens,
+        c = client or self._client
+        m = model or self._model
+        return c.chat.completions.create(
+            model=m, messages=messages, max_tokens=max_tokens,
             temperature=0.0,
         ).choices[0].message.content.strip()
 
@@ -273,32 +285,44 @@ class SimpleAgent(BaseSkillEvolving):
             existing_titles=json.dumps(existing_titles),
         )
 
-        response = self._chat([{"role": "user", "content": prompt}], max_tokens=2048)
+        response = self._chat([{"role": "user", "content": prompt}], max_tokens=2048,
+                               client=self._reflect_client, model=self._reflect_model)
         self._save_reflection(task_id, prompt, response)
 
-        # Parse JSON array from response
-        new_skills = self._parse_skills_response(response)
-        if not new_skills:
+        # Parse reflection JSON response
+        result_json = self._parse_reflection_json(response)
+        if not result_json:
             print(f"  >>> Reflection: no skills generated", flush=True)
             return
 
         added = 0
-        for skill in new_skills:
-            is_mistake = skill.get("skill_id", "").startswith("mist_") or "description" in skill
-            if is_mistake:
-                category = "common_mistakes"
-            else:
-                task_type = self._detect_task_type(goal)
-                category = task_type if task_type in self._skill_mgr.skills.get("task_specific_skills", {}) else "general"
 
-            if self._skill_mgr.add_skill(skill, category):
-                added += 1
+        if result.get("success"):
+            # Success: extract planning_pattern as a general skill
+            pattern = result_json.get("planning_pattern", "")
+            title = result_json.get("title", "")
+            principle = result_json.get("principle", "")
+            if pattern and title:
+                skill = {"skill_id": f"dyn_{int(time.time())}", "title": title, "principle": pattern}
+                if self._skill_mgr.add_skill(skill, "general"):
+                    added += 1
+        else:
+            # Failure: extract mistakes_to_avoid
+            for m in result_json.get("mistakes_to_avoid", []):
+                desc = m.get("trigger_condition", "")
+                fix = m.get("bad_action", "")
+                if desc:
+                    mistake = {
+                        "mistake_id": f"mist_{int(time.time())}_{added}",
+                        "description": desc,
+                        "how_to_avoid": fix,
+                    }
+                    if self._skill_mgr.add_skill(mistake, "common_mistakes"):
+                        added += 1
 
         if added:
             self._skill_mgr.save()
-            print(f"  >>> Reflection: added {added} new skill(s) ({category})", flush=True)
-        else:
-            print(f"  >>> Reflection: no new skills (duplicates)", flush=True)
+            print(f"  >>> Reflection: added {added} new item(s)", flush=True)
 
     def _detect_task_type(self, goal: str) -> str:
         """Infer task category from goal string."""
@@ -317,20 +341,13 @@ class SimpleAgent(BaseSkillEvolving):
             return "examine"
         return "pick_and_place"
 
-    def _parse_skills_response(self, response: str) -> list:
-        """Parse JSON array from reflection LLM response."""
+    def _parse_reflection_json(self, response: str) -> dict:
+        """Parse reflection JSON: {planning_pattern} or {mistakes_to_avoid}."""
         try:
-            start = response.find("[")
-            end = response.rfind("]") + 1
+            start = response.find("{")
+            end = response.rfind("}") + 1
             if start != -1 and end > start:
-                skills = json.loads(response[start:end])
-                valid = []
-                for s in skills:
-                    if all(k in s for k in ["skill_id", "title", "principle"]):
-                        valid.append(s)
-                    elif all(k in s for k in ["skill_id", "description", "how_to_avoid"]):
-                        valid.append(s)
-                return valid
+                return json.loads(response[start:end])
         except (json.JSONDecodeError, Exception):
             pass
-        return []
+        return {}
