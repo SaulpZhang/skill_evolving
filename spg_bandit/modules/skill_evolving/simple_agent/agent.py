@@ -152,20 +152,24 @@ class SimpleAgent(BaseSkillEvolving):
 
     def _parse_action(self, response: str) -> str:
         """Extract action from tags — handles various formats and malformed tags."""
-        # 1. Complete tags (HTML then BBCode)
-        for p in [r"<action>(.*?)</action>", r"\[action\](.*?)\[/action\]"]:
+        # 1. Complete tags
+        for p in [
+            r"<action>(.*?)</action>",              # <action>xxx</action>
+            r"\[action\](.*?)\[/action\]",           # [action]xxx[/action]
+            r"\[action>\s*(.*?)\s*\]",               # [action> xxx ]
+        ]:
             m = re.search(p, response, re.DOTALL)
             if m:
                 return m.group(1).strip()
-        # 2. Opening tag only — take the rest of the line
-        m = re.search(r"(?:<action>|\[action\])\s*(.*)", response, re.DOTALL)
+        # 2. Opening tag only — take the rest
+        m = re.search(r"(?:<action>|\[action>|\[action\])\s*(.*)", response, re.DOTALL)
         if m:
             a = m.group(1).strip()
-            a = re.sub(r"\s*(</action>|\[/action\]).*", "", a)
+            a = re.sub(r"\s*(</action>|\[/action\]|\])[^a-z]*", "", a)
             return a.strip()
-        # 3. Fallback: strip <think> reasoning, then use the first meaningful line
+        # 3. Fallback: strip <think> reasoning, take first line
         clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-        clean = re.sub(r"</?[a-z]+>|\[/?[a-z]+\]", "", clean).strip()
+        clean = re.sub(r"</?[a-z]+>|\[/?[a-z]+\>?|\[\/?[a-z]+\]", "", clean).strip()
         if clean:
             return clean.split("\n")[0].strip()
         return response.strip()
