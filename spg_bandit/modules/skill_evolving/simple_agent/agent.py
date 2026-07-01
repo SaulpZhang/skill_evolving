@@ -41,24 +41,23 @@ Your admissible actions of the current situation are: [{admissible}].
 Now it's your turn to take an action.
 You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
-REFLECT_PROMPT = """Analyze the failed agent trajectory below and suggest NEW skills to add to the skill bank.
+REFLECT_PROMPT = """Analyze the agent trajectory below. The outcome was: {outcome}
 
 TASK: {task}
 TASK TYPE: {task_type}
-TRAJECTORY (last 5 steps):
+TRAJECTORY (last steps):
 {trajectory}
 
 EXISTING SKILL TITLES (avoid duplicating these):
 {existing_titles}
 
-Generate 1-3 NEW actionable skills that would help avoid this failure in the future.
-Each skill must have: skill_id (use "dyn_001", "dyn_002" etc.), title (3-5 words), principle (1-2 sentences), when_to_apply (when to use this skill).
+- If SUCCESS: extract the planning pattern as a reusable skill (title, principle, when_to_apply).
+- If FAILED: suggest new skills that would help avoid this failure.
 
-Return ONLY a JSON array of skills, no other text.
-Example: ```json
-[{{"skill_id": "dyn_001", "title": "Verify Object Location First", "principle": "Before attempting to pick up an object, always verify its current location.", "when_to_apply": "When the task requires moving an object but its location is uncertain"}}]
-```
-"""
+Generate 0-3 NEW actionable skills. Each skill must have: skill_id, title (3-5 words), principle (1-2 sentences), when_to_apply.
+For failed tasks, skills can also be {"skill_id": "mist_...", "description": "...", "how_to_avoid": "..."} for common mistakes.
+
+Return ONLY a JSON array of skills, no other text."""
 
 
 class SimpleAgent(BaseSkillEvolving):
@@ -258,23 +257,17 @@ class SimpleAgent(BaseSkillEvolving):
 
     def reflect(self, task_id: int, result: dict):
         """Reflect on task execution and evolve skills via LLM analysis."""
-        if result["success"]:
-            print(f"  >>> Reflection: task succeeded, no new skills needed", flush=True)
-            return
-
         if not self._skill_mgr:
             return
 
+        outcome = "succeeded" if result["success"] else "failed"
         goal = self._dataset.get_task_goal(task_id)
         traj = result.get("trajectory", "")
-        traj_lines = traj.split("\n")
-        last_steps = traj_lines[-10:]
-
-        steps_text = "\n".join(last_steps)
+        steps_text = "\n".join(traj.split("\n")[-10:])
         existing_titles = self._skill_mgr.existing_titles()
 
         prompt = REFLECT_PROMPT.format(
-            task=goal,
+            outcome=outcome, task=goal,
             task_type=self._detect_task_type(goal),
             trajectory=steps_text,
             existing_titles=json.dumps(existing_titles),
@@ -289,15 +282,15 @@ class SimpleAgent(BaseSkillEvolving):
             print(f"  >>> Reflection: no skills generated", flush=True)
             return
 
-        # Determine category — try task-specific first
-        task_type = self._detect_task_type(goal)
-        if task_type in self._skill_mgr.skills.get("task_specific_skills", {}):
-            category = task_type
-        else:
-            category = "general"
-
         added = 0
         for skill in new_skills:
+            is_mistake = skill.get("skill_id", "").startswith("mist_") or "description" in skill
+            if is_mistake:
+                category = "common_mistakes"
+            else:
+                task_type = self._detect_task_type(goal)
+                category = task_type if task_type in self._skill_mgr.skills.get("task_specific_skills", {}) else "general"
+
             if self._skill_mgr.add_skill(skill, category):
                 added += 1
 
@@ -331,10 +324,13 @@ class SimpleAgent(BaseSkillEvolving):
             end = response.rfind("]") + 1
             if start != -1 and end > start:
                 skills = json.loads(response[start:end])
-                return [
-                    s for s in skills
-                    if all(k in s for k in ["skill_id", "title", "principle"])
-                ]
+                valid = []
+                for s in skills:
+                    if all(k in s for k in ["skill_id", "title", "principle"]):
+                        valid.append(s)
+                    elif all(k in s for k in ["skill_id", "description", "how_to_avoid"]):
+                        valid.append(s)
+                return valid
         except (json.JSONDecodeError, Exception):
             pass
         return []
