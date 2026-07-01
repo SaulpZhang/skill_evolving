@@ -88,7 +88,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=256, max_context_pairs=4):
+    def _chat(self, messages, max_tokens=256, max_context_pairs=8):
         """Chat with context trimming: system + last N complete pairs + current user."""
         self._total_calls += 1
         keep_limit = max_context_pairs * 2 + 2
