@@ -39,7 +39,7 @@ refine-logs/
 .env
 
 config/
-docs/
+docs/*
 wandb/
 
 logs/
