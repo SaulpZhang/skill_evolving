@@ -106,6 +106,20 @@ class SimpleAgent(BaseSkillEvolving):
             temperature=0.0,
         ).choices[0].message.content.strip()
 
+    def _save_reflection(self, task_id: int, prompt: str, response: str):
+        """Save reflection API call (system=auto, user=prompt, assistant=response)."""
+        if not self._records_dir:
+            return
+        self._records_dir.mkdir(parents=True, exist_ok=True)
+        path = self._records_dir / f"reflection_{task_id}_{int(time.time())}.json"
+        with open(path, "w") as f:
+            json.dump({
+                "task_id": task_id,
+                "type": "reflection",
+                "user": prompt,
+                "assistant": response,
+            }, f, indent=2, ensure_ascii=False)
+
     def _save_triplets(self, task_id: int, triplets: list, result: dict):
         """Save all N triplets (system, user, assistant) + result to one JSON file."""
         if not self._records_dir:
@@ -245,7 +259,6 @@ class SimpleAgent(BaseSkillEvolving):
     def reflect(self, task_id: int, result: dict):
         """Reflect on task execution and evolve skills via LLM analysis."""
         if result["success"]:
-            # Success: optionally generate skills too, but for now skip
             print(f"  >>> Reflection: task succeeded, no new skills needed", flush=True)
             return
 
@@ -255,11 +268,9 @@ class SimpleAgent(BaseSkillEvolving):
         goal = self._dataset.get_task_goal(task_id)
         traj = result.get("trajectory", "")
         traj_lines = traj.split("\n")
-        last_steps = traj_lines[-10:]  # last 10 lines for context
+        last_steps = traj_lines[-10:]
 
-        # Build trajectory summary (last 5 action-obs pairs)
         steps_text = "\n".join(last_steps)
-
         existing_titles = self._skill_mgr.existing_titles()
 
         prompt = REFLECT_PROMPT.format(
@@ -270,6 +281,7 @@ class SimpleAgent(BaseSkillEvolving):
         )
 
         response = self._chat([{"role": "user", "content": prompt}], max_tokens=2048)
+        self._save_reflection(task_id, prompt, response)
 
         # Parse JSON array from response
         new_skills = self._parse_skills_response(response)
