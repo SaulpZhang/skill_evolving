@@ -89,11 +89,13 @@ class SimpleAgent(BaseSkillEvolving):
         self._loaded_skill = None
 
     def _chat(self, messages, max_tokens=256, max_context_pairs=4):
-        """Chat with context trimming: system + last max_context_pairs exchanges."""
+        """Chat with context trimming: system + last N complete pairs + current user."""
         self._total_calls += 1
-        # Trim to avoid context overflow: keep system + last N user/assistant pairs
-        if len(messages) > max_context_pairs * 2 + 1:
-            keep = [messages[0]] + messages[-(max_context_pairs * 2):]
+        # Keep system + last (2*max_pairs + 1) messages to maintain user→assistant→user pattern
+        keep_limit = max_context_pairs * 2 + 2
+        if len(messages) > keep_limit:
+            n_keep = max_context_pairs * 2 + 1
+            keep = [messages[0]] + messages[-n_keep:]
             messages[:] = keep
         return self._client.chat.completions.create(
             model=self._model, messages=messages, max_tokens=max_tokens,
