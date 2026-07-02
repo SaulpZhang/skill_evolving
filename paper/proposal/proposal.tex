@@ -25,7 +25,7 @@ Address \\
 \maketitle
 
 \begin{abstract}
-Write your abstract here.
+Large language model agents can improve their performance through skill evolution---reflecting on execution trajectories and accumulating reusable knowledge. However, existing systems select practice tasks uniformly at random, ignoring the fact that different tasks contribute unequally to skill growth. We propose SPG-Bandit, a framework that casts task selection as a contextual bandit problem driven by a latent skill profile of the agent. SPG-Bandit uses Multidimensional Item Response Theory (MIRT) to estimate the agent's proficiency across multiple skill dimensions, then selects tasks using a gap-weighted upper confidence bound that prioritizes underdeveloped dimensions. Theoretically, we show that SPG-Bandit achieves $O(d_f \sqrt{T} \log T)$ cumulative regret by treating the gap-weighted reward as a convex combination of independent ridge regressions.
 \end{abstract}
 
 \section{Introduction}
@@ -242,8 +242,6 @@ Let \(\mathbf{A}_t = \lambda \mathbf{I} + \sum_{i=1}^t \boldsymbol{\phi}_i \bold
 
 where \(\beta_t = \sigma \sqrt{2 \log(K/\delta) + d_f \log(1 + t / (d_f \lambda))} + \sqrt{\lambda} S\), with \(S\) an upper bound on \(\|\mathbf{w}_k^*\|_2\).
 
-\paragraph{Proof sketch.}
-This follows directly from the standard ridge regression confidence bound of Abbasi-Yadkori et al. (2011), applied independently to each of the \(K\) ridge regression problems.
 
 \paragraph{Lemma 2 (Gap-weighted UCB).}
 Let \(\mathbf{g}_t\) be any probability vector (i.e., \(\mathbf{g}_t[k] \geq 0\) and \(\sum_{k=1}^K \mathbf{g}_t[k] = 1\)). With probability at least \(1 - \delta\):
