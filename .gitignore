@@ -35,6 +35,20 @@ results/
 refine-logs/
 *.pdf
 
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.bbl
+*.blg
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+texput.log
+
 # Environment
 .env
 
