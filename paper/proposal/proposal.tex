@@ -1,0 +1,123 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2021_conference,times}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+
+\title{SPG-Bandit: Skill Profile Guided Bandit for Task Selection in LLM Agent Skill Evolution}
+
+%\iclrfinalcopy
+
+\author{Author Name \\
+Affiliation \\
+Address \\
+\texttt{email} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Write your abstract here.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+\subsection{Background and Motivation}
+
+Large language model (LLM) agents have demonstrated the ability to perform complex tasks across a variety of environments, including embodied task completion, web navigation, and software engineering. A key capability enabling such generality is \emph{skill evolution}: the agent reflects on its execution trajectories, extracts reusable knowledge, and accumulates it in a growing skill library for future episodes.
+
+Prior work has focused primarily on two aspects of this process. The first is \emph{skill quality}---how to extract more informative patterns from trajectories. For instance, SkillRL introduces a reflection mechanism that generates planning patterns from successful episodes and common mistakes from failures. The second is \emph{skill utilization}---how to organize, retrieve, and inject skills into the agent's prompt at inference time. These efforts include structured skill banks with category-specific retrieval, vector-database approaches, and dynamic prompting strategies.
+
+A critical dimension has remained largely unexplored: \textbf{the order in which tasks are selected for practice.} Existing systems either cycle through a fixed task pool uniformly, sample tasks at random, or rely on hand-designed curricula that do not adapt to the agent's evolving competence. In RL, it is well-known that the task selection strategy can significantly affect learning efficiency. So, it is natural to ask: \emph{can we improve the efficiency and performance of skill evolution in LLM agents by adaptively selecting tasks based on the agent's current skill profile?}
+
+\subsection{Contributions}
+
+We present \textbf{SPG-Bandit} (Skill Profile Guided Bandit), a framework that casts task selection as a contextual bandit problem driven by a multidimensional skill profile of the agent.
+
+Our core idea is to model the agent's latent proficiency across \(K\) skill dimensions using Multidimensional Item Response Theory (MIRT), then select tasks that maximize the expected progress toward underdeveloped dimensions.
+
+Specifically, this proposal makes the following contributions:
+\begin{enumerate}
+    \item \textbf{Problem.} We identify and formalize the task selection problem in LLM agent skill evolution. We show that uniform and random selection---the default in existing systems---is suboptimal because different tasks contribute unequally to skill growth and the agent's skill profile is inherently multidimensional.
+    \item \textbf{Method.} We propose SPG-Bandit, a framework that combines MIRT-based latent skill profiling with a gap-weighted bandit algorithm. The core idea is to maintain an online estimate of the agent's proficiency across \(K\) skill dimensions, then select tasks that maximize predicted progress toward underdeveloped dimensions.
+    \item \textbf{Framework.} We provide a general framework which can easily combine with existing skill evolution methods. The framework is used to evaluate the effectiveness of SPG-Bandit in improving skill evolution efficiency and performance.
+\end{enumerate}
+
+\section{Problem Formulation}
+\label{sec:problem}
+
+\subsection{Notation and Setup}
+
+Consider an LLM agent interacting with a fixed pool of tasks \(\mathcal{T} = \{1, 2, \dots, M\}\). At each discrete step \(t = 1, 2, \dots\), the agent selects a task \(\tau_t \in \mathcal{T}\), executes it, and receives a binary outcome \(r_t \in \{0, 1\}\) indicating task success or failure.
+
+The agent possesses a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\) representing its proficiency across \(K\) distinct skill dimensions. The profile is not directly observable; it must be inferred from observed outcomes. We denote the \emph{skill progress} between consecutive steps as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), which measures how much the agent's latent proficiency changes after executing task \(\tau_t\) and updating its skills via reflection.
+
+Each task \(\tau\) is associated with a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{d_c}\), typically derived from a sentence encoder applied to the task's natural-language goal description.
+
+The historical data available up to step \(t\) consists of triples \(\{(\tau_i, r_i, \boldsymbol{\delta}_i)\}_{i=1}^{t-1}\), where each \(\boldsymbol{\delta}_i\) is the realized skill progress computed from the inferred skill profiles before and after step \(i\).
+
+\subsection{Problem Definition}
+
+We formalize adaptive task selection as a \emph{contextual bandit} problem. At each step \(t\):
+
+\begin{enumerate}
+    \item The agent observes its current context: the current skill profile \(\mathbf{s}_t\) and the embedding \(\mathbf{e}_\tau\) for each task \(\tau \in \mathcal{T}\).
+    \item The agent selects an arm \(\tau_t \in \mathcal{T}\).
+    \item The agent executes task \(\tau_t\), observes outcome \(r_t\), and updates its skills via reflection.
+    \item The latent skill profile updates to \(\mathbf{s}_{t+1}\), and the realized progress \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\) is observed.
+\end{enumerate}
+
+The goal is to maximize the \emph{cumulative skill progress} over a horizon \(H\):
+
+\begin{equation}
+    \max_{\pi} \; \mathbb{E}\left[ \sum_{t=1}^{H} \|\boldsymbol{\delta}_t\|_1 \;\middle|\; \tau_t \sim \pi(\cdot \mid \mathbf{s}_t, \{\mathbf{e}_\tau\}) \right],
+    \label{eq:objective}
+\end{equation}
+
+where \(\pi\) denotes the task selection policy. Since the realized progress \(\boldsymbol{\delta}_t\) depends on the agent's internal reflection dynamics (which are not directly controlled), we instead learn a \emph{surrogate} prediction model \(\hat{\boldsymbol{\delta}}(\tau, \mathbf{s}_t)\) that estimates the expected progress from selecting task \(\tau\) given current profile \(\mathbf{s}_t\).
+
+This formulation differs from standard bandit settings in two key aspects:
+\begin{enumerate}
+    \item The reward \(\boldsymbol{\delta}_t\) is vector-valued (\(K\)-dimensional), not scalar. The agent cares about balanced improvement across all skill dimensions.
+    \item The reward distribution changes over time because the agent's accumulated skills alter how much it can learn from any given task. This introduces non-stationarity that the selection policy must accommodate.
+\end{enumerate}
+
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+
+\subsection{Key Components}
+
+\subsection{Algorithm}
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+\subsection{Assumptions}
+
+\subsection{Main Results}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+\subsubsection*{Acknowledgments}
+
+\bibliography{refs}
+\bibliographystyle{iclr2021_conference}
+
+\appendix
+\section{Appendix}
+
+\end{document}
