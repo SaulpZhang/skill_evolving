@@ -63,8 +63,6 @@ The agent possesses a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\) r
 
 Each task \(\tau\) is associated with a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{d_c}\), typically derived from a sentence encoder applied to the task's natural-language goal description.
 
-The historical data available up to step \(t\) consists of triples \(\{(\tau_i, y_i, \boldsymbol{\delta}_i)\}_{i=1}^{t-1}\), where each \(\boldsymbol{\delta}_i\) is the realized skill progress computed from the inferred skill profiles before and after step \(i\).
-
 \subsection{Problem Definition}
 
 We formalize adaptive task selection as a \emph{contextual bandit} problem. At each step \(t\):
@@ -106,8 +104,8 @@ where \(\pi\) denotes the task selection policy. Since the realized \(\boldsymbo
 \subsection{Overview}
 
 SPG-Bandit operates in two phases. In the \textbf{warmup phase}, the agent selects tasks uniformly to collect an initial set of interaction outcomes. After warmup, we run Multidimensional Item Response Theory (MIRT) to estimate the agent's latent skill profile for each warmup step, producing a sequence of skill deltas \(\{\boldsymbol{\delta}_t\}\) and item parameters for all tasks. We then train an MLP that predicts these deltas from task embeddings and the current profile.
-
-In the \textbf{bandit phase}, at each step we compute a skill-progress gap vector \(\mathbf{g}\) from the current profile, use the MLP to predict each task's expected delta, and select the task with the highest gap-weighted UCB score. After execution, we update the profile via a Bayesian online MIRT update and update the bandit's ridge regression parameters.
+    
+In the \textbf{bandit phase}, at each step we compute a skill-progress gap vector \(\mathbf{g}_t\) from the current profile, use the Neural Linear UCB to predict each task's expected delta, and select the task with the highest gap-weighted UCB score. After execution, we update the profile via a Bayesian online MIRT and update the bandit's ridge regression parameters.
 
 \subsection{Key Components}
 
@@ -119,27 +117,17 @@ We model each task \(\tau\) with a \(K\)-dimensional discrimination vector \(\ma
     \label{eq:mirt}
 \end{equation}
 
-where \(\sigma(x) = 1/(1 + e^{-x})\). A high value in dimension \(k\) of \(\mathbf{a}_\tau\) means task \(\tau\) heavily depends on skill \(k\); a high \(d_\tau\) means the task is generally difficult.
+where \(\sigma(x) = 1/(1 + e^{-x})\). A high value in dimension \(k\) of \(\mathbf{a}_\tau\) means task \(\tau\) heavily depends on skill profile \(k\); a high \(d_\tau\) means the task is generally difficult.
 
-After collecting \(N\) warmup outcomes \(\{( \tau_t, r_t )\}_{t=1}^N\), we run an EM algorithm to jointly estimate:
+After collecting \(N\) warmup outcomes \(\{( \tau_t, y_t )\}_{t=1}^N\), we run an EM algorithm to jointly estimate:
 \begin{itemize}
-    \item The latent profiles \(\{\mathbf{s}_t\}_{t=1}^N\) where \(\mathbf{s}_t\) is the profile before step \(t\).
+    \item The latent profiles \(\{\mathbf{s}_t\}_{t=1}^N\) .
     \item The item parameters \(\{(\mathbf{a}_\tau, d_\tau)\}_{\tau=1}^M\).
 \end{itemize}
 
 The E-step updates each \(\mathbf{s}_t\) via Newton-Raphson on the log-likelihood of observed outcomes for tasks selected up to step \(t\). The M-step optimizes each item's parameters via L-BFGS-B with \(\ell_2\) regularization.
 
-After fitting, \textbf{sequential MIRT} is applied: for each \(t\), we run EM on the first \(t\) observations to obtain the profile \(\mathbf{s}_t^{\text{(bef)}}\), then on the first \(t+1\) to obtain \(\mathbf{s}_t^{\text{(aft)}}\). The delta \(\boldsymbol{\delta}_t = \mathbf{s}_t^{\text{(aft)}} - \mathbf{s}_t^{\text{(bef)}}\) captures the progress attributable to executing task \(\tau_t\).
-
-\paragraph{Skill-progress gap.}
-At decision time, the agent has profile \(\mathbf{s}\). Dimensions with low proficiency present the greatest room for improvement. We convert this into a gap weight vector:
-
-\begin{equation}
-    \mathbf{g} = \operatorname{softmax}\!\left( \frac{\mathbf{1} - \mathbf{s}}{\tau_g} \right),
-    \label{eq:gap}
-\end{equation}
-
-where \(\tau_g > 0\) is a temperature parameter. A small \(\tau_g\) produces a hard focus on the weakest dimension; a larger \(\tau_g\) spreads weight more evenly.
+After fitting, \textbf{sequential MIRT} is applied. For \(t = 1\), the profile before the step is initialized to zeros; for \(t \geq 2\), we run EM on the first \(t-1\) observations to obtain the profile before step \(t\), denoted \(\mathbf{s}_t^{\text{(bef)}}\). Running EM on the \(t\) observations gives the profile after step \(t\), denoted \(\mathbf{s}_t^{\text{(aft)}}\). The delta \(\boldsymbol{\delta}_t = \mathbf{s}_t^{\text{(aft)}} - \mathbf{s}_t^{\text{(bef)}}\) captures the progress attributable to executing task \(\tau_t\).
 
 \paragraph{Delta prediction via MLP.}
 To anticipate how much a candidate task will improve the agent, we train a two-layer MLP \(\Phi\) that maps the concatenation of the task embedding \(\mathbf{e}_\tau\) and current profile \(\mathbf{s}\) to a feature vector \(\boldsymbol{\phi} \in \mathbb{R}^{d_f}\):
@@ -152,14 +140,14 @@ To anticipate how much a candidate task will improve the agent, we train a two-l
 A linear head \(\mathbf{W} \in \mathbb{R}^{d_f \times K}\) predicts the expected delta: \(\hat{\boldsymbol{\delta}} = \mathbf{W}^\top \boldsymbol{\phi}\). Training minimizes MSE over the warmup dataset \(\{([\mathbf{e}_{\tau_t}; \mathbf{s}_t^{\text{(bef)}}], \boldsymbol{\delta}_t)\}_{t=1}^N\).
 
 \paragraph{Gap-weighted UCB selection.}
-We treat delta prediction as a ridge regression problem. The covariance matrix \(\mathbf{A} = \lambda \mathbf{I} + \sum_{i=1}^t \boldsymbol{\phi}_i \boldsymbol{\phi}_i^\top\) captures uncertainty in the linear head estimate. The bandit score for task \(\tau\) is:
+We treat delta prediction as a ridge regression problem. The covariance matrix \(\mathbf{A} = \lambda \mathbf{I} + \sum_{i=1}^t \boldsymbol{\phi}_i \boldsymbol{\phi}_i^\top\) captures uncertainty in the linear head estimate. At step \(t\), the estimate of the reward \(r_t = \mathbf{g}_t^\top \boldsymbol{\delta}\) for task \(\tau\) is \(\mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau\). To balance exploration, we add a UCB bonus scaled by \(\alpha > 0\):
 
 \begin{equation}
-    \text{score}(\tau) = \mathbf{g}^\top \mathbf{W}^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau},
+    \text{score}(\tau) = \mathbf{g}_t^\top \mathbf{W}^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau},
     \label{eq:score}
 \end{equation}
 
-where the first term is the gap-weighted exploitation (how much we expect this task to improve the weakest skills) and the second is a UCB exploration bonus scaled by \(\alpha > 0\). The task with the highest score is selected.
+where the first term is the gap-weighted exploitation (how much we expect this task to improve the weak skill profile) and the second is a UCB exploration bonus scaled by \(\alpha > 0\). The task with the highest score is selected.
 
 \paragraph{Online Bayesian MIRT update.}
 After executing the selected task and observing outcome \(r\), we update the profile without re-running full EM. A single Newton-Raphson step on the log-posterior combines the IRT likelihood with a Gaussian prior centered at the previous profile:
@@ -201,10 +189,10 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \STATE Initialize \(\mathbf{A} = \lambda \mathbf{I}_{d_f}\), \(\mathbf{B} = \mathbf{0}_{d_f \times K}\), current profile \(\mathbf{s} = \mathbf{s}_N\)
 \STATE {\bf Phase 2: Bandit}
 \FOR{\(t = 1\) to \(H\)}
-    \STATE Compute gap \(\mathbf{g} = \operatorname{softmax}((\mathbf{1} - \mathbf{s}) / \tau_g)\)
+    \STATE Compute gap \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}) / \tau_g)\)
     \FOR{each \(\tau \in \mathcal{T}\)}
         \STATE \(\boldsymbol{\phi}_\tau = \Phi([\mathbf{e}_\tau; \mathbf{s}])\), \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}^\top \boldsymbol{\phi}_\tau\)
-        \STATE \(\text{score}(\tau) = \mathbf{g}^\top \hat{\boldsymbol{\delta}}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau}\)
+        \STATE \(\text{score}(\tau) = \mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau}\)
     \ENDFOR
     \STATE \(\tau_t = \arg\max_\tau \text{score}(\tau)\)
     \STATE Execute \(\tau_t\), observe \(y_t\) and realized \(\boldsymbol{\delta}_t\)
@@ -219,22 +207,117 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \section{Theoretical Analysis}
 \label{sec:theory}
 
+We analyze the regret of SPG-Bandit under the assumption that the MLP feature extractor \(\Phi\) is fixed after warmup, and only the linear head \(\mathbf{W}\) is updated online. This matches the practical procedure described in Algorithm~\ref{alg:spg}. The reward at step \(t\) is \(r_t = \mathbf{g}_t^\top \boldsymbol{\delta}_t\), and the bandit selects the task maximizing \(\mathbf{g}_t^\top \mathbf{W}_{t-1}^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_\tau}\).
+
 \subsection{Assumptions}
 
-\subsection{Main Results}
+\begin{enumerate}
+    \item \textbf{(Linear realizability.)} For each skill dimension \(k \in \{1,\dots,K\}\), there exists a true weight vector \(\mathbf{w}_k^* \in \mathbb{R}^{d_f}\) such that \(\mathbb{E}[\delta_t[k] \mid \boldsymbol{\phi}_{\tau_t}] = \mathbf{w}_k^{*\top} \boldsymbol{\phi}_{\tau_t}\). Collecting all dimensions, \(\mathbb{E}[\boldsymbol{\delta}_t \mid \boldsymbol{\phi}_{\tau_t}] = \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t}\) with \(\mathbf{W}^* = [\mathbf{w}_1^*, \dots, \mathbf{w}_K^*]\).
+    \item \textbf{(Bounded features.)} \(\|\boldsymbol{\phi}_\tau\|_2 \leq 1\) for all \(\tau \in \mathcal{T}\).
+    \item \textbf{(Sub-Gaussian noise.)} The per-dimension noise \(\eta_{t,k} = \delta_t[k] - \mathbf{w}_k^{*\top} \boldsymbol{\phi}_{\tau_t}\) is \(\sigma\)-sub-Gaussian.
+\end{enumerate}
 
-\section{Experiments}
-\label{sec:experiments}
+Assumption~1 is the standard linear realizability condition in contextual bandit theory. The feature vector \(\boldsymbol{\phi}_\tau\) is produced by a frozen MLP trained during warmup, so the linear head operates on a fixed representation.
 
-\section{Conclusion}
-\label{sec:conclusion}
+\subsection{Regret Bound}
 
-\subsubsection*{Acknowledgments}
+Define the instantaneous regret at step \(t\) as the gap between the reward of the optimal task and the chosen task:
 
-\bibliography{refs}
-\bibliographystyle{iclr2021_conference}
+\begin{equation}
+    r_t^* - r_t = \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t^*} - \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t},
+    \label{eq:regret-def}
+\end{equation}
 
-\appendix
-\section{Appendix}
+where \(\tau_t^* = \arg\max_\tau \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_\tau\) is the optimal choice under the true weights.
+
+We first establish that the score function is a valid upper confidence bound.
+
+\paragraph{Lemma 1 (Per-dimension confidence ellipsoid).}
+Let \(\mathbf{A}_t = \lambda \mathbf{I} + \sum_{i=1}^t \boldsymbol{\phi}_i \boldsymbol{\phi}_i^\top\). Under Assumptions~1--3, with probability at least \(1 - \delta/K\), for any dimension \(k\):
+
+\begin{equation}
+    |\boldsymbol{\phi}^\top \hat{\mathbf{w}}_{t,k} - \boldsymbol{\phi}^\top \mathbf{w}_k^*| \leq \beta_t \sqrt{\boldsymbol{\phi}^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}},
+    \label{eq:dim-ucb}
+\end{equation}
+
+where \(\beta_t = \sigma \sqrt{2 \log(K/\delta) + d_f \log(1 + t / (d_f \lambda))} + \sqrt{\lambda} S\), with \(S\) an upper bound on \(\|\mathbf{w}_k^*\|_2\).
+
+\paragraph{Proof sketch.}
+This follows directly from the standard ridge regression confidence bound of Abbasi-Yadkori et al. (2011), applied independently to each of the \(K\) ridge regression problems.
+
+\paragraph{Lemma 2 (Gap-weighted UCB).}
+Let \(\mathbf{g}_t\) be any vector in the \((K-1)\)-simplex (i.e., \(\mathbf{g}_t[k] \geq 0\) and \(\sum_k \mathbf{g}_t[k] = 1\)). With probability at least \(1 - \delta\):
+
+\begin{equation}
+    \left| \mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau - \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_\tau \right| \leq \beta_t \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_\tau},
+    \label{eq:gap-ucb}
+\end{equation}
+
+where \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}_{t-1}^\top \boldsymbol{\phi}_\tau\).
+
+\paragraph{Proof.}
+Unpacking the left side:
+\[
+\mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau - \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_\tau
+= \sum_{k=1}^K \mathbf{g}_t[k] \left( \boldsymbol{\phi}_\tau^\top \hat{\mathbf{w}}_{t-1,k} - \boldsymbol{\phi}_\tau^\top \mathbf{w}_k^* \right).
+\]
+Applying Lemma~1 to each term and using \(\mathbf{g}_t[k] \geq 0\):
+\[
+\left| \sum_{k=1}^K \mathbf{g}_t[k] \left( \boldsymbol{\phi}_\tau^\top \hat{\mathbf{w}}_{t-1,k} - \boldsymbol{\phi}_\tau^\top \mathbf{w}_k^* \right) \right|
+\leq \sum_{k=1}^K \mathbf{g}_t[k] \cdot \beta_t \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_\tau}
+= \beta_t \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_\tau},
+\]
+where the last equality uses \(\sum_k \mathbf{g}_t[k] = 1\). This confirms that \(\text{score}(\tau) = \mathbf{g}_t^\top \mathbf{W}_{t-1}^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_\tau}\) is a valid upper confidence bound when \(\alpha \geq \beta_t\).
+
+\paragraph{Lemma 3 (Instantaneous regret).}
+With probability at least \(1 - \delta\), the instantaneous regret at step \(t\) satisfies:
+
+\begin{equation}
+    r_t^* - r_t \leq 2\beta_t \sqrt{\boldsymbol{\phi}_{\tau_t}^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_{\tau_t}}.
+    \label{eq:inst-regret}
+\end{equation}
+
+\paragraph{Proof.}
+From Lemma~2, the score upper-bounds the true reward: \(\text{score}(\tau) \geq \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_\tau\) for all \(\tau\). Therefore \(\mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t^*} \leq \text{score}(\tau_t^*) \leq \text{score}(\tau_t)\). Using the lower bound from Lemma~2 on the chosen arm:
+
+\[
+r_t^* - r_t = \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t^*} - \mathbf{g}_t^\top \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t}
+\leq \text{score}(\tau_t) - \left( \mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_{\tau_t} - \beta_t \sqrt{\boldsymbol{\phi}_{\tau_t}^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_{\tau_t}} \right)
+= 2\beta_t \sqrt{\boldsymbol{\phi}_{\tau_t}^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_{\tau_t}}.
+\]
+
+\paragraph{Theorem 1 (Cumulative regret).}
+Under Assumptions~1--3 and setting \(\alpha = \beta_T\), the cumulative regret over \(T\) steps satisfies with probability at least \(1 - \delta\):
+
+\begin{equation}
+    R_T = \sum_{t=1}^T (r_t^* - r_t) = O\left( d_f \sqrt{T} \log T \right).
+    \label{eq:cum-regret}
+\end{equation}
+
+\paragraph{Proof sketch.}
+Summing Lemma~3 over \(t = 1,\dots,T\):
+
+\[
+R_T \leq 2\beta_T \sum_{t=1}^T \sqrt{\boldsymbol{\phi}_{\tau_t}^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_{\tau_t}}
+\leq 2\beta_T \sqrt{ T \sum_{t=1}^T \boldsymbol{\phi}_{\tau_t}^\top \mathbf{A}_{t-1}^{-1} \boldsymbol{\phi}_{\tau_t} },
+\]
+
+where the second inequality is Cauchy-Schwarz. By the standard ellipsoid potential lemma, \(\sum_{t=1}^T \|\boldsymbol{\phi}_t\|_{\mathbf{A}_{t-1}^{-1}}^2 \leq 2 d_f \log(1 + T / (d_f \lambda))\). Substituting and expanding \(\beta_T\):
+
+\[
+R_T \leq 2\beta_T \sqrt{ 2 T d_f \log\!\left(1 + \frac{T}{d_f \lambda}\right) } = O\!\left( d_f \sqrt{T} \log T \right).
+\]
+
+This matches the standard LinUCB regret rate up to a factor of \(d_f\), confirming that SPG-Bandit achieves sub-linear regret despite the multi-dimensional skill structure. The key insight is that the gap weight vector \(\mathbf{g}_t\) acts as a convex combination over the \(K\) independent ridge regressions, preserving the confidence bound property without incurring an additional \(O(K)\) penalty.
+
+
+
+
+
+% \bibliography{refs}
+% \bibliographystyle{iclr2021_conference}
+
+% \appendix
+% \section{Appendix}
 
 \end{document}
