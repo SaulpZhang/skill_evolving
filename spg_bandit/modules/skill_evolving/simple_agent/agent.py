@@ -196,6 +196,7 @@ class SimpleAgent(BaseSkillEvolving):
         if self._skill_mgr:
             self.load_skills(str(self._skills_dir))
         calls_before = self._total_calls
+        task_type = self._detect_task_type(goal)
         env, env_id = self._dataset.create_env(task_id)
         obs_tuple, info = env.reset()
         obs = obs_tuple[0]
@@ -205,8 +206,8 @@ class SimpleAgent(BaseSkillEvolving):
         history_window = 5
         triplets = []  # collect (system, user, assistant) per step
 
-        # Build skill section
-        skill_section = self._skill_mgr.format_for_prompt() if self._skill_mgr else ""
+        # Build skill section (filtered by task type per SkillRL)
+        skill_section = self._skill_mgr.format_for_prompt(task_type=task_type) if self._skill_mgr else ""
         has_skills = bool(skill_section and skill_section != "(none)")
 
         for step in range(self.max_turns):
@@ -320,13 +321,14 @@ class SimpleAgent(BaseSkillEvolving):
         added = 0
 
         if result.get("success"):
-            # Success: extract planning_pattern as a general skill
+            # Success: extract planning_pattern as a task-specific skill
             pattern = result_json.get("planning_pattern", "")
             title = result_json.get("title", "")
             principle = result_json.get("principle", "")
+            task_type = self._detect_task_type(goal)
             if pattern and title:
                 skill = {"skill_id": f"dyn_{int(time.time())}", "title": title, "principle": pattern}
-                if self._skill_mgr.add_skill(skill, "general"):
+                if self._skill_mgr.add_skill(skill, task_type):
                     added += 1
         else:
             # Failure: extract mistakes_to_avoid
