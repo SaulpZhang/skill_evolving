@@ -7,6 +7,7 @@ import json
 import numpy as np
 from scipy.special import expit as sigmoid
 from scipy.optimize import minimize
+from sklearn.linear_model import Ridge
 
 from spg_bandit.modules.dataset.base import TaskPool
 from spg_bandit.utils.wandb import log_metrics
@@ -134,7 +135,7 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
             break
         prev_ll = ll
 
-    return sigmoid(s_hist), A, ll, ll_history
+    return sigmoid(s_hist), A, d_vec, ll, ll_history
 
 
 # ── MIRT Online Bayesian Update ─────────────────────────────────────────────
@@ -169,7 +170,7 @@ class SPGBanditSelector(BaseSelector):
                  alpha: float = 0.1, tau: float = 0.1,
                  d_f: int = 16, d_h: int = 32,
                  lambda_reg: float = 1.0, seed: int = 42,
-                 K: int = 6):
+                 K: int = 6, warmup_ids: list[int] | None = None):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -179,6 +180,7 @@ class SPGBanditSelector(BaseSelector):
         self._d_f, self._d_h = d_f, d_h
         self._step = 0
         self._warmup_ready = False
+        self._warmup_ids = list(warmup_ids) if warmup_ids else list(range(task_pool.M))
         self._mlp: MLPFeaturizer | None = None
         self._A = self._lambda * np.eye(d_f)
         self._B = np.zeros((d_f, K))
@@ -231,7 +233,7 @@ class SPGBanditSelector(BaseSelector):
 
     def select(self, task_pool: TaskPool) -> int:
         if self._step < self._n_warm:
-            tid = self._step % task_pool.M
+            tid = self._warmup_ids[self._step % len(self._warmup_ids)]
             self._last_phi = None
             self._step += 1
             return tid
@@ -271,17 +273,9 @@ class SPGBanditSelector(BaseSelector):
             self._warmup_successes.append(success)
             self._warmup_deltas.append(result.get("delta", np.zeros(self._K)))
         elif self._warmup_ready:
-            # MIRT Bayesian online update
-            if self._A_fit is not None and task_id < len(self._A_fit):
-                a_tau = self._A_fit[task_id]
-                d_tau = self._d_fit[task_id] if task_id < len(self._d_fit) else 0.0
-                self._profile = online_profile_update(self._profile, a_tau, d_tau, success)
-            else:
-                # Fallback heuristic
-                dim = TASK_TYPES.index(
-                    task_pool.metadata[task_id]["task_type"]) if task_id < len(task_pool.metadata) else 0
-                self._profile[dim] += 0.05 if success else -0.01
-                self._profile = np.clip(self._profile, 0.0, 1.0)
+            a_tau = self._A_fit[task_id]
+            d_tau = self._d_fit[task_id]
+            self._profile = online_profile_update(self._profile, a_tau, d_tau, success)
 
             # Ridge regression update
             if self._last_phi is not None:
@@ -315,10 +309,20 @@ class SPGBanditSelector(BaseSelector):
             profile = new_profile
 
         # Final EM on all N (verbose, for logging + item params)
-        s_hist, self._A_fit, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
+        s_hist, self._A_fit, self._d_fit, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
         self._profile = s_hist[-1].copy()
-        self._d_fit = np.zeros(task_pool.M)
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
+
+        # Embedding → (a, d) predictor: infer parameters for unseen tasks
+        seen_tids = list(set(self._warmup_task_ids))
+        X_seen = np.array([task_pool.get_embedding(tid) for tid in seen_tids])
+        y_seen = np.column_stack([self._A_fit[seen_tids], self._d_fit[seen_tids]])
+        reg = Ridge(alpha=self._lambda)
+        reg.fit(X_seen, y_seen)
+        X_all = task_pool.embeddings
+        y_pred = reg.predict(X_all)
+        self._A_fit = y_pred[:, :self._K]
+        self._d_fit = y_pred[:, self._K]
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i})
 

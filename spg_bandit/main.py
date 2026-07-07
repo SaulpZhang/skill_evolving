@@ -37,20 +37,22 @@ def build_parser():
     return p
 
 
-def create_selector(name, task_pool, config):
+def create_selector(name, task_pool, config, warmup_ids=None):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
     elif name == "spg_bandit":
+        warmup_cfg = config.get("warmup", {})
         exp = config.get("experiment", {})
         return SPGBanditSelector(
             task_pool=task_pool,
-            n_warm=exp.get("n_warm", 30),
+            n_warm=warmup_cfg.get("n_warm", 30),
             alpha=params.get("alpha", 0.1),
             tau=params.get("tau", 0.1),
             d_f=params.get("d_f", 16),
             K=params.get("K", 6),
             seed=config.get("experiment", {}).get("seed", 42),
+            warmup_ids=warmup_ids,
         )
     raise ValueError(f"Unknown selector: {name}")
 
@@ -81,30 +83,59 @@ def main():
         yaml.dump(config, f, default_flow_style=False)
     logger.info(f"Records: {log_base / 'records'}")
 
-    logger.info("Loading dataset...")
-    dataset = ALFWorldDataset(config.get("alfworld", {}))
-    task_pool = dataset.task_pool
+    def _merge_alf(base, overrides):
+        """Merge shared ALFWorld settings with phase-specific overrides."""
+        cfg = {
+            "embedding_model": config.get("embedding_model", "all-MiniLM-L6-v2"),
+            "embedding_type": config.get("embedding_type", "local"),
+            "max_turns": config.get("max_turns", 51),
+            "task_types": "all",
+            "tasks_per_type": 0,
+            "split": "valid_seen",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    logger.info("Loading evolving dataset...")
+    evo_cfg = config.get("evolve", {})
+    evo_dataset = ALFWorldDataset(_merge_alf(config, evo_cfg))
+    evolving_pool = evo_dataset.task_pool
+
+    warmup_cfg = config.get("warmup", {})
+    w_tpt = warmup_cfg.get("tasks_per_type", 10)
+    warmup_ids = []
+    for tt_idx in range(max(m.get("dim", 0) for m in evolving_pool.metadata) + 1):
+        type_ids = sorted(i for i, m in enumerate(evolving_pool.metadata) if m["dim"] == tt_idx)
+        warmup_ids.extend(type_ids[:w_tpt])
+    logger.info(f"Warmup: {len(warmup_ids)} / {evolving_pool.M} evolving tasks")
+
+    eva_cfg = config.get("evaluate", {})
+    logger.info(f"Loading eval dataset ({eva_cfg.get('split')})...")
+    eval_dataset = ALFWorldDataset(_merge_alf(config, eva_cfg))
+    eval_pool = eval_dataset.task_pool
+
+    logger.info(f"Eval: {eval_pool.M} tasks")
 
     n_bandit = config.get("experiment", {}).get("n_bandit", 50)
+    n_warm = warmup_cfg.get("n_warm", 30)
+    max_turns = config.get("max_turns", 51)
 
     skills_dir = str(Path(__file__).parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
-    method = SimpleAgent(dataset, max_turns=config.get("alfworld", {}).get("max_turns", 30),
-                         records_dir=records_dir)
+    method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
     method.load_skills(skills_dir)
-    selector = create_selector(sel_name, task_pool, config)
+    selector = create_selector(sel_name, evolving_pool, config, warmup_ids=warmup_ids)
 
-    n_warm_config = config.get("experiment", {}).get("n_warm", 30)
     if args.warmup_data:
         if not hasattr(selector, "load_warmup_data"):
             logger.warning("Selector %s does not support warmup loading, ignoring --warmup-data", sel_name)
-            warmup_steps = selector.needs_warmup * n_warm_config
+            warmup_steps = selector.needs_warmup * n_warm
         else:
-            selector.load_warmup_data(args.warmup_data, task_pool)
+            selector.load_warmup_data(args.warmup_data, evolving_pool)
             warmup_steps = 0
             logger.info("Warmup task execution skipped, loaded data from %s", args.warmup_data)
     else:
-        warmup_steps = n_warm_config if selector.needs_warmup else 0
+        warmup_steps = n_warm if selector.needs_warmup else 0
 
     total_steps = n_bandit + warmup_steps
     if warmup_steps > 0:
@@ -114,7 +145,7 @@ def main():
     step_records = []
 
     for step in range(total_steps):
-        task_id = selector.select(task_pool)
+        task_id = selector.select(evolving_pool)
         t0 = time.time()
         result = method.execute(task_id)
         elapsed = time.time() - t0
@@ -157,14 +188,15 @@ def main():
         logger.info(f"{'='*60}")
 
         method.reset()
+        eval_method = SimpleAgent(eval_dataset, max_turns=max_turns)
         evaluating_selector = UniformSelector()
         evaluating_success = 0
         evaluating_records = []
 
         for step in range(n_bandit):
-            task_id = evaluating_selector.select(task_pool)
+            task_id = evaluating_selector.select(eval_pool)
             t0 = time.time()
-            result = method.execute(task_id)
+            result = eval_method.execute(task_id)
             elapsed = time.time() - t0
             if result["success"]:
                 evaluating_success += 1
