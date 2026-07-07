@@ -319,12 +319,15 @@ class SPGBanditSelector(BaseSelector):
         y_seen = np.column_stack([self._A_fit[seen_tids], self._d_fit[seen_tids]])
         reg = Ridge(alpha=self._lambda)
         reg.fit(X_seen, y_seen)
+        y_pred_train = reg.predict(X_seen)
+        pred_mse = float(np.mean((y_pred_train - y_seen) ** 2))
+        log_metrics({"mirt/pred_mse": pred_mse, "_step_mirt": 0})
         X_all = task_pool.embeddings
         y_pred = reg.predict(X_all)
         self._A_fit = y_pred[:, :self._K]
         self._d_fit = y_pred[:, self._K]
         for i, ll_val in enumerate(ll_history):
-            log_metrics({"mirt/ll": ll_val, "_step_mirt": i})
+            log_metrics({"mirt/ll": ll_val, "_step_mirt": i + 1})
 
         # MLP training: X = [embedding(384) | profile_before(K)], y = delta(K)
         embeds = [task_pool.get_embedding(tid) for tid in self._warmup_task_ids]
