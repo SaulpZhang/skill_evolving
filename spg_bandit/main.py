@@ -120,7 +120,7 @@ def main():
     n_warm = warmup_cfg.get("n_warm", 30)
     max_turns = config.get("max_turns", 51)
 
-    skills_dir = str(Path(__file__).parent / "skills" / run_id)
+    skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
     method.load_skills(skills_dir)
