@@ -11,7 +11,7 @@ warmup:
 evolve:
   split: valid_seen
   task_types: all
-  tasks_per_type: 10
+  tasks_per_type: 0
 
 experiment:
   n_bandit: 100
