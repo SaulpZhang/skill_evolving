@@ -52,12 +52,13 @@ texput.log
 # Environment
 .env
 
-config/
+
+/config/
 docs/*
 wandb/
 
 logs/
 
-spg_bandit/skills/
+skills/
 
 record/
