@@ -66,7 +66,7 @@ def main():
     sel_name = config.get("selector", "uniform")
     agent_name = config.get("skill_evolving", {}).get("name", "unknown")
 
-    run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{sel_name}_{agent_name}"
+    run_id = args.run_id or f"{sel_name}_{agent_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     if not args.run_name:
         args.run_name = run_id
 
