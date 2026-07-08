@@ -14,7 +14,7 @@ evolve:
   tasks_per_type: 0
 
 experiment:
-  n_bandit: 100
+  n_bandit: 0
   seed: 42
 
 evaluate:
