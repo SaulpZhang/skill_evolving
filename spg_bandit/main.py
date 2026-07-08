@@ -116,7 +116,9 @@ def main():
 
     logger.info(f"Eval: {eval_pool.M} tasks")
 
-    n_bandit = config.get("experiment", {}).get("n_bandit", 50)
+    n_bandit = config.get("experiment", {}).get("n_bandit", 0)
+    if n_bandit == 0:
+        n_bandit = evolving_pool.M
     n_warm = warmup_cfg.get("n_warm", 30)
     max_turns = config.get("max_turns", 51)
 
