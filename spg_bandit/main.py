@@ -193,7 +193,7 @@ def main():
         evaluating_success = 0
         evaluating_records = []
 
-        for step in range(n_bandit):
+        for step in range(eval_pool.M):
             task_id = evaluating_selector.select(eval_pool)
             t0 = time.time()
             result = eval_method.execute(task_id)
@@ -207,7 +207,7 @@ def main():
                 "duration_s": round(elapsed, 1),
             })
             if step % 5 == 0 or step == n_bandit - 1:
-                logger.info(f"  evaluating step {step+1}/{n_bandit}: task {task_id} -> "
+                logger.info(f"  evaluating step {step+1}/{eval_pool.M}: task {task_id} -> "
                             f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
         evaluating_api = sum(r["api_calls"] for r in evaluating_records)
@@ -215,9 +215,9 @@ def main():
             recorder.append_jsonl("evaluating_steps", rec)
         recorder.save_json("evaluating_result", {
             "label": sel_name, "success": evaluating_success,
-            "total": n_bandit, "api_calls": evaluating_api,
+            "total": eval_pool.M, "api_calls": evaluating_api,
         })
-        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{n_bandit} "
+        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{eval_pool.M} "
                     f"success | {evaluating_api} API calls")
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
