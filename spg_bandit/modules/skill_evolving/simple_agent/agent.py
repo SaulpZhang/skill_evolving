@@ -81,13 +81,13 @@ class SimpleAgent(BaseSkillEvolving):
         self._client = OpenAI(
             base_url=os.getenv("LLM_BASE_URL"),
             api_key=os.getenv("LLM_API_KEY"),
-            timeout=120,
+            timeout=300,
         )
         self._model = os.getenv("LLM_MODEL")
         self._reflect_client = OpenAI(
             base_url=os.getenv("REFLECTION_BASE_URL", os.getenv("LLM_BASE_URL")),
             api_key=os.getenv("REFLECTION_API_KEY", os.getenv("LLM_API_KEY")),
-            timeout=120,
+            timeout=300,
         )
         self._reflect_model = os.getenv("REFLECTION_MODEL", os.getenv("LLM_MODEL"))
         self._total_calls = 0
