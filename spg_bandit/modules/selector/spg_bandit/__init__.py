@@ -275,11 +275,12 @@ class SPGBanditSelector(BaseSelector):
         elif self._warmup_ready:
             a_tau = self._A_fit[task_id]
             d_tau = self._d_fit[task_id]
+            profile_before = self._profile.copy()
             self._profile = online_profile_update(self._profile, a_tau, d_tau, success)
 
-            # Ridge regression update
+            # Ridge regression: learn from real skill progress
             if self._last_phi is not None:
-                delta = result.get("delta", np.zeros(self._K))
+                delta = self._profile - profile_before
                 self._A += np.outer(self._last_phi, self._last_phi)
                 self._B += np.outer(self._last_phi, delta)
                 self._W = np.linalg.solve(self._A, self._B)
