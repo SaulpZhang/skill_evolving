@@ -151,6 +151,70 @@ python spg_bandit/main.py -c spg --no-wandb
 | `--evaluating` | 跑完 bandit 后执行 evaluation 阶段 |
 | `--warmup-data` | 加载已保存的 warmup 数据，跳过 warmup 执行 |
 
+## 扩展：自定义 Skill Evolving 方法
+
+框架支持替换不同的 skill evolving 实现，只需实现 `BaseSkillEvolving` 接口。
+
+### 接口定义
+
+```python
+class BaseSkillEvolving(ABC):
+    
+    def execute(self, task_id: int) -> dict:
+        """执行任务，返回 {"success": bool, "trajectory": str, "api_calls": int, ...}"""
+    
+    def load_skills(self, skills_dir: str):
+        """从目录加载已有技能（可选）"""
+    
+    def reflect(self, task_id: int, result: dict):
+        """执行后反思，更新技能库（可选）"""
+    
+    def get_usage(self) -> dict:
+        """返回 API 调用统计"""
+    
+    def reset(self):
+        """重置状态"""
+```
+
+### 实现步骤
+
+1. 在 `modules/skill_evolving/` 下新建目录，实现 `BaseSkillEvolving`
+
+```
+modules/skill_evolving/my_method/
+  __init__.py        # export class
+  agent.py           # 你的实现
+```
+
+2. 在 `modules/skill_evolving/__init__.py` 中注册：
+
+```python
+from .my_method import MyAgent  # noqa: F401
+```
+
+3. 在 config 中指定：
+
+```yaml
+skill_evolving:
+  name: my_method
+```
+
+### 必要实现
+
+`execute()` 需要返回一个 dict，至少包含：
+
+```python
+{
+    "success": bool,     # 任务是否成功
+    "trajectory": str,   # 执行轨迹文本
+    "api_calls": int,    # 本次任务消耗的 API 调用数
+}
+```
+
+> `delta`（技能变化量）由 SPG-Bandit selector 通过 MIRT profile 变动自行计算，不需要 agent 返回。
+
+框架会自动处理数据集加载、selector 调度、日志记录和 W&B 追踪。
+
 ## 输出结构
 
 ```
