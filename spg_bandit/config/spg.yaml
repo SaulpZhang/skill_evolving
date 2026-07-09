@@ -28,7 +28,7 @@ skill_evolving:
   name: simple_agent
 
 spg_bandit:
-  K: 2
+  K: 4
   alpha: 0.1
   d_f: 16
   tau: 0.1
