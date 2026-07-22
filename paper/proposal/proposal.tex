@@ -111,7 +111,7 @@ We learn a surrogate model \(\hat{\boldsymbol{\delta}}(\tau, \mathbf{s}_t)\) and
 
 SPG-Bandit operates in two phases. In the \textbf{warmup phase}, the agent selects tasks uniformly to collect an initial set of interaction outcomes. After warmup, we run Multidimensional Item Response Theory (MIRT) to estimate the agent's latent skill profile for each warmup step, producing a sequence of skill deltas \(\{\boldsymbol{\delta}_t\}\) and item parameters for all tasks. We then train an MLP that predicts these deltas from task embeddings and the current profile.
     
-In the \textbf{bandit phase}, at each step we compute a skill-progress gap vector \(\mathbf{g}_t\) from the current profile, use the Neural Linear UCB to predict each task's expected delta, and select the task with the highest gap-weighted UCB score. After execution, we update the profile via a Bayesian online MIRT and update the bandit's ridge regression parameters.
+In the \textbf{bandit phase}, at each step we compute a skill-progress gap vector \(\mathbf{g}_t\) from the current profile, use a sliding-window neural linear UCB to predict each task's expected delta, and select the task with the highest gap-weighted UCB score. The sliding window discards outdated interactions, keeping the ridge regression model adapted to the current profile. After execution, we update the profile via a Bayesian online MIRT step and append the new observation to the window.
 
 \subsection{Key Components}
 
@@ -152,35 +152,35 @@ To anticipate how much a candidate task will improve the agent, we train a two-l
 A linear head \(\mathbf{W_3}\) predicts the expected delta: \(\hat{\boldsymbol{\delta}} = \mathbf{W_3}^\top \boldsymbol{\phi}\). Training minimizes MSE over the warmup dataset \(\{([\mathbf{e}_{\tau_t}; \mathbf{s}_t^{\text{(bef)}}], \boldsymbol{\delta}_t)\}_{t=1}^N\).
 
 \paragraph{Gap-weighted UCB selection.}
-The MLP produces a fixed feature representation \(\boldsymbol{\phi}\) for each task. On top of this, we learn a linear mapping from \(\boldsymbol{\phi}\) to the predicted delta \(\hat{\boldsymbol{\delta}}\) via ridge regression. The weight matrix \(\mathbf{W}\) is the ridge regression estimator:
+The MLP produces a fixed feature representation \(\boldsymbol{\phi}\) for each task. To track the non-stationary mapping from features to skill progress, we maintain a sliding window of the most recent \(\ell\) interactions and fit a ridge regression model locally within this window. Let \(\mathcal{W}_t = \{t-\ell+1, \dots, t\}\) denote the indices of the most recent \(\ell\) steps. The windowed covariance and response matrices are:
 
 \begin{equation}
-    \mathbf{W} = \mathbf{A}^{-1} \mathbf{B},
+    \mathbf{W}_t = \mathbf{A}_t^{-1} \mathbf{B}_t,
     \quad
-    \mathbf{A} = \lambda \mathbf{I} + \sum_{i=1}^t \boldsymbol{\phi}_i \boldsymbol{\phi}_i^\top,
+    \mathbf{A}_t = \lambda \mathbf{I} + \sum_{i \in \mathcal{W}_t} \boldsymbol{\phi}_{\tau_i} \boldsymbol{\phi}_{\tau_i}^\top,
     \quad
-    \mathbf{B} = \sum_{i=1}^t \boldsymbol{\phi}_i \boldsymbol{\delta}_i^\top,
+    \mathbf{B}_t = \sum_{i \in \mathcal{W}_t} \boldsymbol{\phi}_{\tau_i} \boldsymbol{\delta}_{\tau_i}^\top,
 \end{equation}
 
-giving the prediction \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}^\top \boldsymbol{\phi}_\tau\). Here \(\mathbf{A}\) also captures uncertainty: \(\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau\) measures the epistemic uncertainty of the prediction. To balance exploitation and exploration, we define the UCB bandit score:
+giving the prediction \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}_t^\top \boldsymbol{\phi}_\tau\). Here \(\mathbf{A}_t\) also captures epistemic uncertainty: \(\boldsymbol{\phi}_\tau^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}_\tau\) measures how much the window covers the region around \(\boldsymbol{\phi}_\tau\). The UCB bandit score is:
 
 \begin{equation}
-    \text{score}(\tau) = \mathbf{g}_t^\top \mathbf{W}^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau},
+    \text{score}(\tau) = \mathbf{g}_t^\top \mathbf{W}_t^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}_\tau},
     \label{eq:score}
 \end{equation}
 
 where the first term exploits the predicted gap-weighted delta and the second provides UCB-style exploration weighted by \(\alpha > 0\).
 
-\paragraph{Ridge regression update.}
-After observing the realized delta \(\boldsymbol{\delta}\), we update the bandit's covariance and response:
+\paragraph{Sliding-window update.}
+After observing \(\boldsymbol{\delta}_t\), we append \((\boldsymbol{\phi}_{\tau_t}, \boldsymbol{\delta}_t)\) to the window and evict the oldest entry once the window exceeds size \(\ell\). The incremental form is:
 
 \begin{align}
-    \mathbf{A} &\mathrel{+}= \boldsymbol{\phi} \boldsymbol{\phi}^\top, \\
-    \mathbf{B} &\mathrel{+}= \boldsymbol{\phi} \boldsymbol{\delta}^\top, \\
-    \mathbf{W} &= \mathbf{A}^{-1} \mathbf{B}.
+    \mathbf{A}_{t+1} &= \mathbf{A}_t + \boldsymbol{\phi}_{\tau_t} \boldsymbol{\phi}_{\tau_t}^\top - \boldsymbol{\phi}_{\text{old}} \boldsymbol{\phi}_{\text{old}}^\top, \\
+    \mathbf{B}_{t+1} &= \mathbf{B}_t + \boldsymbol{\phi}_{\tau_t} \boldsymbol{\delta}_t^\top - \boldsymbol{\phi}_{\text{old}} \boldsymbol{\delta}_{\text{old}}^\top, \\
+    \mathbf{W}_{t+1} &= \mathbf{A}_{t+1}^{-1} \mathbf{B}_{t+1}.
 \end{align}
 
-This ensures that the delta prediction adapts as more data is collected during the bandit phase.
+The window size \(\ell\) controls the tradeoff between estimation quality (more data) and responsiveness to profile drift (only recent data).
 
 \subsection{Algorithm}
 
@@ -190,7 +190,7 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \caption{SPG-Bandit}
 \label{alg:spg}
 \begin{algorithmic}
-\STATE {\bf Input:} Task pool \(\mathcal{T}\), warmup steps \(N\), bandit horizon \(H\), MLP feature dim \(d_f\), gap temperature \(\tau_g\), UCB exploration \(\alpha\), regularizer \(\lambda\), skill dimensions \(K\)
+\STATE {\bf Input:} Task pool \(\mathcal{T}\), warmup steps \(N\), bandit horizon \(H\), window size \(\ell\), MLP feature dim \(d_f\), gap temperature \(\tau_g\), UCB exploration \(\alpha\), regularizer \(\lambda\), skill dimensions \(K\)
 \STATE {\bf Phase 1: Warmup}
 \FOR{\(t = 1\) to \(N\)}
     \STATE Select \(\tau_t \in \mathcal{T}\) uniformly
@@ -199,7 +199,7 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \ENDFOR
 \STATE Run sequential MIRT EM on \(\{(\tau_t, y_t)\}\) \(\to\) profiles \(\{\mathbf{s}_t\}\), deltas \(\{\boldsymbol{\delta}_t\}\), item parameters \(\{\mathbf{a}_\tau, d_\tau\}\)
 \STATE Train MLP \(\Phi\) on \(\{([\mathbf{e}_{\tau_t}; \mathbf{s}_t^{\text{(bef)}}], \boldsymbol{\delta}_t)\}\)
-\STATE Initialize \(\mathbf{A} = \lambda \mathbf{I}_{d_f}\), \(\mathbf{B} = \mathbf{0}_{d_f \times K}\), current profile \(\mathbf{s} = \mathbf{s}_N\)
+\STATE Initialize window buffer \(\mathcal{W} = []\), \(\mathbf{A} = \lambda \mathbf{I}_{d_f}\), \(\mathbf{B} = \mathbf{0}_{d_f \times K}\), current profile \(\mathbf{s} = \mathbf{s}_N\)
 \STATE {\bf Phase 2: Bandit}
 \FOR{\(t = 1\) to \(H\)}
     \STATE Compute gap \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}) / \tau_g)\)
@@ -208,10 +208,12 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
         \STATE \(\text{score}(\tau) = \mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}^{-1} \boldsymbol{\phi}_\tau}\)
     \ENDFOR
     \STATE \(\tau_t = \arg\max_\tau \text{score}(\tau)\)
-    \STATE Execute \(\tau_t\), observe \(y_t\) and realized \(\boldsymbol{\delta}_t\)
+    \STATE Execute \(\tau_t\), observe \(y_t\) and compute \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}\)
     \STATE \(\mathbf{s} \gets \text{BayesUpdate}(\mathbf{s}, \mathbf{a}_{\tau_t}, d_{\tau_t}, y_t)\)
-    \STATE \(\mathbf{A} \mathrel{+}= \boldsymbol{\phi}_{\tau_t} \boldsymbol{\phi}_{\tau_t}^\top\)
-    \STATE \(\mathbf{B} \mathrel{+}= \boldsymbol{\phi}_{\tau_t} \boldsymbol{\delta}_t^\top\)
+    \STATE \(\mathcal{W}.\text{append}((\boldsymbol{\phi}_{\tau_t}, \boldsymbol{\delta}_t))\); \(\mathbf{A} \mathrel{+}= \boldsymbol{\phi}_{\tau_t} \boldsymbol{\phi}_{\tau_t}^\top\); \(\mathbf{B} \mathrel{+}= \boldsymbol{\phi}_{\tau_t} \boldsymbol{\delta}_t^\top\)
+    \IF{\(|\mathcal{W}| > \ell\)}
+        \STATE Pop oldest \((\boldsymbol{\phi}_{\text{old}}, \boldsymbol{\delta}_{\text{old}})\); \(\mathbf{A} \mathrel{-}= \boldsymbol{\phi}_{\text{old}} \boldsymbol{\phi}_{\text{old}}^\top\); \(\mathbf{B} \mathrel{-}= \boldsymbol{\phi}_{\text{old}} \boldsymbol{\delta}_{\text{old}}^\top\)
+    \ENDIF
     \STATE \(\mathbf{W} = \mathbf{A}^{-1} \mathbf{B}\)
 \ENDFOR
 \end{algorithmic}
@@ -238,7 +240,7 @@ The gap weight \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}_
 \subsection{Assumptions}
 
 \begin{enumerate}
-    \item \textbf{(Local linearity.)} Within any sliding window of size \(\tau\), there exists a fixed \(\mathbf{W}^* \in \mathbb{R}^{d_f \times K}\) such that \(\mathbb{E}[\mathbf{s}_{t+1} \mid \boldsymbol{\phi}_{\tau_t}] = \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t}\).
+    \item \textbf{(Local linearity.)} Within any sliding window of size \(\ell\), there exists a fixed \(\mathbf{W}^* \in \mathbb{R}^{d_f \times K}\) such that \(\mathbb{E}[\mathbf{s}_{t+1} \mid \boldsymbol{\phi}_{\tau_t}] = \mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t}\).
     \item \textbf{(Bounded features.)} \(\|\boldsymbol{\phi}_\tau\|_2 \leq 1\) for all \(\tau \in \mathcal{T}\), achievable by scaling.
     \item \textbf{(Bounded variation.)} \(V_T = \sum \|\mathbf{s}_{t+1} - \mathbf{s}_t\|_2 = o(T)\), as argued above.
 \end{enumerate}
@@ -259,37 +261,37 @@ Inserting the true local linear model \(\mathbf{W}^*\) from Assumption~1 yields 
 \hat{\mathbf{s}}_{t+1} - \mathbf{s}_{t+1} = \underbrace{(\mathbf{W}_t - \mathbf{W}^*)^\top \boldsymbol{\phi}_\tau}_{\text{estimation}} \;+\; \underbrace{(\mathbf{W}^{*\top} \boldsymbol{\phi}_\tau - \mathbf{s}_{t+1})}_{\text{model misspecification}}.
 \]
 
-\textbf{Estimation error.} The first term arises from learning \(\mathbf{W}_t\) from a finite window of \(\tau\) samples. The self-normalized martingale bound (Abbasi-Yadkori et al., 2011) yields per-step error \(\tilde{O}(1/\sqrt{\tau})\), accumulating to \(\tilde{O}(T / \sqrt{\tau})\) over \(T\) steps.
+\textbf{Estimation error.} The first term arises from learning \(\mathbf{W}_t\) from a finite window of \(\ell\) samples. The self-normalized martingale bound (Abbasi-Yadkori et al., 2011) yields per-step error \(\tilde{O}(1/\sqrt{\ell})\), accumulating to \(\tilde{O}(T / \sqrt{\ell})\) over \(T\) steps.
 
 \textbf{Drift error.} The true profile satisfies Assumption~1 only approximately within the window. The misspecification at step \(t\) is bounded by the cumulative profile drift inside the window:
 
 \[
-\|\mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t} - \mathbf{s}_{t+1}\| \leq \sum_{k = \max(1, t-\tau)}^{t} \Delta_k.
+\|\mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t} - \mathbf{s}_{t+1}\| \leq \sum_{k = \max(1, t-\ell)}^{t} \Delta_k.
 \]
 
-Over \(T\) steps, each \(\Delta_k\) appears in at most \(\tau\) windows, yielding \(O(\tau \cdot V_T)\).
+Over \(T\) steps, each \(\Delta_k\) appears in at most \(\ell\) windows, yielding \(O(\ell \cdot V_T)\).
 
 Assembling both contributions:
 
 \begin{equation}
     R(T) = \sum_{t=1}^T (r_t^* - r_t) \leq
-    \underbrace{\tilde{O}\!\left( \frac{T}{\sqrt{\tau}} \right)}_{\text{estimation}} \;+\;
-    \underbrace{O(\tau \cdot V_T)}_{\text{drift}}.
+    \underbrace{\tilde{O}\!\left( \frac{T}{\sqrt{\ell}} \right)}_{\text{estimation}} \;+\;
+    \underbrace{O(\ell \cdot V_T)}_{\text{drift}}.
     \label{eq:decomposition}
 \end{equation}
 
 \subsection{Optimal Window and Regret Bound}
 
-Balancing the two terms by setting \(\frac{T}{\sqrt{\tau}} = \tau \cdot V_T\) yields the optimal window size:
+Balancing the two terms by setting \(\frac{T}{\sqrt{\ell}} = \ell \cdot V_T\) yields the optimal window size:
 
 \begin{equation}
-    \tau^* = \left( \frac{T}{V_T} \right)^{2/3},
+    \ell^* = \left( \frac{T}{V_T} \right)^{2/3},
 \end{equation}
 
 and the corresponding cumulative regret bound:
 
 \begin{equation}
-    R(T) = \tilde{O}\!\left( d_f \cdot T^{2/3} \cdot V_T^{1/3} \right).
+    R(T) = \tilde{O}\!\left( T^{2/3} \cdot V_T^{1/3} \right).
     \label{eq:bound}
 \end{equation}
 
@@ -299,7 +301,7 @@ Since \(V_T = o(T)\), let \(V_T = O(T^\nu)\) for some \(\nu < 1\). Substituting:
     R(T) = \tilde{O}\!\left( T^{2/3} \cdot T^{\nu/3} \right) = \tilde{O}\!\left( T^{(2+\nu)/3} \right) = o(T),
 \end{equation}
 
-establishing strictly sublinear regret. For example, \(\nu = 1/2\) (active learning) gives \(\tilde{O}(T^{5/6})\); \(\nu = 0\) (near saturation) gives \(\tilde{O}(T^{2/3})\).
+
 
 
 
