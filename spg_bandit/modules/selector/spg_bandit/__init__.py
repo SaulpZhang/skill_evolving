@@ -84,13 +84,14 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
     N_warm, M = R.shape
     obs_mask = ~np.isnan(R)
     R_filled = np.nan_to_num(R, nan=0.0)
-    s_hist = np.random.randn(N_warm, K) * 0.1
-    A = np.random.randn(M, K) * 0.1
-    d_vec = np.zeros(M)
+    s_hist = np.full((N_warm, K), 0.5)
+    A = np.random.uniform(0.5, 1.5, (M, K))
+    d_vec = np.full(M, 0.5)
     prev_ll = -np.inf
     ll_history = []
 
     for it in range(max_iter):
+        # E-step: MAP estimate of s_t ∈ [0,1]^K
         for t in range(N_warm):
             obs_t = np.where(obs_mask[t])[0]
             if len(obs_t) == 0:
@@ -99,12 +100,14 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
             for _ in range(20):
                 theta = A[obs_t] @ s - d_vec[obs_t]
                 p = sigmoid(theta)
-                grad = A[obs_t].T @ (R_filled[t, obs_t] - p) - s
+                dif = R_filled[t, obs_t] - p
+                grad = A[obs_t].T @ dif - 1.0 * (s - 0.5)
                 Wd = p * (1 - p)
                 hess = -A[obs_t].T @ (A[obs_t] * Wd[:, np.newaxis]) - np.eye(K)
                 s -= 0.5 * np.linalg.solve(hess, grad)
-            s_hist[t] = np.clip(s, -3.0, 3.0)
+            s_hist[t] = np.clip(s, 0.0, 1.0)
 
+        # M-step: optimize per-task (a_τ, d_τ) with a ≥ 0, d ≥ 0
         for tau in range(M):
             t_idx = np.where(obs_mask[:, tau])[0]
             if len(t_idx) < 2:
@@ -117,9 +120,15 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
                 ll = y @ np.log(p + 1e-15) + (1 - y) @ np.log(1 - p + 1e-15)
                 return -(ll - 0.01 * np.sum(a ** 2))
 
-            res = minimize(nll, np.concatenate([A[tau], [d_vec[tau]]]), method="L-BFGS-B", options={"maxiter": 50})
+            res = minimize(
+                nll, np.concatenate([A[tau], [d_vec[tau]]]),
+                method="L-BFGS-B",
+                bounds=[(0, None)] * K + [(0, None)],
+                options={"maxiter": 50},
+            )
             A[tau], d_vec[tau] = res.x[:-1], res.x[-1]
 
+        # Log-likelihood
         ll = 0.0
         for t in range(N_warm):
             for tau in range(M):
@@ -135,7 +144,7 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
             break
         prev_ll = ll
 
-    return sigmoid(s_hist), A, d_vec, ll, ll_history
+    return s_hist, A, d_vec, ll, ll_history
 
 
 # ── MIRT Online Bayesian Update ─────────────────────────────────────────────

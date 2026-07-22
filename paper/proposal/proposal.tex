@@ -24,10 +24,6 @@ Address \\
 
 \maketitle
 
-\begin{abstract}
-Large language model agents can improve their performance through skill evolution---reflecting on execution trajectories and accumulating reusable knowledge. However, existing systems select practice tasks uniformly at random, ignoring the fact that different tasks contribute unequally to skill growth. We propose SPG-Bandit, a framework that casts task selection as a contextual bandit problem driven by a latent skill profile of the agent. SPG-Bandit uses Multidimensional Item Response Theory (MIRT) to estimate the agent's proficiency across multiple skill dimensions, then selects tasks using a gap-weighted upper confidence bound that prioritizes underdeveloped dimensions. Theoretically, we show that SPG-Bandit achieves $O(d_f \sqrt{T} \log T)$ cumulative regret by treating the gap-weighted reward as a convex combination of independent ridge regressions.
-\end{abstract}
-
 \section{Introduction}
 \label{sec:introduction}
 
@@ -126,17 +122,23 @@ We model each task \(\tau\) with a \(K\)-dimensional discrimination vector \(\ma
     \label{eq:mirt}
 \end{equation}
 
-where \(\sigma(x) = 1/(1 + e^{-x})\). A high value in dimension \(k\) of \(\mathbf{a}_\tau\) means task \(\tau\) heavily depends on skill dimension \(k\); a high \(d_\tau\) means the task is generally difficult.
+where \(\sigma(x) = 1/(1 + e^{-x})\). We constrain \(\mathbf{a}_\tau \geq 0\) and \(d_\tau \geq 0\) element-wise. The non-negativity of \(\mathbf{a}_\tau\) guarantees that increasing any dimension of \(\mathbf{s}\) never decreases the predicted success probability---skill acquisition and task performance are monotonically aligned. Together with \(d_\tau \geq 0\), the model encodes the natural prior that higher proficiency corresponds to higher success, establishing \(\mathbf{s}\) as a directionally reliable indicator of agent capability.
 
-After collecting \(N\) warmup outcomes \(\{( \tau_t, y_t )\}_{t=1}^N\), we run an EM algorithm to jointly estimate:
-\begin{itemize}
-    \item The latent profiles \(\{\mathbf{s}_t\}_{t=1}^N\) .
-    \item The item parameters \(\{(\mathbf{a}_\tau, d_\tau)\}_{\tau=1}^M\).
-\end{itemize}
+After collecting \(N\) warmup outcomes \(\{( \tau_t, y_t )\}_{t=1}^N\), we estimate the skill profiles and item parameters via alternating optimization:
 
-The E-step updates each \(\mathbf{s}_t\) via Newton-Raphson on the log-likelihood of observed outcomes for tasks selected up to step \(t\). The M-step optimizes each item's parameters via L-BFGS-B with \(\ell_2\) regularization.
+\textit{E-step.} Fix the item parameters \(\{(\mathbf{a}_\tau, d_\tau)\}\). For each step \(t\), compute the most likely profile \(\mathbf{s}_t\) by maximizing the log-posterior \(\log P(y_t \mid \mathbf{s}_t, \mathbf{a}_{\tau_t}, d_{\tau_t}) + \log P(\mathbf{s}_t)\), where the prior \(P(\mathbf{s}_t)\) is a Gaussian centered at \(0.5\).
 
-After fitting, \textbf{sequential MIRT} is applied. For \(t = 1\), the profile before the step is initialized to zeros; for \(t \geq 2\), we run EM on the first \(t-1\) observations to obtain the profile before step \(t\), denoted \(\mathbf{s}_t^{\text{(bef)}}\). Running EM on the \(t\) observations gives the profile after step \(t\), denoted \(\mathbf{s}_t^{\text{(aft)}}\). The delta \(\boldsymbol{\delta}_t = \mathbf{s}_t^{\text{(aft)}} - \mathbf{s}_t^{\text{(bef)}}\) captures the progress attributable to executing task \(\tau_t\).
+\textit{M-step.} Fix the profiles \(\{\mathbf{s}_t\}\). For each task \(\tau\), maximize the log-likelihood of all observations of that task with respect to \((\mathbf{a}_\tau, d_\tau)\) under L-BFGS-B, enforcing \(\mathbf{a}_\tau \geq 0, d_\tau \geq 0\) and \(\ell_2\) regularization on \(\mathbf{a}_\tau\). The two constraints together guarantee \(\mathbf{s} \uparrow \Rightarrow p_\tau(\mathbf{s}) \uparrow\) (higher proficiency monotonically implies higher success probability).
+
+Alternate E- and M-steps until the log-likelihood stabilizes.
+
+\textit{Online update.} In the bandit phase, each new observation \((y_t, \tau_t)\) refines the profile online without re-running the full alternating estimation. Given the current profile \(\mathbf{s}_t\) and task parameters \((\mathbf{a}_{\tau_t}, d_{\tau_t})\), the posterior profile is:
+
+\begin{equation}
+    \mathbf{s}_{t+1} = \arg\max_{\mathbf{s} \in [0,1]^K} \; \log P(y_t \mid \mathbf{s}, \mathbf{a}_{\tau_t}, d_{\tau_t}) + \log P(\mathbf{s} \mid \mathbf{s}_t),
+\end{equation}
+
+
 
 \paragraph{Delta prediction via MLP.}
 To anticipate how much a candidate task will improve the agent, we train a two-layer MLP \(\Phi\) that maps the concatenation of the task embedding \(\mathbf{e}_\tau\) and current profile \(\mathbf{s}\) to a feature vector \(\boldsymbol{\phi} \in \mathbb{R}^{Z^+}\):
