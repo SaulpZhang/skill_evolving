@@ -33,7 +33,7 @@ Thumbs.db
 # Project specific
 results/
 refine-logs/
-*.pdf
+# *.pdf
 
 # LaTeX build artifacts
 *.aux
