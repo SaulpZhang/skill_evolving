@@ -30,23 +30,23 @@ Address \\
 
 \subsection{Background and Motivation}
 
-Large language model (LLM) agents have demonstrated the ability to perform complex tasks across a variety of environments, including embodied task completion, web navigation, and software engineering. A key capability enabling such generality is \emph{skill evolution}: the agent reflects on its execution trajectories, extracts reusable knowledge, and accumulates it in a growing skill library for future episodes.
+Large language model (LLM) agents have demonstrated the ability to perform complex tasks in diverse environments, including embodied control, web navigation, and software engineering. A key capability underlying this generality is \emph{skill evolution}: an agent reflects on its execution trajectories, extracts reusable knowledge, and accumulates it in an expanding skill library for subsequent episodes.
 
-Prior work has focused primarily on two aspects of this process. The first is \emph{skill quality}---how to extract more informative patterns from trajectories. For instance, SkillRL introduces a reflection mechanism that generates planning patterns from successful episodes and common mistakes from failures. The second is \emph{skill utilization}---how to organize, retrieve, and inject skills into the agent's prompt at inference time. These efforts include structured skill banks with category-specific retrieval, vector-database approaches, and dynamic prompting strategies.
+Prior work has focused primarily on two aspects of this process. The first is \emph{skill quality}: extracting informative, reusable patterns from trajectories. For example, SkillRL uses reflection to derive planning patterns from successful episodes and recurring pitfalls from failures. The second is \emph{skill utilization}: organizing, retrieving, and incorporating skills into an agent's inference-time prompt. Representative approaches include structured skill banks with category-specific retrieval, vector-database-based retrieval, and dynamic prompting strategies.
 
-A critical dimension has remained largely unexplored: \textbf{the order in which tasks are selected for practice.} Existing systems either cycle through a fixed task pool uniformly, sample tasks at random, or rely on hand-designed curricula that do not adapt to the agent's evolving competence. In RL, it is well-known that the task selection strategy can significantly affect learning efficiency. So, it is natural to ask: \emph{can we improve the efficiency and performance of skill evolution in LLM agents by adaptively selecting tasks based on the agent's current skill profile?}
+A critical dimension remains largely unexplored: \textbf{the order in which tasks are selected for practice.} Existing systems typically cycle uniformly through a fixed task pool, sample tasks at random, or use hand-designed curricula that cannot adapt to an agent's evolving competence. Reinforcement learning has shown that task-selection policies can substantially affect learning efficiency. This observation motivates the following question: \emph{Can adaptively selecting tasks according to an agent's current skill profile improve the efficiency and effectiveness of skill evolution in LLM agents?}
 
 \subsection{Contributions}
 
-We present \textbf{SPG-Bandit} (Skill Profile Guided Bandit), a framework that casts task selection as a contextual bandit problem driven by a multidimensional skill profile of the agent.
+We propose \textbf{SPG-Bandit} (Skill Profile Guided Bandit), a framework that casts task selection as a contextual bandit problem informed by an agent's multidimensional skill profile.
 
-Our core idea is to model the agent's latent proficiency across \(K\) skill dimensions using Multidimensional Item Response Theory (MIRT), then select tasks that maximize the expected progress toward underdeveloped dimensions.
+Our central idea is to use Multidimensional Item Response Theory (MIRT) to model the agent's latent proficiency over \(K\) skill dimensions, and then select tasks that maximize expected progress on underdeveloped dimensions.
 
 Specifically, this proposal makes the following contributions:
 \begin{enumerate}
     \item \textbf{Problem.} We identify and formalize the task selection problem in LLM agent skill evolution. We show that uniform and random selection---the default in existing systems---is suboptimal because different tasks contribute unequally to skill growth and the agent's skill profile is inherently multidimensional.
     \item \textbf{Method.} We propose SPG-Bandit, a framework that combines MIRT-based latent skill profiling with a gap-weighted bandit algorithm. The core idea is to maintain an online estimate of the agent's proficiency across \(K\) skill dimensions, then select tasks that maximize predicted progress toward underdeveloped dimensions.
-    \item \textbf{Framework.} We provide a general framework which can easily combine with existing skill evolution methods. The framework is used to evaluate the effectiveness of SPG-Bandit in improving skill evolution efficiency and performance.
+    \item \textbf{Framework.} We provide a general framework that integrates readily with existing skill-evolution methods and enables a systematic evaluation of SPG-Bandit's impact on skill-evolution efficiency and task performance.
 \end{enumerate}
 
 \section{Problem Formulation}
@@ -54,20 +54,20 @@ Specifically, this proposal makes the following contributions:
 
 \subsection{Notation and Setup}
 
-Consider an LLM agent interacting with a fixed pool of tasks \(\mathcal{T} = \{1, 2, \dots, M\}\). At each discrete step \(t = 1, 2, \dots\), the agent selects a task \(\tau_t \in \mathcal{T}\), executes it, and receives a binary outcome \(y_t \in \{0, 1\}\) indicating task success or failure.
+Consider an LLM agent interacting with a fixed task pool \(\mathcal{T} = \{1, 2, \dots, M\}\). At each discrete step \(t = 1, 2, \dots\), the agent selects and executes a task \(\tau_t \in \mathcal{T}\), and observes a binary outcome \(y_t \in \{0, 1\}\) indicating success or failure.
 
-The agent possesses a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\) representing its proficiency across \(K\) distinct skill dimensions. The profile is not directly observable; it must be inferred from observed outcomes. We denote the \emph{skill progress} between consecutive steps as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), which measures how much the agent's latent proficiency changes after executing task \(\tau_t\) and updating its skills via reflection.
+The agent has a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\), which represents its proficiency across \(K\) distinct skill dimensions. This profile is unobserved and must be inferred from task outcomes. We define the \emph{skill progress} between consecutive steps as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), which captures the change in latent proficiency after executing \(\tau_t\) and updating skills through reflection.
 
-Each task \(\tau\) is associated with a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{Z^+}\), typically derived from a sentence encoder applied to the task's natural-language goal description.
+Each task \(\tau\) is associated with a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{Z^+}\), typically obtained by applying a sentence encoder to its natural-language goal description.
 
 \subsection{Problem Definition}
 
 We formalize adaptive task selection as a \emph{contextual bandit} problem. At each step \(t\):
 
 \begin{enumerate}
-    \item The agent observes its current context: the current skill profile \(\mathbf{s}_t\) and the embedding \(\mathbf{e}_\tau\) for each task \(\tau \in \mathcal{T}\).
+    \item The agent observes its context: its current skill profile \(\mathbf{s}_t\) and the embedding \(\mathbf{e}_\tau\) of every task \(\tau \in \mathcal{T}\).
     \item The agent selects an arm \(\tau_t \in \mathcal{T}\).
-    \item The agent executes task \(\tau_t\), observes binary outcome \(y_t\), and updates its skills via reflection.
+    \item The agent executes \(\tau_t\), observes the binary outcome \(y_t\), and updates its skills through reflection.
     \item The latent skill profile updates to \(\mathbf{s}_{t+1}\).
 \end{enumerate}
 
@@ -78,7 +78,7 @@ To prioritize underdeveloped skill dimensions, we define a \emph{gap weight} vec
     \label{eq:gap-def}
 \end{equation}
 
-where \(\tau_g > 0\) is a temperature parameter. We define the immediate reward as the gap-weighted post-execution profile value:
+where \(\tau_g > 0\) is a temperature parameter. We first define the immediate reward as the gap-weighted post-execution profile value:
 
 \begin{equation}
     r_t = \mathbf{g}_t^\top \mathbf{s}_{t+1}.
@@ -92,16 +92,16 @@ The goal is to maximize the expected cumulative reward:
     \label{eq:objective}
 \end{equation}
 
-where \(\pi\) denotes the task selection policy. This formulation naturally prioritizes underdeveloped dimensions via the gap weights \(\mathbf{g}_t\), without requiring an auxiliary objective.
+where \(\pi\) denotes the task-selection policy. This formulation prioritizes underdeveloped dimensions through \(\mathbf{g}_t\), without requiring an auxiliary objective.
 
-Defining the per-step skill progress as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), we have \(r_t = \mathbf{g}_t^\top (\mathbf{s}_t + \boldsymbol{\delta}_t) = \mathbf{g}_t^\top \mathbf{s}_t + \mathbf{g}_t^\top \boldsymbol{\delta}_t\). The term \(\mathbf{g}_t^\top \mathbf{s}_t\) is constant with respect to the choice of \(\tau\) under a given \(\pi\). Hence, maximizing \(r_t\) is equivalent to maximizing the gap-weighted skill progress at each step. We therefore adopt the following equivalent reward:
+Because \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), we have \(r_t = \mathbf{g}_t^\top (\mathbf{s}_t + \boldsymbol{\delta}_t) = \mathbf{g}_t^\top \mathbf{s}_t + \mathbf{g}_t^\top \boldsymbol{\delta}_t\). For a fixed state \(\mathbf{s}_t\), the first term does not depend on the selected task. Thus, maximizing the immediate reward is equivalent to maximizing gap-weighted skill progress. We therefore use the following equivalent decision reward:
 
 \begin{equation}
     r_t = \mathbf{g}_t^\top \boldsymbol{\delta}_t.
     \label{eq:reward-delta}
 \end{equation}
 
-We learn a surrogate model \(\hat{\boldsymbol{\delta}}(\tau, \mathbf{s}_t)\) and use \(\mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau\) as the reward for bandit decision-making.
+We learn a surrogate model \(\hat{\boldsymbol{\delta}}(\tau, \mathbf{s}_t)\) and use \(\mathbf{g}_t^\top \hat{\boldsymbol{\delta}}_\tau\) as the bandit's estimated reward.
 
 
 \section{Method}
@@ -109,31 +109,31 @@ We learn a surrogate model \(\hat{\boldsymbol{\delta}}(\tau, \mathbf{s}_t)\) and
 
 \subsection{Overview}
 
-SPG-Bandit operates in two phases. In the \textbf{warmup phase}, the agent selects tasks uniformly to collect an initial set of interaction outcomes. After warmup, we run Multidimensional Item Response Theory (MIRT) to estimate the agent's latent skill profile for each warmup step, producing a sequence of skill deltas \(\{\boldsymbol{\delta}_t\}\) and item parameters for all tasks. We then train an MLP that predicts these deltas from task embeddings and the current profile.
+SPG-Bandit operates in two phases. During \textbf{warmup}, the agent samples tasks uniformly to collect initial interaction outcomes. We then fit a Multidimensional Item Response Theory (MIRT) model to estimate the agent's latent skill profile at each warmup step, yielding a sequence of skill deltas \(\{\boldsymbol{\delta}_t\}\) and item parameters for all tasks. These estimates supervise an MLP that predicts a task's skill delta from its embedding and the current profile.
     
-In the \textbf{bandit phase}, at each step we compute a skill-progress gap vector \(\mathbf{g}_t\) from the current profile, use a sliding-window neural linear UCB to predict each task's expected delta, and select the task with the highest gap-weighted UCB score. The sliding window discards outdated interactions, keeping the ridge regression model adapted to the current profile. After execution, we update the profile via a Bayesian online MIRT step and append the new observation to the window.
+During the \textbf{bandit phase}, we compute a skill-gap vector \(\mathbf{g}_t\) from the current profile at every step, use a sliding-window neural linear UCB model to predict each task's expected delta, and select the task with the largest gap-weighted UCB score. By discarding outdated interactions, the sliding window keeps the ridge-regression model responsive to the current profile. After execution, we update the profile through an online Bayesian MIRT step and append the new observation to the window.
 
 \subsection{Key Components}
 
 \paragraph{Multidimensional IRT (MIRT).}
-We model each task \(\tau\) with a \(K\)-dimensional discrimination vector \(\mathbf{a}_\tau \in \mathbb{R}^K\) and a difficulty scalar \(d_\tau \in \mathbb{R}\). Given the agent's current skill profile \(\mathbf{s} \in [0,1]^K\), the probability of success on task \(\tau\) is:
+We associate each task \(\tau\) with a \(K\)-dimensional discrimination vector \(\mathbf{a}_\tau \in \mathbb{R}^K\) and a scalar difficulty \(d_\tau \in \mathbb{R}\). Given the agent's current skill profile \(\mathbf{s} \in [0,1]^K\), its success probability on task \(\tau\) is:
 
 \begin{equation}
     p_\tau(\mathbf{s}) = \sigma\!\left( \mathbf{a}_\tau^\top \mathbf{s} - d_\tau \right),
     \label{eq:mirt}
 \end{equation}
 
-where \(\sigma(x) = 1/(1 + e^{-x})\). We constrain \(\mathbf{a}_\tau \geq 0\) and \(d_\tau \geq 0\) element-wise. The non-negativity of \(\mathbf{a}_\tau\) guarantees that increasing any dimension of \(\mathbf{s}\) never decreases the predicted success probability---skill acquisition and task performance are monotonically aligned. Together with \(d_\tau \geq 0\), the model encodes the natural prior that higher proficiency corresponds to higher success, establishing \(\mathbf{s}\) as a directionally reliable indicator of agent capability.
+where \(\sigma(x) = 1/(1 + e^{-x})\). We impose element-wise constraints \(\mathbf{a}_\tau \geq 0\) and \(d_\tau \geq 0\). Non-negativity of \(\mathbf{a}_\tau\) ensures that increasing any component of \(\mathbf{s}\) cannot decrease the predicted success probability; skill acquisition and task performance are therefore monotonically aligned. Together with \(d_\tau \geq 0\), these constraints encode the prior that greater proficiency corresponds to greater success, making \(\mathbf{s}\) a directionally reliable measure of agent capability.
 
-After collecting \(N\) warmup outcomes \(\{( \tau_t, y_t )\}_{t=1}^N\), we estimate the skill profiles and item parameters via alternating optimization:
+After collecting \(N\) warmup outcomes \(\{( \tau_t, y_t )\}_{t=1}^N\), we estimate skill profiles and item parameters by alternating optimization:
 
-\textit{E-step.} Fix the item parameters \(\{(\mathbf{a}_\tau, d_\tau)\}\). For each step \(t\), compute the most likely profile \(\mathbf{s}_t\) by maximizing the log-posterior \(\log P(y_t \mid \mathbf{s}_t, \mathbf{a}_{\tau_t}, d_{\tau_t}) + \log P(\mathbf{s}_t)\), where the prior \(P(\mathbf{s}_t)\) is a Gaussian centered at \(0.5\).
+\textit{E-step.} With item parameters \(\{(\mathbf{a}_\tau, d_\tau)\}\) fixed, estimate the most likely profile \(\mathbf{s}_t\) at each step by maximizing the log-posterior \(\log P(y_t \mid \mathbf{s}_t, \mathbf{a}_{\tau_t}, d_{\tau_t}) + \log P(\mathbf{s}_t)\), where \(P(\mathbf{s}_t)\) is a Gaussian prior centered at \(0.5\).
 
-\textit{M-step.} Fix the profiles \(\{\mathbf{s}_t\}\). For each task \(\tau\), maximize the log-likelihood of all observations of that task with respect to \((\mathbf{a}_\tau, d_\tau)\) under L-BFGS-B, enforcing \(\mathbf{a}_\tau \geq 0, d_\tau \geq 0\) and \(\ell_2\) regularization on \(\mathbf{a}_\tau\). The two constraints together guarantee \(\mathbf{s} \uparrow \Rightarrow p_\tau(\mathbf{s}) \uparrow\) (higher proficiency monotonically implies higher success probability).
+\textit{M-step.} With profiles \(\{\mathbf{s}_t\}\) fixed, maximize each task's observation log-likelihood with respect to \((\mathbf{a}_\tau, d_\tau)\) using L-BFGS-B, subject to \(\mathbf{a}_\tau \geq 0\), \(d_\tau \geq 0\), and \(\ell_2\) regularization on \(\mathbf{a}_\tau\). These constraints ensure \(\mathbf{s} \uparrow \Rightarrow p_\tau(\mathbf{s}) \uparrow\): higher proficiency monotonically implies a higher success probability.
 
-Alternate E- and M-steps until the log-likelihood stabilizes.
+We alternate E- and M-steps until the log-likelihood converges.
 
-\textit{Online update.} In the bandit phase, each new observation \((y_t, \tau_t)\) refines the profile online without re-running the full alternating estimation. Given the current profile \(\mathbf{s}_t\) and task parameters \((\mathbf{a}_{\tau_t}, d_{\tau_t})\), the posterior profile is:
+\textit{Online update.} During the bandit phase, each new observation \((y_t, \tau_t)\) refines the profile without re-running the full alternating procedure. Given the current profile \(\mathbf{s}_t\) and task parameters \((\mathbf{a}_{\tau_t}, d_{\tau_t})\), we obtain the updated profile as:
 
 \begin{equation}
     \mathbf{s}_{t+1} = \arg\max_{\mathbf{s} \in [0,1]^K} \; \log P(y_t \mid \mathbf{s}, \mathbf{a}_{\tau_t}, d_{\tau_t}) + \log P(\mathbf{s} \mid \mathbf{s}_t),
@@ -142,17 +142,17 @@ Alternate E- and M-steps until the log-likelihood stabilizes.
 
 
 \paragraph{Delta prediction via MLP.}
-To anticipate how much a candidate task will improve the agent, we train a two-layer MLP \(\Phi\) that maps the concatenation of the task embedding \(\mathbf{e}_\tau\) and current profile \(\mathbf{s}\) to a feature vector \(\boldsymbol{\phi} \in \mathbb{R}^{Z^+}\):
+To anticipate the improvement induced by a candidate task, we train a two-layer MLP \(\Phi\) that maps the concatenation of task embedding \(\mathbf{e}_\tau\) and current profile \(\mathbf{s}\) to a feature vector \(\boldsymbol{\phi} \in \mathbb{R}^{Z^+}\):
 
 \begin{align}
     \mathbf{h} &= \max(\mathbf{W}_1 [\mathbf{e}_\tau; \mathbf{s}] + \mathbf{b}_1, 0), \\
     \boldsymbol{\phi} &= \mathbf{W}_2 \mathbf{h} + \mathbf{b}_2.
 \end{align}
 
-A linear head \(\mathbf{W_3}\) predicts the expected delta: \(\hat{\boldsymbol{\delta}} = \mathbf{W_3}^\top \boldsymbol{\phi}\). Training minimizes MSE over the warmup dataset \(\{([\mathbf{e}_{\tau_t}; \mathbf{s}_t^{\text{(bef)}}], \boldsymbol{\delta}_t)\}_{t=1}^N\).
+A linear head \(\mathbf{W}_3\) predicts the expected delta, \(\hat{\boldsymbol{\delta}} = \mathbf{W}_3^\top \boldsymbol{\phi}\). We train the network by minimizing MSE over the warmup dataset \(\{([\mathbf{e}_{\tau_t}; \mathbf{s}_t^{\text{(bef)}}], \boldsymbol{\delta}_t)\}_{t=1}^N\).
 
 \paragraph{Gap-weighted UCB selection.}
-The MLP produces a fixed feature representation \(\boldsymbol{\phi}\) for each task. To track the non-stationary mapping from features to skill progress, we maintain a sliding window of the most recent \(\ell\) interactions and fit a ridge regression model locally within this window. Let \(\mathcal{W}_t = \{t-\ell+1, \dots, t\}\) denote the indices of the most recent \(\ell\) steps. The windowed covariance and response matrices are:
+The MLP produces a fixed feature representation \(\boldsymbol{\phi}\) for each task. To track the non-stationary mapping from features to skill progress, we maintain a sliding window containing the most recent \(\ell\) interactions and fit ridge regression locally within that window. Let \(\mathcal{W}_t = \{t-\ell+1, \dots, t\}\) denote the corresponding step indices. The windowed covariance and response matrices are:
 
 \begin{equation}
     \mathbf{W}_t = \mathbf{A}_t^{-1} \mathbf{B}_t,
@@ -162,17 +162,17 @@ The MLP produces a fixed feature representation \(\boldsymbol{\phi}\) for each t
     \mathbf{B}_t = \sum_{i \in \mathcal{W}_t} \boldsymbol{\phi}_{\tau_i} \boldsymbol{\delta}_{\tau_i}^\top,
 \end{equation}
 
-giving the prediction \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}_t^\top \boldsymbol{\phi}_\tau\). Here \(\mathbf{A}_t\) also captures epistemic uncertainty: \(\boldsymbol{\phi}_\tau^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}_\tau\) measures how much the window covers the region around \(\boldsymbol{\phi}_\tau\). The UCB bandit score is:
+which gives the prediction \(\hat{\boldsymbol{\delta}}_\tau = \mathbf{W}_t^\top \boldsymbol{\phi}_\tau\). The matrix \(\mathbf{A}_t\) also captures epistemic uncertainty: \(\boldsymbol{\phi}_\tau^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}_\tau\) quantifies the coverage of the region around \(\boldsymbol{\phi}_\tau\) within the window. The UCB score is:
 
 \begin{equation}
     \text{score}(\tau) = \mathbf{g}_t^\top \mathbf{W}_t^\top \boldsymbol{\phi}_\tau + \alpha \sqrt{\boldsymbol{\phi}_\tau^\top \mathbf{A}_t^{-1} \boldsymbol{\phi}_\tau},
     \label{eq:score}
 \end{equation}
 
-where the first term exploits the predicted gap-weighted delta and the second provides UCB-style exploration weighted by \(\alpha > 0\).
+The first term exploits the predicted gap-weighted delta, while the second induces UCB-style exploration, controlled by \(\alpha > 0\).
 
 \paragraph{Sliding-window update.}
-After observing \(\boldsymbol{\delta}_t\), we append \((\boldsymbol{\phi}_{\tau_t}, \boldsymbol{\delta}_t)\) to the window and evict the oldest entry once the window exceeds size \(\ell\). The incremental form is:
+After observing \(\boldsymbol{\delta}_t\), we append \((\boldsymbol{\phi}_{\tau_t}, \boldsymbol{\delta}_t)\) to the window and evict the oldest entry when the window exceeds size \(\ell\). The incremental updates are:
 
 \begin{align}
     \mathbf{A}_{t+1} &= \mathbf{A}_t + \boldsymbol{\phi}_{\tau_t} \boldsymbol{\phi}_{\tau_t}^\top - \boldsymbol{\phi}_{\text{old}} \boldsymbol{\phi}_{\text{old}}^\top, \\
@@ -180,7 +180,7 @@ After observing \(\boldsymbol{\delta}_t\), we append \((\boldsymbol{\phi}_{\tau_
     \mathbf{W}_{t+1} &= \mathbf{A}_{t+1}^{-1} \mathbf{B}_{t+1}.
 \end{align}
 
-The window size \(\ell\) controls the tradeoff between estimation quality (more data) and responsiveness to profile drift (only recent data).
+The window size \(\ell\) mediates the trade-off between estimation quality, which benefits from more data, and responsiveness to profile drift, which benefits from recent data.
 
 \subsection{Algorithm}
 
@@ -222,20 +222,20 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \section{Theoretical Analysis}
 \label{sec:theory}
 
-The agent's skill profile \(\mathbf{s}_t\) evolves over time, making the reward distribution non-stationary. We analyze the dynamic regret of SPG-Bandit with the sliding-window ridge regression described in Section~\ref{sec:method}.
+Because the agent's skill profile \(\mathbf{s}_t\) evolves over time, its reward distribution is non-stationary. We analyze the dynamic regret of SPG-Bandit under the sliding-window ridge-regression estimator described in Section~\ref{sec:method}.
 
 \subsection{Non-stationary Setting}
 
-Recall that the reward is \(r_t = \mathbf{g}_t^\top \mathbf{s}_{t+1}\). The profile evolves from \(\mathbf{s}_t\) to \(\mathbf{s}_{t+1}\) after task execution and reflection. Define the one-step variation \(\Delta_t = \|\mathbf{s}_{t+1} - \mathbf{s}_t\|_2\), and the total variation budget over \(T\) steps:
+Recall that the reward is \(r_t = \mathbf{g}_t^\top \mathbf{s}_{t+1}\). Task execution and reflection move the profile from \(\mathbf{s}_t\) to \(\mathbf{s}_{t+1}\). Define the one-step variation as \(\Delta_t = \|\mathbf{s}_{t+1} - \mathbf{s}_t\|_2\), and the total variation budget over \(T\) steps as:
 
 \begin{equation}
     V_T = \sum_{t=1}^{T-1} \Delta_t.
     \label{eq:variation}
 \end{equation}
 
-Since \(\mathbf{s}_t \in [0,1]^K\) is bounded and the agent faces diminishing marginal returns near mastery, the total skill path length grows slower than \(T\).
+Since \(\mathbf{s}_t \in [0,1]^K\) is bounded and skill gains exhibit diminishing returns near mastery, the total skill-path length grows sublinearly in \(T\).
 
-The gap weight \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}_t)/\tau_g)\) inherits this bounded variation: softmax is Lipschitz continuous, so \(\|\mathbf{g}_{t+1} - \mathbf{g}_t\| \leq L \cdot \Delta_t\) for some constant \(L\). Consequently, the reward distribution's drift is governed by the same \(V_T = o(T)\) budget.
+The gap-weight vector \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}_t)/\tau_g)\) inherits this bounded variation. Since softmax is Lipschitz continuous, \(\|\mathbf{g}_{t+1} - \mathbf{g}_t\| \leq L \cdot \Delta_t\) for some constant \(L\). Consequently, the drift of the reward distribution is governed by the same budget, \(V_T = o(T)\).
 
 \subsection{Assumptions}
 
@@ -245,33 +245,33 @@ The gap weight \(\mathbf{g}_t = \operatorname{softmax}((\mathbf{1} - \mathbf{s}_
     \item \textbf{(Bounded variation.)} \(V_T = \sum \|\mathbf{s}_{t+1} - \mathbf{s}_t\|_2 = o(T)\), as argued above.
 \end{enumerate}
 
-Assumption~1 states that the next-step profile is locally linear in the learned feature space. Assumption~2 is standard, and Assumption~3 is the structural condition that keeps the non-stationary setting tractable.
+Assumption~1 posits that the next-step profile is locally linear in the learned feature space. Assumption~2 is standard, whereas Assumption~3 is the structural condition that makes the non-stationary setting tractable.
 
 \subsection{Dynamic Regret Decomposition}
 
-The UCB score upper-bounds the true reward with high probability: \(\text{score}(\tau_t) \geq r_t^*\). The instantaneous regret is therefore bounded by the prediction error of the chosen arm:
+With high probability, the UCB score upper-bounds the true reward: \(\text{score}(\tau_t) \geq r_t^*\). The instantaneous regret is therefore bounded by the prediction error of the selected arm:
 
 \[
 r_t^* - r_t \leq  \mathbf{g}_t^\top (\mathbf{s}_{t+1} - \hat{\mathbf{s}}_{t+1}).
 \]
 
-Inserting the true local linear model \(\mathbf{W}^*\) from Assumption~1 yields two orthogonal error sources:
+Introducing the true local linear model \(\mathbf{W}^*\) from Assumption~1 yields two distinct sources of error:
 
 \[
 \hat{\mathbf{s}}_{t+1} - \mathbf{s}_{t+1} = \underbrace{(\mathbf{W}_t - \mathbf{W}^*)^\top \boldsymbol{\phi}_\tau}_{\text{estimation}} \;+\; \underbrace{(\mathbf{W}^{*\top} \boldsymbol{\phi}_\tau - \mathbf{s}_{t+1})}_{\text{model misspecification}}.
 \]
 
-\textbf{Estimation error.} The first term arises from learning \(\mathbf{W}_t\) from a finite window of \(\ell\) samples. The self-normalized martingale bound (Abbasi-Yadkori et al., 2011) yields per-step error \(\tilde{O}(1/\sqrt{\ell})\), accumulating to \(\tilde{O}(T / \sqrt{\ell})\) over \(T\) steps.
+\textbf{Estimation error.} The first term results from estimating \(\mathbf{W}_t\) using a finite window of \(\ell\) samples. A self-normalized martingale bound (Abbasi-Yadkori et al., 2011) gives a per-step error of \(\tilde{O}(1/\sqrt{\ell})\), which accumulates to \(\tilde{O}(T / \sqrt{\ell})\) over \(T\) steps.
 
-\textbf{Drift error.} The true profile satisfies Assumption~1 only approximately within the window. The misspecification at step \(t\) is bounded by the cumulative profile drift inside the window:
+\textbf{Drift error.} Assumption~1 only approximately holds across a sliding window. The resulting misspecification at step \(t\) is bounded by the cumulative profile drift within that window:
 
 \[
 \|\mathbf{W}^{*\top} \boldsymbol{\phi}_{\tau_t} - \mathbf{s}_{t+1}\| \leq \sum_{k = \max(1, t-\ell)}^{t} \Delta_k.
 \]
 
-Over \(T\) steps, each \(\Delta_k\) appears in at most \(\ell\) windows, yielding \(O(\ell \cdot V_T)\).
+Across \(T\) steps, each \(\Delta_k\) appears in at most \(\ell\) windows, yielding a total drift error of \(O(\ell \cdot V_T)\).
 
-Assembling both contributions:
+Combining the two contributions gives:
 
 \begin{equation}
     R(T) = \sum_{t=1}^T (r_t^* - r_t) \leq
@@ -282,7 +282,7 @@ Assembling both contributions:
 
 \subsection{Optimal Window and Regret Bound}
 
-Balancing the two terms by setting \(\frac{T}{\sqrt{\ell}} = \ell \cdot V_T\) yields the optimal window size:
+Balancing the two terms, \(\frac{T}{\sqrt{\ell}} = \ell \cdot V_T\), yields the optimal window size:
 
 \begin{equation}
     \ell^* = \left( \frac{T}{V_T} \right)^{2/3},
@@ -295,7 +295,7 @@ and the corresponding cumulative regret bound:
     \label{eq:bound}
 \end{equation}
 
-Since \(V_T = o(T)\), let \(V_T = O(T^\nu)\) for some \(\nu < 1\). Substituting:
+Since \(V_T = o(T)\), let \(V_T = O(T^\nu)\) for some \(\nu < 1\). Substitution gives:
 
 \begin{equation}
     R(T) = \tilde{O}\!\left( T^{2/3} \cdot T^{\nu/3} \right) = \tilde{O}\!\left( T^{(2+\nu)/3} \right) = o(T),
