@@ -3,8 +3,10 @@
 
 import argparse
 import os
+import random
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,7 +109,17 @@ def main():
         "n_tasks": warmup_cfg.get("n_tasks", 60),
     }))
     warmup_pool = warmup_dataset.task_pool
-    warmup_ids = list(range(warmup_pool.M))
+    # Sample evenly across task types
+    from collections import defaultdict
+    type_to_ids = defaultdict(list)
+    for m in warmup_pool.metadata:
+        type_to_ids[m["dim"]].append(m["id"])
+    warmup_ids = []
+    max_per_type = (warmup_pool.M + 5) // 6  # ceiling division
+    for dim in sorted(type_to_ids):
+        warmup_ids.extend(type_to_ids[dim][:max_per_type])
+    random.shuffle(warmup_ids)
+    logger.info(f"Warmup: {len(warmup_ids)} tasks across {len(type_to_ids)} types")
 
     logger.info("Loading evolve dataset...")
     evo_cfg = config.get("evolve", {})
