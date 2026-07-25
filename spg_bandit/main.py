@@ -39,16 +39,14 @@ def build_parser():
     return p
 
 
-def create_selector(name, task_pool, config, warmup_ids=None):
+def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
     elif name == "spg_bandit":
-        warmup_cfg = config.get("warmup", {})
-        exp = config.get("experiment", {})
         return SPGBanditSelector(
             task_pool=task_pool,
-            n_warm=warmup_cfg.get("n_warm", 30),
+            n_warm=n_warm,
             alpha=params.get("alpha", 0.1),
             tau=params.get("tau", 0.1),
             d_f=params.get("d_f", 16),
@@ -148,7 +146,7 @@ def main():
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
     method.load_skills(skills_dir)
-    selector = create_selector(sel_name, evo_pool, config, warmup_ids=warmup_ids)
+    selector = create_selector(sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm)
 
     if selector.needs_warmup and warmup_pool.M > 0 and warmup_cfg.get("steps", 0) != 0:
         n_bandit = max(evo_pool.M - n_warm, 0)
