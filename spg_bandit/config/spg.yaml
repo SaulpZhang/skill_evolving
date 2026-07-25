@@ -9,13 +9,9 @@ warmup:
 
 evolve:
   split: valid_seen
-  n_tasks: 60
-  steps: all
 
 evaluate:
   split: valid_unseen
-  n_tasks: all
-  steps: all
 
 selector: spg_bandit
 
