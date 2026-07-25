@@ -303,11 +303,9 @@ class SPGBanditSelector(BaseSelector):
         print(f"\n  [SPG] Finalizing warmup ({self._n_warm} tasks)...")
 
         N = len(self._warmup_task_ids)
-        n_types = max(m["dim"] for m in task_pool.metadata) + 1
-        R = np.full((N, n_types), np.nan)
+        R = np.full((N, task_pool.M), np.nan)
         for t, tid in enumerate(self._warmup_task_ids):
-            dim = task_pool.metadata[tid]["dim"]
-            R[t, dim] = float(self._warmup_successes[t])
+            R[t, tid] = float(self._warmup_successes[t])
 
         # Sequential MIRT EM: run EM with cumulative data to compute per-step deltas
         profiles_before = []
@@ -326,9 +324,9 @@ class SPGBanditSelector(BaseSelector):
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         # Embedding → (a, d) predictor: infer parameters for unseen tasks
-        dim_of = [task_pool.metadata[tid]["dim"] for tid in self._warmup_task_ids]
-        X_seen = np.array([task_pool.get_embedding(tid) for tid in self._warmup_task_ids])
-        y_seen = np.column_stack([self._A_fit[dim_of], self._d_fit[dim_of].reshape(-1, 1)])
+        seen_tids = list(set(self._warmup_task_ids))
+        X_seen = np.array([task_pool.get_embedding(tid) for tid in seen_tids])
+        y_seen = np.column_stack([self._A_fit[seen_tids], self._d_fit[seen_tids]])
         reg = Ridge(alpha=self._lambda)
         reg.fit(X_seen, y_seen)
         y_pred_train = reg.predict(X_seen)
