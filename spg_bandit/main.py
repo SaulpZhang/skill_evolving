@@ -141,20 +141,21 @@ def main():
 
     n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
     n_bandit = _resolve_steps(evo_cfg.get("steps", "all"), evo_pool.M)
-    if selector.needs_warmup and warmup_pool.M > 0 and warmup_cfg.get("steps") != 0:
-        n_bandit = max(evo_pool.M - n_warm, 0)
     n_eva = _resolve_steps(eva_cfg.get("steps", "all"), eva_pool.M)
     max_turns = config.get("max_turns", 51)
-
-    logger.info(f"Warmup pool: {warmup_pool.M} tasks, {n_warm} steps")
-    logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
-    logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
     method.load_skills(skills_dir)
     selector = create_selector(sel_name, evo_pool, config, warmup_ids=warmup_ids)
+
+    if selector.needs_warmup and warmup_pool.M > 0 and warmup_cfg.get("steps", 0) != 0:
+        n_bandit = max(evo_pool.M - n_warm, 0)
+
+    logger.info(f"Warmup pool: {warmup_pool.M} tasks, {n_warm} steps")
+    logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
+    logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
 
     if args.warmup_data:
         if not hasattr(selector, "load_warmup_data"):
