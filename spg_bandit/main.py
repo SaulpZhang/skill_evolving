@@ -232,7 +232,7 @@ def main():
         evaluating_records = []
 
         for step in range(n_eva):
-            task_id = evaluating_selector.select(eval_pool)
+            task_id = evaluating_selector.select(eva_pool)
             t0 = time.time()
             result = eval_method.execute(task_id)
             elapsed = time.time() - t0
