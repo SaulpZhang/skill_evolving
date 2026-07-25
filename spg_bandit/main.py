@@ -64,6 +64,8 @@ def main():
     config = load_config(args.config)
     if args.seed is not None:
         config.setdefault("experiment", {})["seed"] = args.seed
+    seed = config.get("experiment", {}).get("seed", 42)
+    random.seed(seed)
 
     sel_name = config.get("selector", "uniform")
     agent_name = config.get("skill_evolving", {}).get("name", "unknown")
