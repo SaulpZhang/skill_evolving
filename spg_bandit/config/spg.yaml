@@ -14,7 +14,7 @@ evolve:
 
 evaluate:
   split: valid_unseen
-  n_tasks: 0
+  n_tasks: all
   steps: all
 
 selector: spg_bandit

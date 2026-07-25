@@ -95,7 +95,6 @@ def main():
             "embedding_type": config.get("embedding_type", "local"),
             "max_turns": config.get("max_turns", 51),
             "task_types": "all",
-            "tasks_per_type": 0,
             "split": "valid_seen",
         }
         cfg.update(overrides)
@@ -114,7 +113,7 @@ def main():
     evo_cfg = config.get("evolve", {})
     evo_dataset = ALFWorldDataset(_make_cfg({
         "split": evo_cfg.get("split", "valid_seen"),
-        "n_tasks": evo_cfg.get("n_tasks", 0),
+        "n_tasks": evo_cfg.get("n_tasks", "all"),
     }))
     evo_pool = evo_dataset.task_pool
 
@@ -122,7 +121,7 @@ def main():
     eva_cfg = config.get("evaluate", {})
     eva_dataset = ALFWorldDataset(_make_cfg({
         "split": eva_cfg.get("split", "valid_seen"),
-        "n_tasks": eva_cfg.get("n_tasks", 0),
+        "n_tasks": eva_cfg.get("n_tasks", "all"),
     }))
     eva_pool = eva_dataset.task_pool
 
