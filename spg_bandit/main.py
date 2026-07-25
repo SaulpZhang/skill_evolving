@@ -108,10 +108,27 @@ def main():
         "n_tasks": warmup_cfg.get("n_tasks", 60),
     }))
     warmup_pool = warmup_dataset.task_pool
-    # Proportional: shuffle all pool tasks, type ratio preserved
-    warmup_ids = list(range(warmup_pool.M))
+    # Proportional allocation per type: each type gets round(count/total * n_warm)
+    from collections import defaultdict
+    type_to_ids = defaultdict(list)
+    for m in warmup_pool.metadata:
+        type_to_ids[m["dim"]].append(m["id"])
+    n_types = len(type_to_ids)
+    raw = {d: len(ids) / warmup_pool.M * n_warm for d, ids in type_to_ids.items()}
+    alloc = {d: int(raw[d]) for d in raw}
+    remainder = n_warm - sum(alloc.values())
+    for d in sorted(raw, key=lambda d: raw[d] - int(raw[d]), reverse=True):
+        if remainder <= 0:
+            break
+        alloc[d] += 1
+        remainder -= 1
+    warmup_ids = []
+    for d in sorted(type_to_ids):
+        pool_ids = type_to_ids[d]
+        warmup_ids.extend((pool_ids * (alloc[d] // len(pool_ids) + 1))[:alloc[d]])
     random.shuffle(warmup_ids)
-    logger.info(f"Warmup: {len(warmup_ids)} tasks (uniform round-robin)")
+    dist = {d: alloc[d] for d in sorted(alloc)}
+    logger.info(f"Warmup: {len(warmup_ids)} tasks, type distribution: {dist}")
 
     logger.info("Loading evolve dataset...")
     evo_cfg = config.get("evolve", {})
