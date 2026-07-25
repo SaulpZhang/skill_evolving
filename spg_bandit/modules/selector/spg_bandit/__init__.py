@@ -324,9 +324,9 @@ class SPGBanditSelector(BaseSelector):
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         # Embedding → (a, d) predictor: infer parameters for unseen tasks
-        seen_tids = list(set(self._warmup_task_ids))
-        X_seen = np.array([task_pool.get_embedding(tid) for tid in seen_tids])
-        y_seen = np.column_stack([self._A_fit[seen_tids], self._d_fit[seen_tids]])
+        dim_of = [task_pool.metadata[tid]["dim"] for tid in self._warmup_task_ids]
+        X_seen = np.array([task_pool.get_embedding(tid) for tid in self._warmup_task_ids])
+        y_seen = np.column_stack([self._A_fit[dim_of], self._d_fit[dim_of].reshape(-1, 1)])
         reg = Ridge(alpha=self._lambda)
         reg.fit(X_seen, y_seen)
         y_pred_train = reg.predict(X_seen)
