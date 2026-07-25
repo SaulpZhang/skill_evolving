@@ -1,26 +1,21 @@
 embedding_model: all-MiniLM-L6-v2
 embedding_type: local
 max_turns: 51
-dataset: alfworld
 
 warmup:
   split: valid_seen
-  n_warm: 0
-  tasks_per_type: 10
+  n_tasks: 60
+  steps: 0
 
 evolve:
   split: valid_seen
-  task_types: all
-  tasks_per_type: 0
-
-experiment:
-  n_bandit: 0
-  seed: 42
+  n_tasks: 60
+  steps: all
 
 evaluate:
   split: valid_unseen
-  task_types: all
-  tasks_per_type: 0
+  n_tasks: 0
+  steps: all
 
 selector: uniform
 

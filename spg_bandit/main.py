@@ -83,8 +83,13 @@ def main():
         yaml.dump(config, f, default_flow_style=False)
     logger.info(f"Records: {log_base / 'records'}")
 
-    def _merge_alf(base, overrides):
-        """Merge shared ALFWorld settings with phase-specific overrides."""
+    def _resolve_steps(steps_cfg, pool_size):
+        """Resolve steps to an integer: 'all' -> pool_size, int -> as-is."""
+        if isinstance(steps_cfg, str) and steps_cfg.lower() == "all":
+            return pool_size
+        return int(steps_cfg)
+
+    def _make_cfg(overrides):
         cfg = {
             "embedding_model": config.get("embedding_model", "all-MiniLM-L6-v2"),
             "embedding_type": config.get("embedding_type", "local"),
@@ -96,44 +101,52 @@ def main():
         cfg.update(overrides)
         return cfg
 
-    logger.info("Loading evolving dataset...")
-    evo_cfg = config.get("evolve", {})
-    evo_dataset = ALFWorldDataset(_merge_alf(config, evo_cfg))
-    evolving_pool = evo_dataset.task_pool
-
+    logger.info("Loading warmup dataset...")
     warmup_cfg = config.get("warmup", {})
-    w_tpt = warmup_cfg.get("tasks_per_type", 10)
-    warmup_ids = []
-    for tt_idx in range(max(m.get("dim", 0) for m in evolving_pool.metadata) + 1):
-        type_ids = sorted(i for i, m in enumerate(evolving_pool.metadata) if m["dim"] == tt_idx)
-        warmup_ids.extend(type_ids[:w_tpt])
-    logger.info(f"Warmup: {len(warmup_ids)} / {evolving_pool.M} evolving tasks")
+    warmup_dataset = ALFWorldDataset(_make_cfg({
+        "split": warmup_cfg.get("split", "valid_seen"),
+        "n_tasks": warmup_cfg.get("n_tasks", 60),
+    }))
+    warmup_pool = warmup_dataset.task_pool
+    warmup_ids = list(range(warmup_pool.M))
 
+    logger.info("Loading evolve dataset...")
+    evo_cfg = config.get("evolve", {})
+    evo_dataset = ALFWorldDataset(_make_cfg({
+        "split": evo_cfg.get("split", "valid_seen"),
+        "n_tasks": evo_cfg.get("n_tasks", 0),
+    }))
+    evo_pool = evo_dataset.task_pool
+
+    logger.info("Loading evaluate dataset...")
     eva_cfg = config.get("evaluate", {})
-    logger.info(f"Loading eval dataset ({eva_cfg.get('split')})...")
-    eval_dataset = ALFWorldDataset(_merge_alf(config, eva_cfg))
-    eval_pool = eval_dataset.task_pool
+    eva_dataset = ALFWorldDataset(_make_cfg({
+        "split": eva_cfg.get("split", "valid_seen"),
+        "n_tasks": eva_cfg.get("n_tasks", 0),
+    }))
+    eva_pool = eva_dataset.task_pool
 
-    logger.info(f"Eval: {eval_pool.M} tasks")
-
-    n_bandit = config.get("experiment", {}).get("n_bandit", 0)
-    if n_bandit == 0:
-        n_bandit = evolving_pool.M
-    n_warm = warmup_cfg.get("n_warm", 30)
+    n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
+    n_bandit = _resolve_steps(evo_cfg.get("steps", 0), evo_pool.M)
+    n_eva = _resolve_steps(eva_cfg.get("steps", "all"), eva_pool.M)
     max_turns = config.get("max_turns", 51)
+
+    logger.info(f"Warmup pool: {warmup_pool.M} tasks, {n_warm} steps")
+    logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
+    logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
     method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
     method.load_skills(skills_dir)
-    selector = create_selector(sel_name, evolving_pool, config, warmup_ids=warmup_ids)
+    selector = create_selector(sel_name, evo_pool, config, warmup_ids=warmup_ids)
 
     if args.warmup_data:
         if not hasattr(selector, "load_warmup_data"):
             logger.warning("Selector %s does not support warmup loading, ignoring --warmup-data", sel_name)
             warmup_steps = selector.needs_warmup * n_warm
         else:
-            selector.load_warmup_data(args.warmup_data, evolving_pool)
+            selector.load_warmup_data(args.warmup_data, evo_pool)
             warmup_steps = 0
             logger.info("Warmup task execution skipped, loaded data from %s", args.warmup_data)
     else:
@@ -147,7 +160,8 @@ def main():
     step_records = []
 
     for step in range(total_steps):
-        task_id = selector.select(evolving_pool)
+        pool = warmup_pool if step < warmup_steps else evo_pool
+        task_id = selector.select(pool)
         t0 = time.time()
         result = method.execute(task_id)
         elapsed = time.time() - t0
@@ -189,12 +203,12 @@ def main():
         logger.info(f"{'='*60}")
 
         method.reset()
-        eval_method = SimpleAgent(eval_dataset, max_turns=max_turns)
+        eval_method = SimpleAgent(eva_dataset, max_turns=max_turns)
         evaluating_selector = UniformSelector()
         evaluating_success = 0
         evaluating_records = []
 
-        for step in range(eval_pool.M):
+        for step in range(n_eva):
             task_id = evaluating_selector.select(eval_pool)
             t0 = time.time()
             result = eval_method.execute(task_id)
@@ -207,8 +221,8 @@ def main():
                 "success": result["success"], "api_calls": result["api_calls"],
                 "duration_s": round(elapsed, 1),
             })
-            if step % 5 == 0 or step == n_bandit - 1:
-                logger.info(f"  evaluating step {step+1}/{eval_pool.M}: task {task_id} -> "
+            if step % 5 == 0 or step == n_eva - 1:
+                logger.info(f"  evaluating step {step+1}/{n_eva}: task {task_id} -> "
                             f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
 
         evaluating_api = sum(r["api_calls"] for r in evaluating_records)
@@ -216,9 +230,9 @@ def main():
             recorder.append_jsonl("evaluating_steps", rec)
         recorder.save_json("evaluating_result", {
             "label": sel_name, "success": evaluating_success,
-            "total": eval_pool.M, "api_calls": evaluating_api,
+            "total": n_eva, "api_calls": evaluating_api,
         })
-        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{eval_pool.M} "
+        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{n_eva} "
                     f"success | {evaluating_api} API calls")
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
