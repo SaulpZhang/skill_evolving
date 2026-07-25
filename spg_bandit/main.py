@@ -155,11 +155,10 @@ def main():
         selector.update(task_id, result)
 
         is_warmup = step < warmup_steps
-        if not is_warmup:
-            if result["success"]:
-                success_count += 1
-            bandit_done = step - warmup_steps + 1
-            log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
+        if result["success"]:
+            success_count += 1
+        bandit_done = step + 1
+        log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
 
         record = {
             "step": step, "selector": sel_name, "task_id": task_id,

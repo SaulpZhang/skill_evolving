@@ -53,7 +53,7 @@ class ALFWorldDataset(BaseDataset):
     def __init__(self, config: dict):
         self.max_turns = config.get("max_turns", 30)
         self._task_types = config.get("task_types", TASK_TYPES)  # list or "all"
-        self._tasks_per_type = config.get("tasks_per_type", 0)    # 0 = all
+        self._tasks_per_type = config.get("tasks_per_type", 0)    # 0 = all, int = uniform, dict = per-type
         self._split = config.get("split", "valid_seen")           # valid_seen/valid_unseen/train
         self._embedding_model = config.get("embedding_model", "all-MiniLM-L6-v2")
         self._embedding_type = config.get("embedding_type", "local")  # local / ollama / openai
@@ -117,7 +117,11 @@ class ALFWorldDataset(BaseDataset):
             tt = data["task_type"]
             if tt not in types_to_include:
                 continue
-            if self._tasks_per_type > 0 and type_count[tt] >= self._tasks_per_type:
+            if isinstance(self._tasks_per_type, dict):
+                limit = self._tasks_per_type.get(tt, 0)
+            else:
+                limit = self._tasks_per_type
+            if limit > 0 and type_count[tt] >= limit:
                 continue
             type_count[tt] = type_count[tt] + 1
             goal = data["turk_annotations"]["anns"][0]["task_desc"]

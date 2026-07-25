@@ -9,7 +9,7 @@
 \usepackage{hyperref}
 \usepackage{algorithm}
 \usepackage{algorithmic}
-\newcommand{\theHalgorithm}{\arabic{algorithm}}
+% \newcommand{\theHalgorithm}{\arabic{algorithm}}
 
 \title{SPG-Bandit: Skill Profile Guided Bandit for Task Selection in LLM Agent Skill Evolution}
 
@@ -40,13 +40,13 @@ A critical dimension has remained largely unexplored: \textbf{the order in which
 
 We present \textbf{SPG-Bandit} (Skill Profile Guided Bandit), a framework that casts task selection as a contextual bandit problem driven by a multidimensional skill profile of the agent.
 
-Our core idea is to model the agent's latent proficiency across \(K\) skill dimensions using Multidimensional Item Response Theory (MIRT), then select tasks that maximize the expected progress toward underdeveloped dimensions.
+Our core idea is to model the agent's latent proficiency across \(K\) dimensions that reflecting the agent's capabilities on different skills using Multidimensional Item Response Theory (MIRT). Then, we select tasks that maximize the expected progress towards the latent proficiency with a linear contextual bandit algorithm.
 
-Specifically, this proposal makes the following contributions:
+Specifically, our contributions are threefold:
 \begin{enumerate}
-    \item \textbf{Problem.} We identify and formalize the task selection problem in LLM agent skill evolution. We show that uniform and random selection---the default in existing systems---is suboptimal because different tasks contribute unequally to skill growth and the agent's skill profile is inherently multidimensional.
-    \item \textbf{Method.} We propose SPG-Bandit, a framework that combines MIRT-based latent skill profiling with a gap-weighted bandit algorithm. The core idea is to maintain an online estimate of the agent's proficiency across \(K\) skill dimensions, then select tasks that maximize predicted progress toward underdeveloped dimensions.
-    \item \textbf{Framework.} We provide a general framework which can easily combine with existing skill evolution methods. The framework is used to evaluate the effectiveness of SPG-Bandit in improving skill evolution efficiency and performance.
+    \item \textbf{A Novel Problem.} We identify and formalize the task selection problem in LLM agent skill evolution. We show that uniform and random selection---the default in existing systems---is suboptimal: different tasks contribute unequally to skill growth, and the agent's skill profile is inherently multidimensional.
+    \item \textbf{A Flexible Framework.} We provide a general framework that is capable of integrating with existing skill evolution methods and evaluate SPG-Bandit against it, demonstrating improvements in skill evolution efficiency and overall performance.
+    \item \textbf{Method.} We propose SPG-Bandit, a framework that combines MIRT-based latent skill profiling with a gap-weighted bandit algorithm. The core idea is to maintain an online estimate of the agent's proficiency across \(K\) skill dimensions and select tasks that maximize predicted progress along the most underdeveloped dimensions.
 \end{enumerate}
 
 \section{Problem Formulation}
@@ -54,11 +54,11 @@ Specifically, this proposal makes the following contributions:
 
 \subsection{Notation and Setup}
 
-Consider an LLM agent interacting with a fixed pool of tasks \(\mathcal{T} = \{1, 2, \dots, M\}\). At each discrete step \(t = 1, 2, \dots\), the agent selects a task \(\tau_t \in \mathcal{T}\), executes it, and receives a binary outcome \(y_t \in \{0, 1\}\) indicating task success or failure.
+We first consider an LLM agent interacting with a fixed set of tasks \(\mathcal{T} = \{1, 2, \dots, M\}\). At step \(t \in [T]\), the agent execute a selected task \(\tau_t \in \mathcal{T}\), and receives a binary outcome \(y_t \in \{0, 1\}\) indicating task success or failure.
 
-The agent possesses a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\) representing its proficiency across \(K\) distinct skill dimensions. The profile is not directly observable; it must be inferred from observed outcomes. We denote the \emph{skill progress} between consecutive steps as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), which measures how much the agent's latent proficiency changes after executing task \(\tau_t\) and updating its skills via reflection.
+The agent possesses a \emph{latent skill profile} \(\mathbf{s}_t \in [0,1]^K\) representing its proficiency across \(K\) distinct skill dimensions. The profile, which can not be observed directly, must be inferred from observed outcomes. We denote the \emph{skill progress} between consecutive steps as \(\boldsymbol{\delta}_t = \mathbf{s}_{t+1} - \mathbf{s}_t\), which measures how much the agent's latent proficiency changes after updating its skills via the reflection obtained by executing the chosen task \(\tau_t\).
 
-Each task \(\tau\) is associated with a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{Z^+}\), typically derived from a sentence encoder applied to the task's natural-language goal description.
+Each task \(\tau\) is related to a \emph{task embedding} \(\mathbf{e}_\tau \in \mathbb{R}^{d_c}, d_c \in \mathbb{Z}^+\), typically derived from a sentence encoder applied to the task's natural-language goal description.
 
 \subsection{Problem Definition}
 
@@ -66,19 +66,20 @@ We formalize adaptive task selection as a \emph{contextual bandit} problem. At e
 
 \begin{enumerate}
     \item The agent observes its current context: the current skill profile \(\mathbf{s}_t\) and the embedding \(\mathbf{e}_\tau\) for each task \(\tau \in \mathcal{T}\).
-    \item The agent selects an arm \(\tau_t \in \mathcal{T}\).
+    \item The agent selects a certain \(\tau_t \in \mathcal{T}\).
     \item The agent executes task \(\tau_t\), observes binary outcome \(y_t\), and updates its skills via reflection.
     \item The latent skill profile updates to \(\mathbf{s}_{t+1}\).
 \end{enumerate}
 
-To prioritize underdeveloped skill dimensions, we define a \emph{gap weight} vector:
+% To prioritize underdeveloped skill dimensions, 
+We define a \emph{gap weight} vector:
 
 \begin{equation}
-    \mathbf{g}_t = \operatorname{softmax}\!\left( \frac{\mathbf{1} - \mathbf{s}_t}{\tau_g} \right),
+    \mathbf{g}_t = \operatorname{softmax}\!\left( \frac{\mathbf{1} - \mathbf{s}_t}{\alpha} \right),
     \label{eq:gap-def}
 \end{equation}
 
-where \(\tau_g > 0\) is a temperature parameter. We define the immediate reward as the gap-weighted post-execution profile value:
+where \(\alpha > 0\) is a temperature parameter. We define the immediate reward as the gap-weighted post-execution profile value:
 
 \begin{equation}
     r_t = \mathbf{g}_t^\top \mathbf{s}_{t+1}.
@@ -88,7 +89,7 @@ where \(\tau_g > 0\) is a temperature parameter. We define the immediate reward 
 The goal is to maximize the expected cumulative reward:
 
 \begin{equation}
-    \max_{\pi} \; \mathbb{E}\left[ \sum_{t=1}^{H} r_t \;\middle|\; \tau_t \sim \pi(\cdot \mid \mathbf{s}_t, \{\mathbf{e}_\tau\}) \right],
+    \max_{\pi} \; \mathbb{E}\left[ \sum_{t=1}^{H} r_t \;\middle|\; \tau_t \sim \pi_t(\cdot \mid \mathbf{s}_t), \tau_t\in\mathcal{T} \right],
     \label{eq:objective}
 \end{equation}
 
