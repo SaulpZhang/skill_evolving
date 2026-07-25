@@ -141,6 +141,8 @@ def main():
 
     n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
     n_bandit = _resolve_steps(evo_cfg.get("steps", "all"), evo_pool.M)
+    if selector.needs_warmup and warmup_pool.M > 0 and warmup_cfg.get("steps") != 0:
+        n_bandit = max(evo_pool.M - n_warm, 0)
     n_eva = _resolve_steps(eva_cfg.get("steps", "all"), eva_pool.M)
     max_turns = config.get("max_turns", 51)
 
