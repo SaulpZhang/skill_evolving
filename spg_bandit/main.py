@@ -108,12 +108,13 @@ def main():
         "n_tasks": warmup_cfg.get("n_tasks", 60),
     }))
     warmup_pool = warmup_dataset.task_pool
+    n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
+
     # Proportional allocation per type: each type gets round(count/total * n_warm)
     from collections import defaultdict
     type_to_ids = defaultdict(list)
     for m in warmup_pool.metadata:
         type_to_ids[m["dim"]].append(m["id"])
-    n_types = len(type_to_ids)
     raw = {d: len(ids) / warmup_pool.M * n_warm for d, ids in type_to_ids.items()}
     alloc = {d: int(raw[d]) for d in raw}
     remainder = n_warm - sum(alloc.values())
@@ -146,7 +147,6 @@ def main():
     }))
     eva_pool = eva_dataset.task_pool
 
-    n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
     n_bandit = _resolve_steps(evo_cfg.get("steps", "all"), evo_pool.M)
     n_eva = _resolve_steps(eva_cfg.get("steps", "all"), eva_pool.M)
     max_turns = config.get("max_turns", 51)
