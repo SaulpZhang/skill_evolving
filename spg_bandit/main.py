@@ -12,6 +12,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
 from dotenv import load_dotenv
+from json import JSONEncoder
+
+class NumpyEncoder(JSONEncoder):
+    def default(self, obj):
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return {"__numpy__": True, "dtype": str(obj.dtype), "shape": obj.shape, "data": obj.tobytes().hex()}
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        return super().default(obj)
+
 load_dotenv()
 
 from spg_bandit.utils.config_loader import load_config, get_param
@@ -35,6 +50,8 @@ def build_parser():
                    help="Path to warmup data JSON. Skip task execution, load data for MIRT+MLP.")
     p.add_argument("--evaluating", action="store_true",
                    help="Run evaluation after main experiment (Uniform, no reflection)")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume a previous run. Must also pass --run_id.")
     return p
 
 
@@ -75,7 +92,7 @@ def main():
     logger.info(f"Config: {args.config}")
     logger.info(f"Selector: {sel_name}")
 
-    wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb)
+    wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb, resume=args.resume)
 
     log_base = Path(__file__).parent.parent / "logs" / run_id
     recorder = Recorder(str(log_base / "records"))
@@ -181,32 +198,88 @@ def main():
 
     success_count = 0
     step_records = []
+    ckpt_interval = 30
+    start_step = 0
 
-    for step in range(total_steps):
-        pool = warmup_pool if step < warmup_steps else evo_pool
-        task_id = selector.select(pool)
-        t0 = time.time()
-        result = method.execute(task_id)
-        elapsed = time.time() - t0
-        method.reflect(task_id, result)
-        selector.update(task_id, result)
+    # Resume: load checkpoint if --resume
+    ckpt_path = str(log_base / "records" / "checkpoint.json")
+    if args.resume:
+        if not args.run_id:
+            logger.error("--resume requires --run_id")
+            return
+        try:
+            import json
+            ckpt = json.load(open(ckpt_path))
+            start_step = ckpt["step"]
+            success_count = ckpt["success_count"]
+            step_records = ckpt["step_records"]
+            warmup_steps = ckpt["warmup_steps"]
+            n_bandit = ckpt.get("n_bandit", n_bandit)
+            n_eva = ckpt.get("n_eva", n_eva)
+            if hasattr(selector, "load_checkpoint"):
+                selector.load_checkpoint(ckpt.get("selector", {}))
+            logger.info(f"Resumed from step {start_step}/{total_steps}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return
 
-        is_warmup = step < warmup_steps
-        if result["success"]:
-            success_count += 1
-        bandit_done = step + 1
-        log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
+    def _save_ckpt(st, sw, sb, sr, phase=""):
+        try:
+            data = {
+                "step": st, "total_steps": total_steps,
+                "warmup_steps": sw, "success_count": sb,
+                "step_records": sr, "n_bandit": n_bandit,
+                "n_eva": n_eva, "phase": phase,
+            }
+            if hasattr(selector, "save_checkpoint"):
+                data["selector"] = selector.save_checkpoint()
+            with open(ckpt_path, "w") as f:
+                import json
+                json.dump(data, f, indent=2, cls=NumpyEncoder)
+            logger.info(f"Checkpoint saved at step {st} ({phase})")
+        except Exception as e:
+            logger.warning(f"Checkpoint save failed: {e}")
 
-        record = {
-            "step": step, "selector": sel_name, "task_id": task_id,
-            "success": result["success"], "api_calls": result["api_calls"],
-            "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
-        }
-        step_records.append(record)
-        recorder.append_jsonl(f"{sel_name}_steps", record)
+    try:
+        for step in range(start_step, total_steps):
+            pool = warmup_pool if step < warmup_steps else evo_pool
+            task_id = selector.select(pool)
+            t0 = time.time()
+            result = method.execute(task_id)
+            elapsed = time.time() - t0
+            method.reflect(task_id, result)
+            selector.update(task_id, result)
+
+            is_warmup = step < warmup_steps
+            if result["success"]:
+                success_count += 1
+            bandit_done = step + 1
+            log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
+
+            record = {
+                "step": step, "selector": sel_name, "task_id": task_id,
+                "success": result["success"], "api_calls": result["api_calls"],
+                "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
+            }
+            step_records.append(record)
+            recorder.append_jsonl(f"{sel_name}_steps", record)
+
+            # Checkpoint: every 30 steps + warmup end
+            if (step + 1) % ckpt_interval == 0:
+                _save_ckpt(step + 1, warmup_steps, success_count, step_records, "interval")
+            if warmup_steps > 0 and step == warmup_steps - 1:
+                _save_ckpt(step + 1, warmup_steps, success_count, step_records, "warmup_end")
+
+    except Exception as e:
+        _save_ckpt(step, warmup_steps, success_count, step_records, "error")
+        logger.error(f"Experiment interrupted at step {step}: {e}")
+        finish_wandb()
+        raise
 
         logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
                     f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+
+    _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
 
     if hasattr(selector, "get_metrics"):
         metrics = selector.get_metrics()
@@ -231,23 +304,35 @@ def main():
         evaluating_success = 0
         evaluating_records = []
 
-        for step in range(n_eva):
-            task_id = evaluating_selector.select(eva_pool)
-            t0 = time.time()
-            result = eval_method.execute(task_id)
-            elapsed = time.time() - t0
-            if result["success"]:
-                evaluating_success += 1
-            log_metrics({"evaluating/success_rate": evaluating_success / (step + 1), "_step_evaluating": step + 1})
-            evaluating_records.append({
-                "step": step, "task_id": task_id,
-                "success": result["success"], "api_calls": result["api_calls"],
-                "duration_s": round(elapsed, 1),
-            })
-            if step % 5 == 0 or step == n_eva - 1:
-                logger.info(f"  evaluating step {step+1}/{n_eva}: task {task_id} -> "
-                            f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+        eva_start = 0
+        eva_ckpt_key = "evaluating"
 
+        try:
+            for step in range(eva_start, n_eva):
+                task_id = evaluating_selector.select(eva_pool)
+                t0 = time.time()
+                result = eval_method.execute(task_id)
+                elapsed = time.time() - t0
+                if result["success"]:
+                    evaluating_success += 1
+                log_metrics({"evaluating/success_rate": evaluating_success / (step + 1), "_step_evaluating": step + 1})
+                evaluating_records.append({
+                    "step": step, "task_id": task_id,
+                    "success": result["success"], "api_calls": result["api_calls"],
+                    "duration_s": round(elapsed, 1),
+                })
+                if step % 5 == 0 or step == n_eva - 1:
+                    logger.info(f"  evaluating step {step+1}/{n_eva}: task {task_id} -> "
+                                f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+                if (step + 1) % ckpt_interval == 0:
+                    _save_ckpt(step + 1, warmup_steps, success_count, step_records, "eval_interval")
+        except Exception as e:
+            _save_ckpt(step, warmup_steps, success_count, step_records, "eval_error")
+            logger.error(f"Evaluating interrupted at step {step}: {e}")
+            finish_wandb()
+            raise
+
+        _save_ckpt(n_eva, warmup_steps, success_count, step_records, "eval_end")
         evaluating_api = sum(r["api_calls"] for r in evaluating_records)
         for rec in evaluating_records:
             recorder.append_jsonl("evaluating_steps", rec)

@@ -369,3 +369,32 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_embeds.clear()
         self._A_fit = None
         self._d_fit = None
+
+    def save_checkpoint(self) -> dict:
+        return {
+            "step": self._step, "n_warm": self._n_warm,
+            "warmup_ready": self._warmup_ready,
+            "profile": self._profile.tolist() if hasattr(self._profile, 'tolist') else self._profile,
+            "A": self._A.tolist() if hasattr(self._A, 'tolist') else self._A,
+            "B": self._B.tolist() if hasattr(self._B, 'tolist') else self._B,
+            "W": self._W.tolist() if hasattr(self._W, 'tolist') else self._W,
+            "A_fit": self._A_fit.tolist() if self._A_fit is not None else None,
+            "d_fit": self._d_fit.tolist() if self._d_fit is not None else None,
+            "task_ids": list(self._warmup_task_ids),
+            "successes": list(self._warmup_successes),
+        }
+
+    def load_checkpoint(self, data: dict):
+        self._step = data["step"]
+        self._n_warm = data["n_warm"]
+        self._warmup_ready = data["warmup_ready"]
+        import numpy as np
+        self._profile = np.array(data["profile"])
+        self._A = np.array(data["A"])
+        self._B = np.array(data["B"])
+        self._W = np.array(data["W"])
+        self._A_fit = np.array(data["A_fit"]) if data.get("A_fit") is not None else None
+        self._d_fit = np.array(data["d_fit"]) if data.get("d_fit") is not None else None
+        self._warmup_task_ids = list(data["task_ids"])
+        self._warmup_successes = list(data["successes"])
+
