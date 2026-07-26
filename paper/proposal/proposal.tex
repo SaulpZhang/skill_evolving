@@ -10,6 +10,7 @@
 \usepackage{algorithm}
 \usepackage{algorithmic}
 % \newcommand{\theHalgorithm}{\arabic{algorithm}}
+% \newcommand{\theHalgorithm}{\arabic{algorithm}}
 
 \title{SPG-Bandit: Skill Profile Guided Bandit for Task Selection in LLM Agent Skill Evolution}
 
@@ -42,7 +43,7 @@ We propose \textbf{SPG-Bandit} (Skill Profile Guided Bandit), a framework that c
 
 Our central idea is to use Multidimensional Item Response Theory (MIRT) to estimate latent proficiency across \(K\) skill dimensions and to select tasks that maximize expected progress on dimensions with lower estimated proficiency.
 
-Specifically, this proposal makes the following contributions:
+Specifically, our contributions are threefold:
 \begin{enumerate}
     \item \textbf{Problem formulation.} We formalize task selection during LLM agent skill evolution as a non-stationary contextual bandit problem. The formulation captures both task-specific differences in expected skill progress and the multidimensional nature of agent competence.
     \item \textbf{Method.} We propose SPG-Bandit, which combines MIRT-based latent skill profiling with a gap-weighted sliding-window UCB policy. The method maintains an online proficiency estimate and selects tasks with high predicted progress on underdeveloped dimensions while accounting for estimation uncertainty.
@@ -71,7 +72,8 @@ We formalize adaptive task selection as a \emph{non-stationary contextual bandit
     \item The latent skill profile updates to \(\mathbf{s}_{t+1}\).
 \end{enumerate}
 
-To prioritize underdeveloped skill dimensions, we define a \emph{gap weight} vector:
+% To prioritize underdeveloped skill dimensions, 
+We define a \emph{gap weight} vector:
 
 \begin{equation}
     \mathbf{g}_t = \operatorname{softmax}\!\left( \frac{\mathbf{1} - \mathbf{s}_t}{\gamma_g} \right),

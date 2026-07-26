@@ -4,7 +4,7 @@ import os
 
 
 def init_wandb(config: dict, run_id: str = None, run_name: str = None,
-               enabled: bool = True):
+               enabled: bool = True, resume: bool = False):
     if not enabled:
         return False
     api_key = os.getenv("wandb_key")
@@ -19,6 +19,7 @@ def init_wandb(config: dict, run_id: str = None, run_name: str = None,
             id=run_id,
             name=run_name,
             config=config,
+            resume="allow" if resume else None,
         )
         wandb.define_metric("_step_evolving", hidden=True)
         wandb.define_metric("_step_evaluating", hidden=True)

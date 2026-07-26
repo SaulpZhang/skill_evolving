@@ -36,6 +36,23 @@ class MLPFeaturizer:
         h = np.maximum(x @ self.W1 + self.b1, 0.0)
         return h @ self.W2 + self.b2
 
+    def get_state(self) -> dict:
+        return {
+            "W1": self.W1.tolist(), "b1": self.b1.tolist(),
+            "W2": self.W2.tolist(), "b2": self.b2.tolist(),
+            "head_W": self._head_W.tolist() if self._head_W is not None else None,
+            "head_b": self._head_b.tolist() if self._head_b is not None else None,
+        }
+
+    def set_state(self, state: dict):
+        import numpy as np
+        self.W1 = np.array(state["W1"])
+        self.b1 = np.array(state["b1"])
+        self.W2 = np.array(state["W2"])
+        self.b2 = np.array(state["b2"])
+        self._head_W = np.array(state["head_W"]) if state.get("head_W") is not None else None
+        self._head_b = np.array(state["head_b"]) if state.get("head_b") is not None else None
+
     def train(self, X, y, epochs=50, batch_size=32, wandb_prefix="mlp"):
         N, K = X.shape[0], y.shape[1]
         if self._head_W is None:
@@ -369,3 +386,40 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_embeds.clear()
         self._A_fit = None
         self._d_fit = None
+
+    def save_checkpoint(self) -> dict:
+        return {
+            "step": self._step, "n_warm": self._n_warm,
+            "warmup_ready": self._warmup_ready,
+            "profile": self._profile.tolist() if hasattr(self._profile, 'tolist') else self._profile,
+            "A": self._A.tolist() if hasattr(self._A, 'tolist') else self._A,
+            "B": self._B.tolist() if hasattr(self._B, 'tolist') else self._B,
+            "W": self._W.tolist() if hasattr(self._W, 'tolist') else self._W,
+            "A_fit": self._A_fit.tolist() if self._A_fit is not None else None,
+            "d_fit": self._d_fit.tolist() if self._d_fit is not None else None,
+            "task_ids": list(self._warmup_task_ids),
+            "successes": list(self._warmup_successes),
+            "mlp": self._mlp.get_state() if self._mlp is not None else None,
+            "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed} if self._mlp is not None else None,
+        }
+
+    def load_checkpoint(self, data: dict):
+        self._step = data["step"]
+        self._n_warm = data["n_warm"]
+        self._warmup_ready = data["warmup_ready"]
+        import numpy as np
+        self._profile = np.array(data["profile"])
+        self._A = np.array(data["A"])
+        self._B = np.array(data["B"])
+        self._W = np.array(data["W"])
+        self._A_fit = np.array(data["A_fit"]) if data.get("A_fit") is not None else None
+        self._d_fit = np.array(data["d_fit"]) if data.get("d_fit") is not None else None
+        self._warmup_task_ids = list(data["task_ids"])
+        self._warmup_successes = list(data["successes"])
+        if data.get("mlp") and self._mlp is None:
+            mlp_cfg = data["mlp_cfg"]
+            import numpy as np
+            self._mlp = MLPFeaturizer(mlp_cfg["d_c"], mlp_cfg["d_h"], mlp_cfg["d_f"], mlp_cfg["seed"])
+        if data.get("mlp"):
+            self._mlp.set_state(data["mlp"])
+
