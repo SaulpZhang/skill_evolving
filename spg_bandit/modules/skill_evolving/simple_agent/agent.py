@@ -308,7 +308,7 @@ class SimpleAgent(BaseSkillEvolving):
             existing_titles=json.dumps(existing_titles),
         )
 
-        response = self._chat([{"role": "user", "content": prompt}], max_tokens=128 * 1024,
+        response = self._chat([{"role": "user", "content": prompt}], max_tokens=8192,
                                client=self._reflect_client, model=self._reflect_model)
         self._save_reflection(task_id, prompt, response)
 
