@@ -116,6 +116,7 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls += 1
         c = client or self._client
         m = model or self._model
+        print(f"[DEBUG] base_url={c.base_url}, model={m}", flush=True)
         return c.chat.completions.create(
             model=m, messages=messages, max_tokens=max_tokens,
             temperature=0.3,
