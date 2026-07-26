@@ -112,14 +112,22 @@ class SimpleAgent(BaseSkillEvolving):
         self._loaded_skill = None
 
     def _chat(self, messages, max_tokens=1024, client=None, model=None):
-        """Chat. Optionally override client/model (e.g. for reflection)."""
-        self._total_calls += 1
+        """Chat with retry on transient errors."""
         c = client or self._client
         m = model or self._model
-        return c.chat.completions.create(
-            model=m, messages=messages, max_tokens=max_tokens,
-            temperature=0.3,
-        ).choices[0].message.content.strip()
+        for attempt in range(3):
+            try:
+                self._total_calls += 1
+                return c.chat.completions.create(
+                    model=m, messages=messages, max_tokens=max_tokens,
+                    temperature=0.3,
+                ).choices[0].message.content.strip()
+            except Exception as e:
+                if attempt < 2:
+                    print(f"  >>> API call failed (attempt {attempt+1}/3): {e}", flush=True)
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
 
     def _save_reflection(self, task_id: int, prompt: str, response: str):
         """Save reflection API call (system=auto, user=prompt, assistant=response)."""
