@@ -111,14 +111,15 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, client=None, model=None):
+    def _chat(self, messages, max_tokens=1024, client=None, model=None):
         """Chat. Optionally override client/model (e.g. for reflection)."""
         self._total_calls += 1
         c = client or self._client
         m = model or self._model
-        print(f"[DEBUG] msgs_len={len(messages)}, first_200={str(messages[0])[:200]}", flush=True)
+        print(f"[DEBUG] base_url={c.base_url}, model={m}", flush=True)
         return c.chat.completions.create(
-            model=m, messages=messages,
+            model=m, messages=messages, max_tokens=max_tokens,
+            temperature=0.3,
         ).choices[0].message.content.strip()
 
     def _save_reflection(self, task_id: int, prompt: str, response: str):
