@@ -189,7 +189,7 @@ Algorithm~\ref{alg:spg} summarizes the complete procedure.
 \caption{SPG-Bandit}
 \label{alg:spg}
 \begin{algorithmic}
-\STATE {\bf Input:} Task pool \(\mathcal{T}\), warmup steps \(N\geq\ell\), bandit horizon \(T\), window size \(\ell\), feature dimension \(d_f\), gap temperature \(\gamma_g\), confidence radii \(\{\beta_t\}\), regularizer \(\lambda\), skill dimensions \(K\)
+\STATE {\bf Input:} Task pool \(\mathcal{T}\), warmup steps \(N\geq\ell\), bandit horizon \(T\), window size \(\ell\), feature dimension \(d_f\), gap temperature \(\gamma_g\), confidence radii \(\{\beta_t\}\), regularizer \(\lambda>0\), skill dimensions \(K\)
 \STATE {\bf Phase 1: Warmup}
 \FOR{\(i = 1\) to \(N\)}
     \STATE Select \(\tau_i \in \mathcal{T}\) uniformly
@@ -245,56 +245,56 @@ This quantity is a pseudo-regret because it compares conditional expected reward
 \subsection{Assumptions}
 
 \begin{enumerate}
-    \item \textbf{(Time-varying linear delta model.)} There are matrices \(\{\mathbf{W}_t^*\}_{t=1}^{T}\), with \(\mathbf{W}_t^*\in\mathbb{R}^{d_f\times K}\), such that \(\boldsymbol{\delta}_t(\tau)=\mathbf{W}_t^{*\top}\boldsymbol{\phi}_{t,\tau}+\boldsymbol{\varepsilon}_t(\tau)\), where \(\mathbb{E}[\boldsymbol{\varepsilon}_t(\tau)\mid\mathcal{F}_{t-1},\tau]=\mathbf{0}\).
-    \item \textbf{(Boundedness and noise.)} \(\lVert\boldsymbol{\phi}_{t,\tau}\rVert_2\leq1\), \(\lVert\mathbf{W}_t^*\rVert_F\leq S\), and, for every \(\mathbf{u}\) with \(\lVert\mathbf{u}\rVert_2\leq1\), \(\mathbf{u}^\top\boldsymbol{\varepsilon}_t(\tau)\) is conditionally \(\sigma\)-sub-Gaussian.
-    \item \textbf{(Parameter-path variation.)} The reward-model parameters satisfy \(P_T=\sum_{t=1}^{T-1}\lVert\mathbf{W}_{t+1}^*-\mathbf{W}_t^*\rVert_F\).
-    \item \textbf{(Window coverage.)} For a constant \(\kappa>0\), \(\lambda_{\min}(\sum_{i\in\mathcal{W}_t}\boldsymbol{\phi}_i\boldsymbol{\phi}_i^\top)\geq\kappa|\mathcal{W}_t|\) whenever \(|\mathcal{W}_t|=\ell\).
+    \item \textbf{(Time-varying linear delta model.)} There are matrices \(\{\mathbf{W}_t^*\}_{t=1}^{T}\), where \(\mathbf{W}_t^*\in\mathbb{R}^{d_f\times K}\), such that \(\boldsymbol{\delta}_t(\tau)=\mathbf{W}_t^{*\top}\boldsymbol{\phi}_{t,\tau}+\boldsymbol{\varepsilon}_t(\tau)\), with \(\mathbb{E}[\boldsymbol{\varepsilon}_t(\tau)\mid\mathcal{F}_{t-1},\tau]=\mathbf{0}\).
+    \item \textbf{(Boundedness and noise.)} \(\lVert\boldsymbol{\phi}_{t,\tau}\rVert_2\leq1\), \(\lVert\mathbf{W}_t^*\rVert_F\leq S\), and, for every \(\mathbf{u}\) satisfying \(\lVert\mathbf{u}\rVert_2\leq1\), the scalar \(\mathbf{u}^\top\boldsymbol{\varepsilon}_t(\tau)\) is conditionally \(\sigma\)-sub-Gaussian.
+    \item \textbf{(Parameter-path variation.)} The reward-model variation is \(P_T=\sum_{t=1}^{T-1}\lVert\mathbf{W}_{t+1}^*-\mathbf{W}_t^*\rVert_F\).
+    \item \textbf{(Calibrated window and coverage.)} Before the first bandit round, warmup provides \(\ell\) calibration observations generated under \(\mathbf{W}_1^*\). At each bandit round, the window contains exactly \(\ell\) observations and satisfies \(\sum_{i\in\mathcal{W}_t}\boldsymbol{\phi}_i\boldsymbol{\phi}_i^\top\succeq\kappa\ell\mathbf{I}_{d_f}\) for a constant \(\kappa>0\).
 \end{enumerate}
 
-Assumption~1 matches the algorithmic regression target, which is \(\boldsymbol{\delta}_t\) rather than \(\mathbf{s}_{t+1}\). Assumption~2 controls feature magnitudes, parameter magnitudes, and noise. Assumption~3 quantifies non-stationarity through the parameter path. Assumption~4 prevents an ill-conditioned sliding-window design. For a failure probability \(\rho\in(0,1)\), Appendix~\ref{app:proof} provides a detailed high-probability proof.
+Assumption~1 matches the algorithmic regression target, which is \(\boldsymbol{\delta}_t\) rather than \(\mathbf{s}_{t+1}\). Assumption~2 controls the scale of features, parameters, and noise. Assumption~3 quantifies non-stationarity through the parameter path. Assumption~4 isolates the effect of non-stationarity from an ill-conditioned design matrix. For a failure probability \(\rho\in(0,1)\), Appendix~\ref{app:proof} provides a detailed high-probability proof.
 
 \subsection{Dynamic Regret Decomposition}
 
-Let \(\widehat{\mathbf{W}}_t=\mathbf{A}_t^{-1}\mathbf{B}_t\). Under Assumptions~1--4, the windowed self-normalized ridge-regression bound in Appendix~\ref{app:proof} gives, with probability at least \(1-\rho\),
+Let \(w_t(\tau)=\sqrt{\boldsymbol{\phi}_{t,\tau}^\top\mathbf{A}_t^{-1}\boldsymbol{\phi}_{t,\tau}}\) and \(\widehat{\mathbf{W}}_t=\mathbf{A}_t^{-1}\mathbf{B}_t\). Under Assumptions~1--4, Appendix~\ref{app:proof} proves that, with probability at least \(1-\rho\),
 
 \[
 \left|\mathbf{g}_t^\top(\widehat{\mathbf{W}}_t-\mathbf{W}_t^*)^\top\boldsymbol{\phi}_{t,\tau}\right|
-\leq \beta_t\lVert\mathbf{g}_t\rVert_2\sqrt{\boldsymbol{\phi}_{t,\tau}^\top\mathbf{A}_t^{-1}\boldsymbol{\phi}_{t,\tau}}+D_t
+\leq \beta_t\lVert\mathbf{g}_t\rVert_2w_t(\tau)+D_t,
 \]
 
-where \(\beta_t=\tilde{O}(\sigma\sqrt{K d_f}+\sqrt{\lambda}S)\) is a confidence radius and \(D_t\) is the bias induced by stale observations. Lemma~1 in Appendix~\ref{app:proof} implies \(\sum_{t=1}^{T}D_t=O(\ell P_T)\). Since the policy selects the task with the largest UCB score, approximate optimism yields
+where \(\beta_t=\tilde{O}(\sigma\sqrt{K d_f}+\sqrt{\lambda}S)\) is a confidence radius and \(D_t\) is the explicitly bounded bias from stale observations. Since the policy selects the task with the largest UCB score, approximate optimism yields
 \[
 q_t(\tau_t^*)-q_t(\tau_t)
 \leq 2\beta_t\lVert\mathbf{g}_t\rVert_2
-\sqrt{\boldsymbol{\phi}_{t,\tau_t}^\top\mathbf{A}_t^{-1}\boldsymbol{\phi}_{t,\tau_t}}+2D_t.
+ w_t(\tau_t)+2D_t.
 \]
 
-Because \(\mathbf{g}_t\) is a softmax vector, \(\lVert\mathbf{g}_t\rVert_2\leq1\). Under Assumption~4, the cumulative confidence width is \(O(\beta T/\sqrt{\kappa\ell})\), where \(\beta=\max_{t\leq T}\beta_t\). Combining the estimation and drift contributions gives:
+Because \(\mathbf{g}_t\) is a softmax vector, \(\lVert\mathbf{g}_t\rVert_2\leq1\). Assumption~4 gives \(w_t(\tau)\leq(\lambda+\kappa\ell)^{-1/2}\) for every candidate task. The detailed counting argument in Appendix~\ref{app:proof} gives \(\sum_{t=1}^{T}D_t\leq \ell^2P_T/\sqrt{\lambda(\lambda+\kappa\ell)}\). Therefore, with \(\beta=\max_{t\leq T}\beta_t\),
 
 \begin{equation}
-    R_T \leq \underbrace{O\!\left(\frac{\beta T}{\sqrt{\kappa\ell}}\right)}_{\text{estimation}}+\underbrace{O(\ell P_T)}_{\text{drift}}.
+    R_T \leq \underbrace{\frac{2\beta T}{\sqrt{\lambda+\kappa\ell}}}_{\text{estimation}}+\underbrace{\frac{2\ell^2P_T}{\sqrt{\lambda(\lambda+\kappa\ell)}}}_{\text{drift}}.
     \label{eq:decomposition}
 \end{equation}
 
 \subsection{Optimal Window and Regret Bound}
 
-Balancing the two terms, \(\beta T/\sqrt{\kappa\ell}=\ell P_T\), yields the window size:
+For \(P_T>0\), when \(\kappa\ell\geq\lambda\), balancing the two terms yields the following feasible integer window size:
 
 \begin{equation}
-    \ell^*=\min\!\left\{T,\left(\frac{\beta T}{\sqrt{\kappa}P_T}\right)^{2/3}\right\},
+    \ell^*=\min\!\left\{T,\max\!\left\{\left\lceil\frac{\lambda}{\kappa}\right\rceil,\left\lceil\left(\frac{\beta T\sqrt{\lambda}}{P_T}\right)^{1/2}\right\rceil\right\}\right\},
 \end{equation}
 
-and the corresponding cumulative regret bound:
+and the corresponding cumulative regret bound, up to universal constants:
 
 \begin{equation}
-    R_T=O\!\left(\left(\frac{\beta T}{\sqrt{\kappa}}\right)^{2/3}P_T^{1/3}\right).
+    R_T=O\!\left(\frac{(\beta T)^{3/4}P_T^{1/4}}{\kappa^{1/2}\lambda^{1/8}}\right).
     \label{eq:bound}
 \end{equation}
 
-If \(P_T=o(T)\) and \(\beta,\kappa^{-1}\) grow at most polylogarithmically, then the bound is sublinear. For example, if \(P_T=O(T^\nu)\) for \(\nu<1\), then
+If \(P_T=0\), the drift term vanishes and \(\ell=T\) minimizes the displayed bound. If \(P_T=o(T)\) and \(\beta\), \(\kappa^{-1}\), and \(\lambda^{-1}\) grow at most polylogarithmically, then the bound is sublinear. For example, if \(P_T=O(T^\nu)\) for \(\nu<1\), then
 
 \begin{equation}
-    R_T=\tilde{O}\!\left(T^{(2+\nu)/3}\right)=o(T).
+    R_T=\tilde{O}\!\left(T^{(3+\nu)/4}\right)=o(T).
 \end{equation}
 
 
