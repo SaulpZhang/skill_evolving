@@ -126,7 +126,7 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
                 s -= 0.5 * np.linalg.solve(hess, grad)
             s_hist[t] = np.clip(s, 0.0, 1.0)
 
-        # M-step: optimize per-task (a_τ, d_τ) with a ≥ 0, d ≥ 0
+        # M-step: optimize unconstrained task discrimination and difficulty.
         for tau in range(M):
             t_idx = np.where(obs_mask[:, tau])[0]
             if len(t_idx) == 0:
@@ -142,7 +142,6 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
             res = minimize(
                 nll, np.concatenate([A[tau], [d_vec[tau]]]),
                 method="L-BFGS-B",
-                bounds=[(0, None)] * K + [(0, None)],
                 options={"maxiter": 50},
             )
             A[tau], d_vec[tau] = res.x[:-1], res.x[-1]
