@@ -4,8 +4,6 @@ max_turns: 50
 
 warmup:
   split: valid_seen
-  n_tasks: 60
-  steps: 60
 
 evolve:
   split: valid_seen
@@ -19,6 +17,7 @@ skill_evolving:
   name: simple_agent
 
 spg_bandit:
+  warmup_ratio: 0.3
   K: 4
   alpha: 0.1
   d_f: 16

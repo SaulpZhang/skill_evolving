@@ -2,11 +2,6 @@ embedding_model: all-MiniLM-L6-v2
 embedding_type: local
 max_turns: 50
 
-warmup:
-  split: valid_seen
-  n_tasks: 60
-  steps: 0
-
 evolve:
   split: valid_seen
 

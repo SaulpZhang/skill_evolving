@@ -67,26 +67,19 @@ max_turns: 51                       # 每任务最大执行步数
 
 # Warmup 阶段
 warmup:
-  split: valid_seen                 # 数据集 split
-  n_warm: 60                        # warmup 步数
-  tasks_per_type: 10                # 每 type 取多少任务, 0=全部
+  split: valid_seen                 # 仅 SPG-Bandit 使用
 
 # Evolving（bandit）阶段
 evolve:
-  split: valid_seen                 # 数据集 split
-  task_types: all                   # 任务类型筛选
-  tasks_per_type: 0                 # 0 = 所有可用任务
-
-# 实验参数
-experiment:
-  n_bandit: 0                       # bandit 步数, 0 = 和 evolving 任务数相同
-  seed: 42
+  split: valid_seen
 
 # Evaluation 阶段
 evaluate:
   split: valid_unseen               # 评估用 held-out split
-  task_types: all
-  tasks_per_type: 0
+
+# 实验随机种子
+experiment:
+  seed: 42
 
 # Selector 选择
 selector: spg_bandit                # spg_bandit 或 uniform
@@ -97,6 +90,7 @@ skill_evolving:
 
 # SPG-Bandit 专属参数
 spg_bandit:
+  warmup_ratio: 0.3                 # evolve 任务总数中用于 warmup 的比例
   K: 2                              # MIRT skill 维度
   d_f: 16                           # MLP 特征维度
   alpha: 0.1                        # UCB 探索系数
@@ -118,7 +112,8 @@ spg_bandit:
 | `valid_unseen` | 134 |
 | `train` | 3553 |
 
-`tasks_per_type: 0` 表示加载对应 split 的全部任务。
+每个阶段会加载对应 split 的全部任务。SPG-Bandit 的 warmup 步数为
+`round(evolve_pool_size * warmup_ratio)`，剩余步数用于 bandit；uniform 不加载也不执行 warmup。
 
 ## 运行实验
 

@@ -97,12 +97,13 @@ class MLPFeaturizer:
 
 # ── MIRT EM ─────────────────────────────────────────────────────────────────
 
-def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
+def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
     N_warm, M = R.shape
     obs_mask = ~np.isnan(R)
     R_filled = np.nan_to_num(R, nan=0.0)
     s_hist = np.full((N_warm, K), 0.5)
-    A = np.random.uniform(0.5, 1.5, (M, K))
+    rng = np.random.default_rng(seed)
+    A = rng.uniform(0.5, 1.5, (M, K))
     d_vec = np.full(M, 0.5)
     prev_ll = -np.inf
     ll_history = []
@@ -127,7 +128,7 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False):
         # M-step: optimize per-task (a_τ, d_τ) with a ≥ 0, d ≥ 0
         for tau in range(M):
             t_idx = np.where(obs_mask[:, tau])[0]
-            if len(t_idx) < 2:
+            if len(t_idx) == 0:
                 continue
             X, y = s_hist[t_idx], R_filled[t_idx, tau]
 
@@ -196,7 +197,8 @@ class SPGBanditSelector(BaseSelector):
                  alpha: float = 0.1, tau: float = 0.1,
                  d_f: int = 16, d_h: int = 32,
                  lambda_reg: float = 1.0, seed: int = 42,
-                 K: int = 6, warmup_ids: list[int] | None = None):
+                 K: int = 6, warmup_ids: list[int] | None = None,
+                 warmup_pool: TaskPool | None = None):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -206,6 +208,8 @@ class SPGBanditSelector(BaseSelector):
         self._d_f, self._d_h = d_f, d_h
         self._step = 0
         self._warmup_ready = False
+        self._task_pool = task_pool
+        self._warmup_pool = warmup_pool or task_pool
         self._warmup_ids = list(warmup_ids) if warmup_ids else list(range(task_pool.M))
         self._mlp: MLPFeaturizer | None = None
         self._A = self._lambda * np.eye(d_f)
@@ -246,7 +250,7 @@ class SPGBanditSelector(BaseSelector):
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
-    def load_warmup_data(self, path: str, task_pool: TaskPool):
+    def load_warmup_data(self, path: str, task_pool: TaskPool | None = None):
         """Load warmup data, skip task execution, run MIRT EM + MLP."""
         with open(path) as f:
             data = json.load(f)
@@ -254,7 +258,7 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_successes = data["successes"]
         self._warmup_deltas = [np.array(d) for d in data["deltas"]]
         self._n_warm = len(self._warmup_task_ids)
-        self._finalize_warmup(task_pool)
+        self._finalize_warmup()
         self._step = self._n_warm
 
     def select(self, task_pool: TaskPool) -> int:
@@ -265,7 +269,7 @@ class SPGBanditSelector(BaseSelector):
             return tid
 
         if not self._warmup_ready:
-            self._finalize_warmup(task_pool)
+            self._finalize_warmup()
 
         g = self._compute_gap(self._profile)
 
@@ -316,11 +320,13 @@ class SPGBanditSelector(BaseSelector):
         exp = np.exp(raw - np.max(raw))
         return exp / np.sum(exp)
 
-    def _finalize_warmup(self, task_pool: TaskPool):
+    def _finalize_warmup(self):
         print(f"\n  [SPG] Finalizing warmup ({self._n_warm} tasks)...")
 
         N = len(self._warmup_task_ids)
-        R = np.full((N, task_pool.M), np.nan)
+        if N == 0:
+            raise ValueError("Cannot finalize SPG-Bandit warmup without observations")
+        R = np.full((N, self._warmup_pool.M), np.nan)
         for t, tid in enumerate(self._warmup_task_ids):
             R[t, tid] = float(self._warmup_successes[t])
 
@@ -329,27 +335,31 @@ class SPGBanditSelector(BaseSelector):
         profile = np.zeros(self._K)
         deltas = []
         for t in range(N):
-            s_hist_t, *_ = fit_mirt_em(R[:t + 1], self._K, verbose=False)
+            s_hist_t, *_ = fit_mirt_em(R[:t + 1], self._K, verbose=False, seed=self._seed)
             new_profile = s_hist_t[-1]
             profiles_before.append(profile.copy())
             deltas.append(new_profile - profile)
             profile = new_profile
 
         # Final EM on all N (verbose, for logging + item params)
-        s_hist, self._A_fit, self._d_fit, ll, ll_history = fit_mirt_em(R, self._K, verbose=True)
+        s_hist, self._A_fit, self._d_fit, ll, ll_history = fit_mirt_em(
+            R, self._K, verbose=True, seed=self._seed,
+        )
         self._profile = s_hist[-1].copy()
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         # Embedding → (a, d) predictor: infer parameters for unseen tasks
-        dim_of = [task_pool.metadata[tid]["dim"] for tid in self._warmup_task_ids]
-        X_seen = np.array([task_pool.get_embedding(tid) for tid in self._warmup_task_ids])
-        y_seen = np.column_stack([self._A_fit[dim_of], self._d_fit[dim_of].reshape(-1, 1)])
+        X_seen = np.array([self._warmup_pool.get_embedding(tid) for tid in self._warmup_task_ids])
+        warmup_ids = np.asarray(self._warmup_task_ids)
+        y_seen = np.column_stack([
+            self._A_fit[warmup_ids], self._d_fit[warmup_ids].reshape(-1, 1),
+        ])
         reg = Ridge(alpha=self._lambda)
         reg.fit(X_seen, y_seen)
         y_pred_train = reg.predict(X_seen)
         pred_mse = float(np.mean((y_pred_train - y_seen) ** 2))
         log_metrics({"mirt/pred_mse": pred_mse, "_step_mirt": 0})
-        X_all = task_pool.embeddings
+        X_all = self._task_pool.embeddings
         y_pred = reg.predict(X_all)
         self._A_fit = y_pred[:, :self._K]
         self._d_fit = y_pred[:, self._K]
@@ -357,11 +367,11 @@ class SPGBanditSelector(BaseSelector):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i + 1})
 
         # MLP training: X = [embedding(384) | profile_before(K)], y = delta(K)
-        embeds = [task_pool.get_embedding(tid) for tid in self._warmup_task_ids]
+        embeds = [self._warmup_pool.get_embedding(tid) for tid in self._warmup_task_ids]
         X = np.array([np.concatenate([e, p]) for e, p in zip(embeds, profiles_before)])
         y = np.array(deltas)
         self._warmup_deltas = deltas
-        self._mlp = MLPFeaturizer(task_pool.d_c + self._K, self._d_h, self._d_f, self._seed)
+        self._mlp = MLPFeaturizer(self._task_pool.d_c + self._K, self._d_h, self._d_f, self._seed)
         loss_hist = self._mlp.train(X, y, 50, wandb_prefix="spg")
         self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
@@ -422,4 +432,3 @@ class SPGBanditSelector(BaseSelector):
             self._mlp = MLPFeaturizer(mlp_cfg["d_c"], mlp_cfg["d_h"], mlp_cfg["d_f"], mlp_cfg["seed"])
         if data.get("mlp"):
             self._mlp.set_state(data["mlp"])
-

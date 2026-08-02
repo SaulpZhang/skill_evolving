@@ -2,15 +2,17 @@
 """SPG-Bandit experiment runner with structured data saving."""
 
 import argparse
+import importlib
+import inspect
 import os
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import yaml
 from dotenv import load_dotenv
 from json import JSONEncoder
 
@@ -29,12 +31,12 @@ class NumpyEncoder(JSONEncoder):
 
 load_dotenv()
 
-from spg_bandit.utils.config_loader import load_config, get_param
+from spg_bandit.utils.config_loader import load_config, resolve_config_path
 from spg_bandit.utils.logger import setup_logger
 from spg_bandit.utils.recorder import Recorder
 from spg_bandit.utils.wandb import init_wandb, log_metrics, finish_wandb
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
-from spg_bandit.modules.skill_evolving import SimpleAgent
+from spg_bandit.modules.skill_evolving import BaseSkillEvolving, SimpleAgent
 from spg_bandit.modules.selector import UniformSelector, SPGBanditSelector
 
 
@@ -55,7 +57,8 @@ def build_parser():
     return p
 
 
-def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0):
+def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
+                    warmup_pool=None):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
@@ -69,13 +72,44 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0):
             K=params.get("K", 6),
             seed=config.get("experiment", {}).get("seed", 42),
             warmup_ids=warmup_ids,
+            warmup_pool=warmup_pool,
         )
     raise ValueError(f"Unknown selector: {name}")
+
+
+def create_skill_evolving(name, dataset, max_turns, records_dir=None):
+    """Instantiate a registered skill-evolving implementation by its package name."""
+    if name == "simple_agent":
+        implementation = SimpleAgent
+    else:
+        module = importlib.import_module(f"spg_bandit.modules.skill_evolving.{name}")
+        implementations = [
+            value for value in vars(module).values()
+            if isinstance(value, type)
+            and issubclass(value, BaseSkillEvolving)
+            and value is not BaseSkillEvolving
+        ]
+        if len(implementations) != 1:
+            raise ValueError(
+                f"Skill evolving module '{name}' must export exactly one "
+                "BaseSkillEvolving implementation"
+            )
+        implementation = implementations[0]
+
+    parameters = inspect.signature(implementation).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    kwargs = {}
+    if accepts_kwargs or "max_turns" in parameters:
+        kwargs["max_turns"] = max_turns
+    if records_dir is not None and (accepts_kwargs or "records_dir" in parameters):
+        kwargs["records_dir"] = records_dir
+    return implementation(dataset, **kwargs)
 
 
 def main():
     args = build_parser().parse_args()
     config = load_config(args.config)
+    config_source = resolve_config_path(args.config)
     if args.seed is not None:
         config.setdefault("experiment", {})["seed"] = args.seed
     seed = config.get("experiment", {}).get("seed", 42)
@@ -96,16 +130,14 @@ def main():
 
     log_base = Path(__file__).parent.parent / "logs" / run_id
     recorder = Recorder(str(log_base / "records"))
-    config_path = str(log_base / "records" / "config.yaml")
-    with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+    config_path = log_base / "records" / "config.yaml"
+    if config_source is not None:
+        # Keep the exact user-authored YAML rather than serializing a normalized
+        # runtime dictionary, so unknown future fields and formatting are retained.
+        shutil.copyfile(config_source, config_path)
+    else:
+        logger.warning("No config source file found; no config.yaml was copied")
     logger.info(f"Records: {log_base / 'records'}")
-
-    def _resolve_steps(steps_cfg, pool_size):
-        """Resolve steps to an integer: 'all' -> pool_size, int -> as-is."""
-        if isinstance(steps_cfg, str) and steps_cfg.lower() == "all":
-            return pool_size
-        return int(steps_cfg)
 
     def _make_cfg(overrides):
         cfg = {
@@ -118,41 +150,10 @@ def main():
         cfg.update(overrides)
         return cfg
 
-    logger.info("Loading warmup dataset...")
-    warmup_cfg = config.get("warmup", {})
-    warmup_dataset = ALFWorldDataset(_make_cfg({
-        "split": warmup_cfg.get("split", "valid_seen"),
-        "n_tasks": warmup_cfg.get("n_tasks", 60),
-    }))
-    warmup_pool = warmup_dataset.task_pool
-    n_warm = _resolve_steps(warmup_cfg.get("steps", 0), warmup_pool.M)
-
-    # Proportional allocation per type: each type gets round(count/total * n_warm)
-    from collections import defaultdict
-    type_to_ids = defaultdict(list)
-    for m in warmup_pool.metadata:
-        type_to_ids[m["dim"]].append(m["id"])
-    raw = {d: len(ids) / warmup_pool.M * n_warm for d, ids in type_to_ids.items()}
-    alloc = {d: int(raw[d]) for d in raw}
-    remainder = n_warm - sum(alloc.values())
-    for d in sorted(raw, key=lambda d: raw[d] - int(raw[d]), reverse=True):
-        if remainder <= 0:
-            break
-        alloc[d] += 1
-        remainder -= 1
-    warmup_ids = []
-    for d in sorted(type_to_ids):
-        pool_ids = type_to_ids[d]
-        warmup_ids.extend((pool_ids * (alloc[d] // len(pool_ids) + 1))[:alloc[d]])
-    random.shuffle(warmup_ids)
-    dist = {d: alloc[d] for d in sorted(alloc)}
-    logger.info(f"Warmup: {len(warmup_ids)} tasks, type distribution: {dist}")
-
     logger.info("Loading evolve dataset...")
     evo_cfg = config.get("evolve", {})
     evo_dataset = ALFWorldDataset(_make_cfg({
         "split": evo_cfg.get("split", "valid_seen"),
-        "n_tasks": evo_cfg.get("n_tasks", "all"),
     }))
     evo_pool = evo_dataset.task_pool
 
@@ -160,24 +161,76 @@ def main():
     eva_cfg = config.get("evaluate", {})
     eva_dataset = ALFWorldDataset(_make_cfg({
         "split": eva_cfg.get("split", "valid_seen"),
-        "n_tasks": eva_cfg.get("n_tasks", "all"),
     }))
     eva_pool = eva_dataset.task_pool
 
-    n_bandit = _resolve_steps(evo_cfg.get("steps", "all"), evo_pool.M)
-    n_eva = _resolve_steps(eva_cfg.get("steps", "all"), eva_pool.M)
+    n_bandit = evo_pool.M
+    n_eva = eva_pool.M
     max_turns = config.get("max_turns", 51)
+
+    warmup_dataset = None
+    warmup_pool = None
+    warmup_ids = []
+    n_warm = 0
+    if sel_name == "spg_bandit":
+        warmup_cfg = config.get("warmup", {})
+        warmup_ratio = config.get("spg_bandit", {}).get("warmup_ratio", 0.3)
+        if not 0 < warmup_ratio < 1:
+            raise ValueError("spg_bandit.warmup_ratio must be between 0 and 1")
+        n_warm = round(evo_pool.M * warmup_ratio)
+        if n_warm == 0:
+            raise ValueError("Warmup ratio produces zero steps; increase warmup_ratio")
+
+        logger.info("Loading warmup dataset...")
+        warmup_dataset = ALFWorldDataset(_make_cfg({
+            "split": warmup_cfg.get("split", evo_cfg.get("split", "valid_seen")),
+        }))
+        warmup_pool = warmup_dataset.task_pool
+        if warmup_pool.M == 0:
+            raise ValueError("Warmup requested but the warmup dataset has no tasks")
+
+        # Allocate warmup evenly by type and repeat anchor tasks so MIRT receives
+        # multiple observations for each fitted item.
+        from collections import defaultdict
+        type_to_ids = defaultdict(list)
+        for m in warmup_pool.metadata:
+            type_to_ids[m["dim"]].append(m["id"])
+        raw = {d: len(ids) / warmup_pool.M * n_warm for d, ids in type_to_ids.items()}
+        alloc = {d: int(raw[d]) for d in raw}
+        remainder = n_warm - sum(alloc.values())
+        for d in sorted(raw, key=lambda d: raw[d] - int(raw[d]), reverse=True):
+            if remainder <= 0:
+                break
+            alloc[d] += 1
+            remainder -= 1
+        for d in sorted(type_to_ids):
+            pool_ids = type_to_ids[d]
+            anchor_count = min(len(pool_ids), max(1, alloc[d] // 2))
+            anchors = pool_ids[:anchor_count]
+            warmup_ids.extend((anchors * (alloc[d] // len(anchors) + 1))[:alloc[d]])
+        random.shuffle(warmup_ids)
+        logger.info("Warmup: %s tasks, type distribution: %s", len(warmup_ids),
+                    {d: alloc[d] for d in sorted(alloc)})
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
-    method = SimpleAgent(evo_dataset, max_turns=max_turns, records_dir=records_dir)
+    method = create_skill_evolving(agent_name, evo_dataset, max_turns, records_dir)
+    warmup_method = (
+        create_skill_evolving(agent_name, warmup_dataset, max_turns, records_dir)
+        if warmup_dataset is not None else None
+    )
     method.load_skills(skills_dir)
-    selector = create_selector(sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm)
+    if warmup_method is not None:
+        warmup_method.load_skills(skills_dir)
+    selector = create_selector(
+        sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm,
+        warmup_pool=warmup_pool,
+    )
 
-    if selector.needs_warmup and warmup_pool.M > 0 and warmup_cfg.get("steps", 0) != 0:
-        n_bandit = max(evo_pool.M - n_warm, 0)
+    if selector.needs_warmup:
+        n_bandit = evo_pool.M - n_warm
 
-    logger.info(f"Warmup pool: {warmup_pool.M} tasks, {n_warm} steps")
+    logger.info(f"Warmup pool: {warmup_pool.M if warmup_pool else 0} tasks, {n_warm} steps")
     logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
     logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
 
@@ -186,7 +239,7 @@ def main():
             logger.warning("Selector %s does not support warmup loading, ignoring --warmup-data", sel_name)
             warmup_steps = selector.needs_warmup * n_warm
         else:
-            selector.load_warmup_data(args.warmup_data, evo_pool)
+            selector.load_warmup_data(args.warmup_data)
             warmup_steps = 0
             logger.info("Warmup task execution skipped, loaded data from %s", args.warmup_data)
     else:
@@ -223,7 +276,7 @@ def main():
             logger.error(f"Failed to load checkpoint: {e}")
             return
 
-    def _save_ckpt(st, sw, sb, sr, phase=""):
+    def _save_ckpt(st, sw, sb, sr, phase="", path=None):
         try:
             data = {
                 "step": st, "total_steps": total_steps,
@@ -233,7 +286,7 @@ def main():
             }
             if hasattr(selector, "save_checkpoint"):
                 data["selector"] = selector.save_checkpoint()
-            with open(ckpt_path, "w") as f:
+            with open(path or ckpt_path, "w") as f:
                 import json
                 json.dump(data, f, indent=2, cls=NumpyEncoder)
             logger.info(f"Checkpoint saved at step {st} ({phase})")
@@ -242,15 +295,16 @@ def main():
 
     try:
         for step in range(start_step, total_steps):
-            pool = warmup_pool if step < warmup_steps else evo_pool
+            is_warmup = step < warmup_steps
+            pool = warmup_pool if is_warmup else evo_pool
+            active_method = warmup_method if is_warmup else method
             task_id = selector.select(pool)
             t0 = time.time()
-            result = method.execute(task_id)
+            result = active_method.execute(task_id)
             elapsed = time.time() - t0
-            method.reflect(task_id, result)
+            active_method.reflect(task_id, result)
             selector.update(task_id, result)
 
-            is_warmup = step < warmup_steps
             if result["success"]:
                 success_count += 1
             bandit_done = step + 1
@@ -276,9 +330,6 @@ def main():
         finish_wandb()
         raise
 
-        logger.info(f"  step {step+1}/{total_steps}: task {task_id} -> "
-                    f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
-
     _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
 
     if hasattr(selector, "get_metrics"):
@@ -299,14 +350,14 @@ def main():
         logger.info(f"{'='*60}")
 
         method.reset()
-        eval_method = SimpleAgent(eva_dataset, max_turns=max_turns)
+        eval_method = create_skill_evolving(agent_name, eva_dataset, max_turns)
         eval_method.load_skills(skills_dir)
         evaluating_selector = UniformSelector()
         evaluating_success = 0
         evaluating_records = []
 
         eva_start = 0
-        eva_ckpt_key = "evaluating"
+        eval_ckpt_path = str(log_base / "records" / "evaluating_checkpoint.json")
 
         try:
             for step in range(eva_start, n_eva):
@@ -326,14 +377,17 @@ def main():
                     logger.info(f"  evaluating step {step+1}/{n_eva}: task {task_id} -> "
                                 f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
                 if (step + 1) % ckpt_interval == 0:
-                    _save_ckpt(step + 1, warmup_steps, success_count, step_records, "eval_interval")
+                    _save_ckpt(step + 1, warmup_steps, success_count, step_records,
+                               "eval_interval", path=eval_ckpt_path)
         except Exception as e:
-            _save_ckpt(step, warmup_steps, success_count, step_records, "eval_error")
+            _save_ckpt(step, warmup_steps, success_count, step_records,
+                       "eval_error", path=eval_ckpt_path)
             logger.error(f"Evaluating interrupted at step {step}: {e}")
             finish_wandb()
             raise
 
-        _save_ckpt(n_eva, warmup_steps, success_count, step_records, "eval_end")
+        _save_ckpt(n_eva, warmup_steps, success_count, step_records,
+                   "eval_end", path=eval_ckpt_path)
         evaluating_api = sum(r["api_calls"] for r in evaluating_records)
         for rec in evaluating_records:
             recorder.append_jsonl("evaluating_steps", rec)
