@@ -4,6 +4,7 @@ Maintains its own skill profile internally, independent of skill evolving method
 """
 
 import json
+from collections import deque
 import numpy as np
 from scipy.special import expit as sigmoid
 from scipy.optimize import minimize
@@ -198,7 +199,7 @@ class SPGBanditSelector(BaseSelector):
                  d_f: int = 16, d_h: int = 32,
                  lambda_reg: float = 1.0, seed: int = 42,
                  K: int = 6, warmup_ids: list[int] | None = None,
-                 warmup_pool: TaskPool | None = None):
+                 window_size: int = 20):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -206,16 +207,19 @@ class SPGBanditSelector(BaseSelector):
         self._lambda = lambda_reg
         self._seed = seed
         self._d_f, self._d_h = d_f, d_h
+        self._window_size = window_size
+        if self._window_size <= 0:
+            raise ValueError("window_size must be positive")
         self._step = 0
         self._warmup_ready = False
         self._task_pool = task_pool
-        self._warmup_pool = warmup_pool or task_pool
         self._warmup_ids = list(warmup_ids) if warmup_ids else list(range(task_pool.M))
         self._mlp: MLPFeaturizer | None = None
         self._A = self._lambda * np.eye(d_f)
         self._B = np.zeros((d_f, K))
         self._W = np.zeros((d_f, K))
         self._last_phi = None
+        self._window = deque()
 
         # Internal profile (SPG own concept)
         self._profile = np.zeros(K)
@@ -287,7 +291,7 @@ class SPGBanditSelector(BaseSelector):
             inp = np.concatenate([task_pool.get_embedding(tau), self._profile])
             phi = self._mlp.forward(inp)
             delta_hat = self._W.T @ phi
-            ucb = self._alpha * np.sqrt(max(phi @ A_inv @ phi, 1e-10))
+            ucb = self._alpha * np.linalg.norm(g) * np.sqrt(max(phi @ A_inv @ phi, 1e-10))
             score = g @ delta_hat + ucb
             if score > best_score:
                 best_score, best_tid, self._last_phi = score, tau, phi
@@ -311,8 +315,7 @@ class SPGBanditSelector(BaseSelector):
             # Ridge regression: learn from real skill progress
             if self._last_phi is not None:
                 delta = self._profile - profile_before
-                self._A += np.outer(self._last_phi, self._last_phi)
-                self._B += np.outer(self._last_phi, delta)
+                self._append_window_observation(self._last_phi, delta)
                 self._W = np.linalg.solve(self._A, self._B)
 
     def _compute_gap(self, profile):
@@ -326,7 +329,9 @@ class SPGBanditSelector(BaseSelector):
         N = len(self._warmup_task_ids)
         if N == 0:
             raise ValueError("Cannot finalize SPG-Bandit warmup without observations")
-        R = np.full((N, self._warmup_pool.M), np.nan)
+        if self._window_size > N:
+            raise ValueError("window_size cannot exceed the number of warmup observations")
+        R = np.full((N, self._task_pool.M), np.nan)
         for t, tid in enumerate(self._warmup_task_ids):
             R[t, tid] = float(self._warmup_successes[t])
 
@@ -349,7 +354,7 @@ class SPGBanditSelector(BaseSelector):
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
 
         # Embedding → (a, d) predictor: infer parameters for unseen tasks
-        X_seen = np.array([self._warmup_pool.get_embedding(tid) for tid in self._warmup_task_ids])
+        X_seen = np.array([self._task_pool.get_embedding(tid) for tid in self._warmup_task_ids])
         warmup_ids = np.asarray(self._warmup_task_ids)
         y_seen = np.column_stack([
             self._A_fit[warmup_ids], self._d_fit[warmup_ids].reshape(-1, 1),
@@ -367,7 +372,7 @@ class SPGBanditSelector(BaseSelector):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i + 1})
 
         # MLP training: X = [embedding(384) | profile_before(K)], y = delta(K)
-        embeds = [self._warmup_pool.get_embedding(tid) for tid in self._warmup_task_ids]
+        embeds = [self._task_pool.get_embedding(tid) for tid in self._warmup_task_ids]
         X = np.array([np.concatenate([e, p]) for e, p in zip(embeds, profiles_before)])
         y = np.array(deltas)
         self._warmup_deltas = deltas
@@ -376,10 +381,26 @@ class SPGBanditSelector(BaseSelector):
         self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
 
+        # Algorithm 1 initializes the sliding-window ridge head with the final
+        # window_size warmup tuples, rather than discarding calibration data.
+        self._window.clear()
         self._A = self._lambda * np.eye(self._d_f)
         self._B = np.zeros((self._d_f, self._K))
-        self._W = np.zeros((self._d_f, self._K))
+        for embedding, profile_before, delta in zip(embeds, profiles_before, deltas):
+            phi = self._mlp.forward(np.concatenate([embedding, profile_before]))
+            self._append_window_observation(phi, delta)
+        self._W = np.linalg.solve(self._A, self._B)
         self._warmup_ready = True
+
+    def _append_window_observation(self, phi: np.ndarray, delta: np.ndarray):
+        """Append one tuple and evict the oldest tuple beyond the sliding window."""
+        if len(self._window) == self._window_size:
+            old_phi, old_delta = self._window.popleft()
+            self._A -= np.outer(old_phi, old_phi)
+            self._B -= np.outer(old_phi, old_delta)
+        self._window.append((phi.copy(), delta.copy()))
+        self._A += np.outer(phi, phi)
+        self._B += np.outer(phi, delta)
 
     def reset(self):
         self._step = 0
@@ -390,6 +411,7 @@ class SPGBanditSelector(BaseSelector):
         self._B = np.zeros((self._d_f, self._K))
         self._W = np.zeros((self._d_f, self._K))
         self._last_phi = None
+        self._window.clear()
         self._warmup_task_ids.clear()
         self._warmup_successes.clear()
         self._warmup_deltas.clear()
@@ -409,6 +431,11 @@ class SPGBanditSelector(BaseSelector):
             "d_fit": self._d_fit.tolist() if self._d_fit is not None else None,
             "task_ids": list(self._warmup_task_ids),
             "successes": list(self._warmup_successes),
+            "window": [
+                {"phi": phi.tolist(), "delta": delta.tolist()}
+                for phi, delta in self._window
+            ],
+            "window_size": self._window_size,
             "mlp": self._mlp.get_state() if self._mlp is not None else None,
             "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed} if self._mlp is not None else None,
         }
@@ -426,6 +453,11 @@ class SPGBanditSelector(BaseSelector):
         self._d_fit = np.array(data["d_fit"]) if data.get("d_fit") is not None else None
         self._warmup_task_ids = list(data["task_ids"])
         self._warmup_successes = list(data["successes"])
+        self._window_size = data.get("window_size", self._window_size)
+        self._window = deque(
+            (np.array(item["phi"]), np.array(item["delta"]))
+            for item in data.get("window", [])
+        )
         if data.get("mlp") and self._mlp is None:
             mlp_cfg = data["mlp_cfg"]
             import numpy as np

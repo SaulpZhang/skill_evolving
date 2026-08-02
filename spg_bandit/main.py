@@ -58,7 +58,7 @@ def build_parser():
 
 
 def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
-                    warmup_pool=None):
+                    window_size=20):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
@@ -72,7 +72,7 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
             K=params.get("K", 6),
             seed=config.get("experiment", {}).get("seed", 42),
             warmup_ids=warmup_ids,
-            warmup_pool=warmup_pool,
+            window_size=window_size,
         )
     raise ValueError(f"Unknown selector: {name}")
 
@@ -168,69 +168,37 @@ def main():
     n_eva = eva_pool.M
     max_turns = config.get("max_turns", 51)
 
-    warmup_dataset = None
-    warmup_pool = None
     warmup_ids = []
     n_warm = 0
+    window_size = 20
     if sel_name == "spg_bandit":
-        warmup_cfg = config.get("warmup", {})
-        warmup_ratio = config.get("spg_bandit", {}).get("warmup_ratio", 0.3)
+        spg_cfg = config.get("spg_bandit", {})
+        warmup_ratio = spg_cfg.get("warmup_ratio", 0.3)
         if not 0 < warmup_ratio < 1:
             raise ValueError("spg_bandit.warmup_ratio must be between 0 and 1")
         n_warm = round(evo_pool.M * warmup_ratio)
         if n_warm == 0:
             raise ValueError("Warmup ratio produces zero steps; increase warmup_ratio")
-
-        logger.info("Loading warmup dataset...")
-        warmup_dataset = ALFWorldDataset(_make_cfg({
-            "split": warmup_cfg.get("split", evo_cfg.get("split", "valid_seen")),
-        }))
-        warmup_pool = warmup_dataset.task_pool
-        if warmup_pool.M == 0:
-            raise ValueError("Warmup requested but the warmup dataset has no tasks")
-
-        # Allocate warmup evenly by type and repeat anchor tasks so MIRT receives
-        # multiple observations for each fitted item.
-        from collections import defaultdict
-        type_to_ids = defaultdict(list)
-        for m in warmup_pool.metadata:
-            type_to_ids[m["dim"]].append(m["id"])
-        raw = {d: len(ids) / warmup_pool.M * n_warm for d, ids in type_to_ids.items()}
-        alloc = {d: int(raw[d]) for d in raw}
-        remainder = n_warm - sum(alloc.values())
-        for d in sorted(raw, key=lambda d: raw[d] - int(raw[d]), reverse=True):
-            if remainder <= 0:
-                break
-            alloc[d] += 1
-            remainder -= 1
-        for d in sorted(type_to_ids):
-            pool_ids = type_to_ids[d]
-            anchor_count = min(len(pool_ids), max(1, alloc[d] // 2))
-            anchors = pool_ids[:anchor_count]
-            warmup_ids.extend((anchors * (alloc[d] // len(anchors) + 1))[:alloc[d]])
-        random.shuffle(warmup_ids)
-        logger.info("Warmup: %s tasks, type distribution: %s", len(warmup_ids),
-                    {d: alloc[d] for d in sorted(alloc)})
+        window_size = spg_cfg.get("window_size", min(20, n_warm))
+        if not 0 < window_size <= n_warm:
+            raise ValueError("spg_bandit.window_size must be in [1, n_warm]")
+        # Algorithm 1: warmup samples uniformly from the same fixed task pool.
+        warmup_ids = [random.randrange(evo_pool.M) for _ in range(n_warm)]
+        logger.info("Warmup: %s uniform samples from evolve pool", n_warm)
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
     method = create_skill_evolving(agent_name, evo_dataset, max_turns, records_dir)
-    warmup_method = (
-        create_skill_evolving(agent_name, warmup_dataset, max_turns, records_dir)
-        if warmup_dataset is not None else None
-    )
     method.load_skills(skills_dir)
-    if warmup_method is not None:
-        warmup_method.load_skills(skills_dir)
     selector = create_selector(
         sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm,
-        warmup_pool=warmup_pool,
+        window_size=window_size,
     )
 
     if selector.needs_warmup:
         n_bandit = evo_pool.M - n_warm
 
-    logger.info(f"Warmup pool: {warmup_pool.M if warmup_pool else 0} tasks, {n_warm} steps")
+    logger.info(f"Warmup pool: evolve pool ({evo_pool.M} tasks), {n_warm} steps")
     logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
     logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
 
@@ -296,13 +264,11 @@ def main():
     try:
         for step in range(start_step, total_steps):
             is_warmup = step < warmup_steps
-            pool = warmup_pool if is_warmup else evo_pool
-            active_method = warmup_method if is_warmup else method
-            task_id = selector.select(pool)
+            task_id = selector.select(evo_pool)
             t0 = time.time()
-            result = active_method.execute(task_id)
+            result = method.execute(task_id)
             elapsed = time.time() - t0
-            active_method.reflect(task_id, result)
+            method.reflect(task_id, result)
             selector.update(task_id, result)
 
             if result["success"]:

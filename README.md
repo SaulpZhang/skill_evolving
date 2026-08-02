@@ -65,10 +65,6 @@ embedding_model: all-MiniLM-L6-v2   # 任务 embedding 模型
 embedding_type: local               # local / openai / ollama
 max_turns: 51                       # 每任务最大执行步数
 
-# Warmup 阶段
-warmup:
-  split: valid_seen                 # 仅 SPG-Bandit 使用
-
 # Evolving（bandit）阶段
 evolve:
   split: valid_seen
@@ -91,6 +87,7 @@ skill_evolving:
 # SPG-Bandit 专属参数
 spg_bandit:
   warmup_ratio: 0.3                 # evolve 任务总数中用于 warmup 的比例
+  window_size: 20                   # sliding-window ridge 的窗口长度，≤ warmup 步数
   K: 2                              # MIRT skill 维度
   d_f: 16                           # MLP 特征维度
   alpha: 0.1                        # UCB 探索系数
@@ -112,8 +109,9 @@ spg_bandit:
 | `valid_unseen` | 134 |
 | `train` | 3553 |
 
-每个阶段会加载对应 split 的全部任务。SPG-Bandit 的 warmup 步数为
-`round(evolve_pool_size * warmup_ratio)`，剩余步数用于 bandit；uniform 不加载也不执行 warmup。
+每个阶段会加载对应 split 的全部任务。SPG-Bandit 的 warmup 从 evolve pool 均匀采样，步数为
+`round(evolve_pool_size * warmup_ratio)`；剩余步数用于 bandit。滑动窗口以最后
+`window_size` 条 warmup 观测初始化，并在 bandit 阶段逐轮淘汰最旧观测；uniform 不执行 warmup。
 
 ## 运行实验
 

@@ -27,19 +27,14 @@ class _CapturingRidge:
 
 class SPGBanditTests(unittest.TestCase):
     def setUp(self):
-        self.warmup_pool = TaskPool(
+        self.evolve_pool = TaskPool(
             embeddings=np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]),
             metadata=[{"id": i, "dim": 0, "goal": str(i)} for i in range(3)],
-        )
-        self.evolve_pool = TaskPool(
-            embeddings=np.array([[3.0, 0.0], [4.0, 0.0]]),
-            metadata=[{"id": i, "dim": 0, "goal": str(i)} for i in range(2)],
         )
 
     def test_finalize_uses_warmup_task_parameters_not_task_type_indexes(self):
         selector = SPGBanditSelector(
-            self.evolve_pool, n_warm=2, K=2, d_f=2,
-            warmup_pool=self.warmup_pool,
+            self.evolve_pool, n_warm=2, K=2, d_f=2, window_size=2,
         )
         selector._warmup_task_ids = [1, 2]
         selector._warmup_successes = [True, False]
@@ -63,6 +58,24 @@ class SPGBanditTests(unittest.TestCase):
         selector = SPGBanditSelector(self.evolve_pool, n_warm=0, K=2)
         with self.assertRaisesRegex(ValueError, "without observations"):
             selector.select(self.evolve_pool)
+
+    def test_sliding_window_evicts_the_oldest_observation(self):
+        selector = SPGBanditSelector(
+            self.evolve_pool, n_warm=3, K=2, d_f=2, window_size=2,
+        )
+        selector._append_window_observation(np.array([1.0, 0.0]), np.array([1.0, 0.0]))
+        selector._append_window_observation(np.array([0.0, 1.0]), np.array([0.0, 1.0]))
+        selector._append_window_observation(np.array([1.0, 1.0]), np.array([2.0, 3.0]))
+
+        self.assertEqual(len(selector._window), 2)
+        np.testing.assert_array_equal(
+            selector._A,
+            np.eye(2) + np.array([[0.0, 0.0], [0.0, 1.0]]) + np.ones((2, 2)),
+        )
+        np.testing.assert_array_equal(
+            selector._B,
+            np.array([[2.0, 3.0], [2.0, 4.0]]),
+        )
 
 
 class ConfigResolutionTests(unittest.TestCase):
