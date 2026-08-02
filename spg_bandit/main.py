@@ -300,6 +300,7 @@ def main():
 
         method.reset()
         eval_method = SimpleAgent(eva_dataset, max_turns=max_turns)
+        eval_method.load_skills(skills_dir)
         evaluating_selector = UniformSelector()
         evaluating_success = 0
         evaluating_records = []
