@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ import numpy as np
 from spg_bandit.modules.dataset.base import TaskPool
 from spg_bandit.modules.selector.spg_bandit import SPGBanditSelector
 from spg_bandit.utils.config_loader import resolve_config_path
+from spg_bandit.utils.warmup import sample_type_balanced_task_ids
 
 
 class _CapturingRidge:
@@ -84,6 +86,26 @@ class ConfigResolutionTests(unittest.TestCase):
             source = Path(directory) / "custom.yaml"
             source.write_text("future_field:\n  arbitrary: [keep, this]\n")
             self.assertEqual(resolve_config_path(str(source)), source)
+
+
+class WarmupSamplingTests(unittest.TestCase):
+    def test_sampling_balances_task_types_without_repeating_tasks(self):
+        pool = TaskPool(
+            embeddings=np.zeros((5, 2)),
+            metadata=[
+                {"id": 0, "dim": 0}, {"id": 1, "dim": 0},
+                {"id": 2, "dim": 1}, {"id": 3, "dim": 1},
+                {"id": 4, "dim": 2},
+            ],
+        )
+        sampled = sample_type_balanced_task_ids(pool, 5, random.Random(7))
+        counts = {task_type: 0 for task_type in range(3)}
+        for task_id in sampled:
+            counts[pool.metadata[task_id]["dim"]] += 1
+
+        self.assertEqual(len(sampled), 5)
+        self.assertEqual(len(sampled), len(set(sampled)))
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
 
 
 if __name__ == "__main__":

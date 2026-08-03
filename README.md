@@ -99,7 +99,7 @@ spg_bandit:
 | scenario | warmup 行为 | bandit 行为 | eval 行为 |
 |---|---|---|---|
 | `uniform` | 无（n_warm=0） | 均匀循环选任务 | uniform 无 reflection |
-| `spg_bandit` | 均匀采样，MIRT 建模 | gap-weighted UCB 选任务 | uniform 无 reflection |
+| `spg_bandit` | 各 task type 近似均衡采样，MIRT 建模 | gap-weighted UCB 选任务 | uniform 无 reflection |
 
 数据集规模：
 
@@ -109,7 +109,8 @@ spg_bandit:
 | `valid_unseen` | 134 |
 | `train` | 3553 |
 
-每个阶段会加载对应 split 的全部任务。SPG-Bandit 的 warmup 从 evolve pool 均匀采样，步数为
+每个阶段会加载对应 split 的全部任务。SPG-Bandit 的 warmup 从 evolve pool 采样，并使各 task type
+的抽样次数尽量均衡；同一 task 在 warmup 内最多抽取一次。步数为
 `round(evolve_pool_size * warmup_ratio)`；剩余步数用于 bandit。滑动窗口以最后
 `window_size` 条 warmup 观测初始化，并在 bandit 阶段逐轮淘汰最旧观测；uniform 不执行 warmup。
 

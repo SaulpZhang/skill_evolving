@@ -35,6 +35,7 @@ from spg_bandit.utils.config_loader import load_config, resolve_config_path
 from spg_bandit.utils.logger import setup_logger
 from spg_bandit.utils.recorder import Recorder
 from spg_bandit.utils.wandb import init_wandb, log_metrics, finish_wandb
+from spg_bandit.utils.warmup import sample_type_balanced_task_ids
 from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
 from spg_bandit.modules.skill_evolving import BaseSkillEvolving, SimpleAgent
 from spg_bandit.modules.selector import UniformSelector, SPGBanditSelector
@@ -182,9 +183,8 @@ def main():
         window_size = spg_cfg.get("window_size", min(20, n_warm))
         if not 0 < window_size <= n_warm:
             raise ValueError("spg_bandit.window_size must be in [1, n_warm]")
-        # Algorithm 1: warmup samples uniformly from the same fixed task pool.
-        warmup_ids = [random.randrange(evo_pool.M) for _ in range(n_warm)]
-        logger.info("Warmup: %s uniform samples from evolve pool", n_warm)
+        warmup_ids = sample_type_balanced_task_ids(evo_pool, n_warm, random)
+        logger.info("Warmup: %s type-balanced samples from evolve pool", n_warm)
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
