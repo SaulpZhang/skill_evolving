@@ -133,7 +133,7 @@ class SimpleAgent(BaseSkillEvolving):
         if not self._records_dir:
             return
         self._records_dir.mkdir(parents=True, exist_ok=True)
-        path = self._records_dir / f"reflection_{task_id}_{int(time.time())}.json"
+        path = self._records_dir / f"reflection_{task_id}_{time.time_ns()}.json"
         with open(path, "w") as f:
             json.dump({
                 "task_id": task_id,
@@ -147,7 +147,7 @@ class SimpleAgent(BaseSkillEvolving):
         if not self._records_dir:
             return
         self._records_dir.mkdir(parents=True, exist_ok=True)
-        path = self._records_dir / f"task_{task_id}_{int(time.time())}.json"
+        path = self._records_dir / f"task_{task_id}_{time.time_ns()}.json"
         with open(path, "w") as f:
             json.dump({
                 "task_id": task_id,
@@ -197,7 +197,18 @@ class SimpleAgent(BaseSkillEvolving):
 
     # ── Execution ─────────────────────────────────────────────────────
 
-    def execute(self, task_id: int) -> dict:
+    def _get_skill_section(self, goal: str, task_type: str) -> str:
+        """Return prompt-ready skills; subclasses can supply another memory."""
+        if not self._skill_mgr:
+            return ""
+        return self._skill_mgr.format_for_prompt(task_type=task_type)
+
+    def execute(self, task_id: int, num_rollouts: int = 1) -> dict:
+        if num_rollouts != 1:
+            raise ValueError(
+                "SimpleAgent executes one trajectory per selected task; "
+                "use skillrl for grouped rollouts."
+            )
         goal = self._dataset.get_task_goal(task_id)
         print(f"\n  --- Executing task {task_id}: {goal}", flush=True)
         if self._skill_mgr:
@@ -214,7 +225,7 @@ class SimpleAgent(BaseSkillEvolving):
         triplets = []  # collect (system, user, assistant) per step
 
         # Build skill section (filtered by task type per SkillRL)
-        skill_section = self._skill_mgr.format_for_prompt(task_type=task_type) if self._skill_mgr else ""
+        skill_section = self._get_skill_section(goal, task_type)
         has_skills = bool(skill_section and skill_section != "(none)")
 
         for step in range(self.max_turns):

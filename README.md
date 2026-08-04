@@ -225,3 +225,25 @@ logs/<run_id>/
 
 skills/<run_id>/skills.json      # 实验过程中积累的 skill 库
 ```
+
+## SkillRL adapter
+
+Run the direct SkillRL SkillBank integration with `-c skillrl`. It reuses
+the vendored SkillRL `SkillsOnlyMemory`, seed ALFWorld skills, retrieval
+formatter, and skill-update prompt/parser from `resource/skillrl`. The adapter supports
+`skill_evolving.rollouts_per_task`; each rollout remains an individual
+Bernoulli observation, while SPG performs one grouped MIRT update for the task
+selection. The original SkillRL GRPO/FSDP policy trainer is not run by this
+OpenAI-compatible environment runner.
+
+The initial, un-evolved ALFWorld SkillBank is copied independently into each
+run at `skills/<run_id>/skills.json`. Use the same bank for a Uniform control:
+
+```bash
+python spg_bandit/main.py -c skillrl --evaluating --no-wandb       # SPG-Bandit
+python spg_bandit/main.py -c skillrl_uniform --evaluating --no-wandb # Uniform
+```
+
+Both configs point to `resource/skillrl/memory_data/alfworld/claude_style_skills.json`.
+Set `skill_evolving.skill_bank_path` to another JSON SkillBank later without
+changing the agent implementation.

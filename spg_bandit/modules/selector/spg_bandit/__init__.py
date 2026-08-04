@@ -98,10 +98,25 @@ class MLPFeaturizer:
 
 # ── MIRT EM ─────────────────────────────────────────────────────────────────
 
-def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
+def fit_mirt_em(R, K, trials=None, max_iter=200, tol=1e-4, verbose=False, seed=None):
+    """Fit MIRT to grouped Bernoulli observations.
+
+    ``R[t, tau]`` is the number of successful rollouts selected at round t;
+    ``trials[t, tau]`` is the corresponding rollout count.  With ``trials``
+    omitted this is the original single-Bernoulli formulation.  Grouping is
+    important: repeated rollouts of one selected task share one pre-update
+    skill profile instead of being treated as sequential profile states.
+    """
     N_warm, M = R.shape
     obs_mask = ~np.isnan(R)
     R_filled = np.nan_to_num(R, nan=0.0)
+    if trials is None:
+        trials_filled = obs_mask.astype(float)
+    else:
+        if trials.shape != R.shape:
+            raise ValueError("trials must have the same shape as R")
+        trials_filled = np.nan_to_num(trials, nan=0.0)
+        obs_mask &= trials_filled > 0
     s_hist = np.full((N_warm, K), 0.5)
     rng = np.random.default_rng(seed)
     A = rng.uniform(0.5, 1.5, (M, K))
@@ -119,9 +134,10 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
             for _ in range(20):
                 theta = A[obs_t] @ s - d_vec[obs_t]
                 p = sigmoid(theta)
-                dif = R_filled[t, obs_t] - p
+                n = trials_filled[t, obs_t]
+                dif = R_filled[t, obs_t] - n * p
                 grad = A[obs_t].T @ dif - 1.0 * (s - 0.5)
-                Wd = p * (1 - p)
+                Wd = n * p * (1 - p)
                 hess = -A[obs_t].T @ (A[obs_t] * Wd[:, np.newaxis]) - np.eye(K)
                 s -= 0.5 * np.linalg.solve(hess, grad)
             s_hist[t] = np.clip(s, 0.0, 1.0)
@@ -132,11 +148,12 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
             if len(t_idx) == 0:
                 continue
             X, y = s_hist[t_idx], R_filled[t_idx, tau]
+            n = trials_filled[t_idx, tau]
 
             def nll(params):
                 a, b = params[:-1], params[-1]
                 p = sigmoid(X @ a - b)
-                ll = y @ np.log(p + 1e-15) + (1 - y) @ np.log(1 - p + 1e-15)
+                ll = y @ np.log(p + 1e-15) + (n - y) @ np.log(1 - p + 1e-15)
                 return -(ll - 0.01 * np.sum(a ** 2))
 
             res = minimize(
@@ -152,7 +169,8 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
             for tau in range(M):
                 if obs_mask[t, tau]:
                     p = sigmoid(A[tau] @ s_hist[t] - d_vec[tau])
-                    ll += R_filled[t, tau] * np.log(p + 1e-15) + (1 - R_filled[t, tau]) * np.log(1 - p + 1e-15)
+                    n = trials_filled[t, tau]
+                    ll += R_filled[t, tau] * np.log(p + 1e-15) + (n - R_filled[t, tau]) * np.log(1 - p + 1e-15)
         ll_history.append(ll)
         if verbose:
             print(f"  EM iter {it}: LL = {ll:.4f}")
@@ -167,15 +185,17 @@ def fit_mirt_em(R, K, max_iter=200, tol=1e-4, verbose=False, seed=None):
 
 # ── MIRT Online Bayesian Update ─────────────────────────────────────────────
 
-def online_profile_update(s_t, a_tau, d_tau, success, sigma_s=1.0):
-    """One-step MIRT Bayesian profile update (proposal §3.1.4)."""
+def online_profile_update(s_t, a_tau, d_tau, successes, trials=1, sigma_s=1.0):
+    """Grouped MIRT Bayesian profile update (proposal §3.1.4)."""
+    if trials <= 0 or not 0 <= successes <= trials:
+        raise ValueError("successes must be in [0, trials] and trials must be positive")
     K = len(s_t)
     s = s_t.copy()
     for _ in range(5):
         theta = a_tau @ s - d_tau
         p = sigmoid(theta)
-        grad = (float(success) - p) * a_tau - (1.0 / sigma_s ** 2) * (s - s_t)
-        W = p * (1 - p)
+        grad = (float(successes) - trials * p) * a_tau - (1.0 / sigma_s ** 2) * (s - s_t)
+        W = trials * p * (1 - p)
         hess = -W * np.outer(a_tau, a_tau) - (1.0 / sigma_s ** 2) * np.eye(K)
         s -= np.linalg.solve(hess, grad)
     return np.clip(s, 0.0, 1.0)
@@ -229,6 +249,8 @@ class SPGBanditSelector(BaseSelector):
         # Warmup data
         self._warmup_task_ids = []
         self._warmup_successes = []
+        self._warmup_trials = []
+        self._warmup_outcomes = []
         self._warmup_deltas = []
         self._warmup_embeds = []
 
@@ -248,6 +270,8 @@ class SPGBanditSelector(BaseSelector):
         data = {
             "task_ids": self._warmup_task_ids,
             "successes": self._warmup_successes,
+            "trials": self._warmup_trials,
+            "outcomes": self._warmup_outcomes,
             "deltas": [d.tolist() for d in self._warmup_deltas],
         }
         with open(path, "w") as f:
@@ -259,6 +283,11 @@ class SPGBanditSelector(BaseSelector):
             data = json.load(f)
         self._warmup_task_ids = data["task_ids"]
         self._warmup_successes = data["successes"]
+        self._warmup_trials = data.get("trials", [1] * len(self._warmup_task_ids))
+        self._warmup_outcomes = data.get(
+            "outcomes",
+            [[bool(success)] for success in self._warmup_successes],
+        )
         self._warmup_deltas = [np.array(d) for d in data["deltas"]]
         self._n_warm = len(self._warmup_task_ids)
         self._finalize_warmup()
@@ -299,17 +328,27 @@ class SPGBanditSelector(BaseSelector):
         return best_tid
 
     def update(self, task_id: int, result: dict):
-        success = result["success"]
+        outcomes = result.get("rollout_successes")
+        if outcomes is None:
+            outcomes = [bool(result["success"])]
+        outcomes = [bool(outcome) for outcome in outcomes]
+        if not outcomes:
+            raise ValueError("result.rollout_successes must not be empty")
+        successes, trials = sum(outcomes), len(outcomes)
 
         if self._step <= self._n_warm and not self._warmup_ready:
             self._warmup_task_ids.append(task_id)
-            self._warmup_successes.append(success)
+            self._warmup_successes.append(successes)
+            self._warmup_trials.append(trials)
+            self._warmup_outcomes.append(outcomes)
             self._warmup_deltas.append(result.get("delta", np.zeros(self._K)))
         elif self._warmup_ready:
             a_tau = self._A_fit[task_id]
             d_tau = self._d_fit[task_id]
             profile_before = self._profile.copy()
-            self._profile = online_profile_update(self._profile, a_tau, d_tau, success)
+            self._profile = online_profile_update(
+                self._profile, a_tau, d_tau, successes, trials,
+            )
 
             # Ridge regression: learn from real skill progress
             if self._last_phi is not None:
@@ -328,18 +367,31 @@ class SPGBanditSelector(BaseSelector):
         N = len(self._warmup_task_ids)
         if N == 0:
             raise ValueError("Cannot finalize SPG-Bandit warmup without observations")
+        # Compatibility with warmup JSON/checkpoints written before grouped
+        # rollout support, and with callers that populate legacy fields.
+        if len(self._warmup_trials) != N:
+            self._warmup_trials = [1] * N
+        if len(self._warmup_outcomes) != N:
+            self._warmup_outcomes = [
+                [bool(success)] for success in self._warmup_successes
+            ]
         if self._window_size > N:
             raise ValueError("window_size cannot exceed the number of warmup observations")
         R = np.full((N, self._task_pool.M), np.nan)
+        trials = np.full((N, self._task_pool.M), np.nan)
         for t, tid in enumerate(self._warmup_task_ids):
             R[t, tid] = float(self._warmup_successes[t])
+            trials[t, tid] = float(self._warmup_trials[t])
 
         # Sequential MIRT EM: run EM with cumulative data to compute per-step deltas
         profiles_before = []
         profile = np.zeros(self._K)
         deltas = []
         for t in range(N):
-            s_hist_t, *_ = fit_mirt_em(R[:t + 1], self._K, verbose=False, seed=self._seed)
+            s_hist_t, *_ = fit_mirt_em(
+                R[:t + 1], self._K, trials=trials[:t + 1],
+                verbose=False, seed=self._seed,
+            )
             new_profile = s_hist_t[-1]
             profiles_before.append(profile.copy())
             deltas.append(new_profile - profile)
@@ -347,7 +399,7 @@ class SPGBanditSelector(BaseSelector):
 
         # Final EM on all N (verbose, for logging + item params)
         s_hist, self._A_fit, self._d_fit, ll, ll_history = fit_mirt_em(
-            R, self._K, verbose=True, seed=self._seed,
+            R, self._K, trials=trials, verbose=True, seed=self._seed,
         )
         self._profile = s_hist[-1].copy()
         self._metrics["mirt_ll_history"] = [round(v, 4) for v in ll_history]
@@ -413,6 +465,8 @@ class SPGBanditSelector(BaseSelector):
         self._window.clear()
         self._warmup_task_ids.clear()
         self._warmup_successes.clear()
+        self._warmup_trials.clear()
+        self._warmup_outcomes.clear()
         self._warmup_deltas.clear()
         self._warmup_embeds.clear()
         self._A_fit = None
@@ -430,6 +484,8 @@ class SPGBanditSelector(BaseSelector):
             "d_fit": self._d_fit.tolist() if self._d_fit is not None else None,
             "task_ids": list(self._warmup_task_ids),
             "successes": list(self._warmup_successes),
+            "trials": list(self._warmup_trials),
+            "outcomes": list(self._warmup_outcomes),
             "window": [
                 {"phi": phi.tolist(), "delta": delta.tolist()}
                 for phi, delta in self._window
@@ -452,6 +508,10 @@ class SPGBanditSelector(BaseSelector):
         self._d_fit = np.array(data["d_fit"]) if data.get("d_fit") is not None else None
         self._warmup_task_ids = list(data["task_ids"])
         self._warmup_successes = list(data["successes"])
+        self._warmup_trials = list(data.get("trials", [1] * len(self._warmup_task_ids)))
+        self._warmup_outcomes = list(data.get(
+            "outcomes", [[bool(success)] for success in self._warmup_successes],
+        ))
         self._window_size = data.get("window_size", self._window_size)
         self._window = deque(
             (np.array(item["phi"]), np.array(item["delta"]))

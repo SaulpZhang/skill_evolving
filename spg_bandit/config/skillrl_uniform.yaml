@@ -1,0 +1,21 @@
+embedding_model: all-MiniLM-L6-v2
+embedding_type: local
+max_turns: 50
+
+evolve:
+  split: valid_seen
+
+evaluate:
+  split: valid_unseen
+
+selector: uniform
+
+skill_evolving:
+  name: skillrl
+  rollouts_per_task: 1
+  retrieval_mode: template
+  enable_dynamic_update: true
+  update_interval: 10
+  update_threshold: 0.4
+  max_new_skills: 3
+  skill_bank_path: resource/skillrl/memory_data/alfworld/claude_style_skills.json

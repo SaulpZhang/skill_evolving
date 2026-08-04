@@ -78,7 +78,7 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
     raise ValueError(f"Unknown selector: {name}")
 
 
-def create_skill_evolving(name, dataset, max_turns, records_dir=None):
+def create_skill_evolving(name, dataset, max_turns, records_dir=None, skill_config=None):
     """Instantiate a registered skill-evolving implementation by its package name."""
     if name == "simple_agent":
         implementation = SimpleAgent
@@ -104,6 +104,11 @@ def create_skill_evolving(name, dataset, max_turns, records_dir=None):
         kwargs["max_turns"] = max_turns
     if records_dir is not None and (accepts_kwargs or "records_dir" in parameters):
         kwargs["records_dir"] = records_dir
+    if skill_config is not None:
+        if accepts_kwargs or "config" in parameters:
+            kwargs["config"] = skill_config
+        elif "skill_config" in parameters:
+            kwargs["skill_config"] = skill_config
     return implementation(dataset, **kwargs)
 
 
@@ -118,6 +123,10 @@ def main():
 
     sel_name = config.get("selector", "uniform")
     agent_name = config.get("skill_evolving", {}).get("name", "unknown")
+    skill_config = config.get("skill_evolving", {})
+    rollouts_per_task = int(skill_config.get("rollouts_per_task", 1))
+    if rollouts_per_task < 1:
+        raise ValueError("skill_evolving.rollouts_per_task must be at least 1")
 
     run_id = args.run_id or f"{sel_name}_{agent_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     if not args.run_name:
@@ -188,7 +197,9 @@ def main():
 
     skills_dir = str(Path(__file__).parent.parent / "skills" / run_id)
     records_dir = str(log_base / sel_name / "messages")
-    method = create_skill_evolving(agent_name, evo_dataset, max_turns, records_dir)
+    method = create_skill_evolving(
+        agent_name, evo_dataset, max_turns, records_dir, skill_config,
+    )
     method.load_skills(skills_dir)
     selector = create_selector(
         sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm,
@@ -218,6 +229,7 @@ def main():
         logger.info(f"  (warmup: {warmup_steps} steps)")
 
     success_count = 0
+    rollout_count = 0
     step_records = []
     ckpt_interval = 30
     start_step = 0
@@ -233,6 +245,7 @@ def main():
             ckpt = json.load(open(ckpt_path))
             start_step = ckpt["step"]
             success_count = ckpt["success_count"]
+            rollout_count = ckpt.get("rollout_count", start_step)
             step_records = ckpt["step_records"]
             warmup_steps = ckpt["warmup_steps"]
             n_bandit = ckpt.get("n_bandit", n_bandit)
@@ -249,6 +262,7 @@ def main():
             data = {
                 "step": st, "total_steps": total_steps,
                 "warmup_steps": sw, "success_count": sb,
+                "rollout_count": rollout_count,
                 "step_records": sr, "n_bandit": n_bandit,
                 "n_eva": n_eva, "phase": phase,
             }
@@ -266,19 +280,24 @@ def main():
             is_warmup = step < warmup_steps
             task_id = selector.select(evo_pool)
             t0 = time.time()
-            result = method.execute(task_id)
+            result = method.execute(task_id, num_rollouts=rollouts_per_task)
             elapsed = time.time() - t0
             method.reflect(task_id, result)
             selector.update(task_id, result)
 
-            if result["success"]:
-                success_count += 1
+            successes = int(result.get("successes", int(bool(result["success"]))))
+            num_rollouts = int(result.get("num_rollouts", 1))
+            success_count += successes
+            rollout_count += num_rollouts
             bandit_done = step + 1
-            log_metrics({"evolving/success_rate": success_count / bandit_done, "_step_evolving": bandit_done})
+            log_metrics({"evolving/success_rate": success_count / rollout_count, "_step_evolving": bandit_done})
 
             record = {
                 "step": step, "selector": sel_name, "task_id": task_id,
                 "success": result["success"], "api_calls": result["api_calls"],
+                "successes": successes, "num_rollouts": num_rollouts,
+                "success_rate": successes / num_rollouts,
+                "rollout_successes": result.get("rollout_successes"),
                 "duration_s": round(elapsed, 1), "is_warmup": is_warmup,
             }
             step_records.append(record)
@@ -316,10 +335,13 @@ def main():
         logger.info(f"{'='*60}")
 
         method.reset()
-        eval_method = create_skill_evolving(agent_name, eva_dataset, max_turns)
+        eval_method = create_skill_evolving(
+            agent_name, eva_dataset, max_turns, skill_config=skill_config,
+        )
         eval_method.load_skills(skills_dir)
         evaluating_selector = UniformSelector()
         evaluating_success = 0
+        evaluating_rollouts = 0
         evaluating_records = []
 
         eva_start = 0
@@ -329,14 +351,19 @@ def main():
             for step in range(eva_start, n_eva):
                 task_id = evaluating_selector.select(eva_pool)
                 t0 = time.time()
-                result = eval_method.execute(task_id)
+                result = eval_method.execute(task_id, num_rollouts=rollouts_per_task)
                 elapsed = time.time() - t0
-                if result["success"]:
-                    evaluating_success += 1
-                log_metrics({"evaluating/success_rate": evaluating_success / (step + 1), "_step_evaluating": step + 1})
+                successes = int(result.get("successes", int(bool(result["success"]))))
+                num_rollouts = int(result.get("num_rollouts", 1))
+                evaluating_success += successes
+                evaluating_rollouts += num_rollouts
+                log_metrics({"evaluating/success_rate": evaluating_success / evaluating_rollouts, "_step_evaluating": step + 1})
                 evaluating_records.append({
                     "step": step, "task_id": task_id,
                     "success": result["success"], "api_calls": result["api_calls"],
+                    "successes": successes, "num_rollouts": num_rollouts,
+                    "success_rate": successes / num_rollouts,
+                    "rollout_successes": result.get("rollout_successes"),
                     "duration_s": round(elapsed, 1),
                 })
                 if step % 5 == 0 or step == n_eva - 1:
@@ -359,18 +386,19 @@ def main():
             recorder.append_jsonl("evaluating_steps", rec)
         recorder.save_json("evaluating_result", {
             "label": sel_name, "success": evaluating_success,
-            "total": n_eva, "api_calls": evaluating_api,
+            "total": evaluating_rollouts, "api_calls": evaluating_api,
         })
-        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{n_eva} "
+        logger.info(f"\n  [evaluating] Done: {evaluating_success}/{evaluating_rollouts} "
                     f"success | {evaluating_api} API calls")
 
     bandit_steps = [r for r in step_records if not r["is_warmup"]]
-    bandit_success = sum(1 for r in bandit_steps if r["success"])
+    bandit_success = sum(int(r.get("successes", int(bool(r["success"])))) for r in bandit_steps)
+    bandit_rollouts = sum(int(r.get("num_rollouts", 1)) for r in bandit_steps)
     total_api = sum(r["api_calls"] for r in bandit_steps)
 
     result_entry = {
         "name": sel_name, "success": bandit_success,
-        "total": len(bandit_steps), "api_calls": total_api,
+        "total": bandit_rollouts, "api_calls": total_api,
     }
 
     recorder.save_json("comparison", {
@@ -380,7 +408,7 @@ def main():
     })
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"[{sel_name}] Done: {bandit_success}/{len(bandit_steps)} "
+    logger.info(f"[{sel_name}] Done: {bandit_success}/{bandit_rollouts} "
                 f"success | {total_api} API calls")
 
     finish_wandb()

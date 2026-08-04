@@ -1,0 +1,31 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 50
+
+evolve:
+  split: valid_seen
+
+evaluate:
+  split: valid_unseen
+
+selector: spg_bandit
+
+skill_evolving:
+  name: skillrl
+  # One selected task can be evaluated by several independent trajectories.
+  # They are retained as individual Bernoulli outcomes for grouped MIRT.
+  rollouts_per_task: 1
+  retrieval_mode: template
+  enable_dynamic_update: true
+  update_interval: 10
+  update_threshold: 0.4
+  max_new_skills: 3
+  skill_bank_path: resource/skillrl/memory_data/alfworld/claude_style_skills.json
+
+spg_bandit:
+  warmup_ratio: 0.4
+  window_size: 20
+  K: 4
+  alpha: 0.1
+  d_f: 16
+  tau: 0.1
