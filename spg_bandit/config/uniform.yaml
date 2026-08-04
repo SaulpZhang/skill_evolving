@@ -1,4 +1,4 @@
-embedding_model: all-MiniLM-L6-v2
+embedding_model: Qwen/Qwen3-Embedding-0.6B
 embedding_type: local
 max_turns: 50
 
