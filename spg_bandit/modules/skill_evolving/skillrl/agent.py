@@ -179,7 +179,13 @@ class SkillRLAgent(SimpleAgent):
     def execute(self, task_id: int, num_rollouts: int = 1) -> dict:
         if num_rollouts < 1:
             raise ValueError("num_rollouts must be at least 1")
-        rollout_results = [super().execute(task_id) for _ in range(num_rollouts)]
+        # Do not use zero-argument ``super()`` inside a list comprehension.
+        # Python 3 creates a separate comprehension scope, so the implicit
+        # ``__class__``/``self`` pair is lost and raises
+        # ``TypeError: super(type, obj)`` on the first rollout.
+        rollout_results = [
+            SimpleAgent.execute(self, task_id) for _ in range(num_rollouts)
+        ]
         outcomes = [bool(result["success"]) for result in rollout_results]
         successes = sum(outcomes)
         representative = rollout_results[0]

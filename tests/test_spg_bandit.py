@@ -248,5 +248,31 @@ class DatasetInterfaceTests(unittest.TestCase):
         self.assertTrue(handle.closed)
 
 
+class SkillRLAdapterTests(unittest.TestCase):
+    def test_grouped_rollouts_do_not_call_zero_argument_super_in_comprehension(self):
+        from spg_bandit.modules.skill_evolving.skillrl.agent import SkillRLAgent
+
+        fake_rollout = {
+            "success": True,
+            "trajectory": "ok",
+            "actions": [],
+            "api_calls": 1,
+        }
+        with patch("spg_bandit.modules.skill_evolving.simple_agent.agent.OpenAI"):
+            agent = SkillRLAgent(
+                _FakeDataset({}),
+                config={"enable_dynamic_update": False},
+            )
+        with patch(
+            "spg_bandit.modules.skill_evolving.skillrl.agent.SimpleAgent.execute",
+            return_value=fake_rollout,
+        ) as execute:
+            result = agent.execute(0, num_rollouts=2)
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(result["successes"], 2)
+        self.assertEqual(result["num_rollouts"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
