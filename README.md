@@ -68,6 +68,9 @@ ssh -L 8000:127.0.0.1:8000 root@connect.bjb1.seetacloud.com
 # 全局设置
 embedding_model: all-MiniLM-L6-v2   # 任务 embedding 模型
 embedding_type: local               # local / openai / ollama
+embedding_cache: true               # 复用项目 cache/ 中已保存的 embedding
+# embedding_cache_dir: cache        # 可选；相对项目根目录的自定义目录
+# embedding_cache_save_interval: 100 # 每新增多少条后落盘一次
 max_turns: 51                       # 每任务最大执行步数
 
 # 数据集（省略时默认为 alfworld）

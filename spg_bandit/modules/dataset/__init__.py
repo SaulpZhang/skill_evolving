@@ -1,10 +1,11 @@
 from .base import BaseDataset, TaskPool
 from .base import EnvironmentState, EnvironmentStep
+from .embedding_cache import EmbeddingCache
 from .registry import available_datasets, create_dataset, get_dataset_class, register_dataset
 
 __all__ = [
     "ALFWorldDataset", "BaseDataset", "EnvironmentState", "EnvironmentStep",
-    "TaskPool", "available_datasets", "create_dataset", "get_dataset_class",
+    "TaskPool", "EmbeddingCache", "available_datasets", "create_dataset", "get_dataset_class",
     "register_dataset",
 ]
 

@@ -184,6 +184,15 @@ def main():
                 "embedding_model", cfg.get("embedding_model", "all-MiniLM-L6-v2")
             ),
             "embedding_type": config.get("embedding_type", cfg.get("embedding_type", "local")),
+            "embedding_url": config.get("embedding_url", cfg.get("embedding_url", "")),
+            "embedding_cache": config.get("embedding_cache", cfg.get("embedding_cache", True)),
+            "embedding_cache_dir": config.get(
+                "embedding_cache_dir", cfg.get("embedding_cache_dir")
+            ),
+            "embedding_cache_save_interval": config.get(
+                "embedding_cache_save_interval",
+                cfg.get("embedding_cache_save_interval", 100),
+            ),
             "max_turns": config.get("max_turns", cfg.get("max_turns", 51)),
         })
         cfg.update(overrides)

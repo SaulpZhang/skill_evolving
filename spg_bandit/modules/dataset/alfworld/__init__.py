@@ -13,6 +13,7 @@ from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInf
 from spg_bandit.modules.dataset.base import (
     BaseDataset, EnvironmentState, EnvironmentStep, TaskPool,
 )
+from spg_bandit.modules.dataset.embedding_cache import EmbeddingCache
 
 
 TASK_TYPES = [
@@ -109,6 +110,11 @@ class ALFWorldDataset(BaseDataset):
         self._embedding_model = config.get("embedding_model", "all-MiniLM-L6-v2")
         self._embedding_type = config.get("embedding_type", "local")  # local / ollama / openai
         self._embedding_url = config.get("embedding_url", "")
+        self._embedding_cache_enabled = bool(config.get("embedding_cache", True))
+        self._embedding_cache_dir = config.get("embedding_cache_dir")
+        self._embedding_cache_save_interval = max(
+            1, int(config.get("embedding_cache_save_interval", 100))
+        )
         self._pool: TaskPool | None = None
         self._task_list: list[dict] = []
 
@@ -272,10 +278,44 @@ class ALFWorldDataset(BaseDataset):
         self._task_list = task_list
         print(f"ALFWorld ({self._split}): {len(task_list)} tasks loaded")
         print(f"  Generating embeddings ({self._embedding_type}: {self._embedding_model})...")
+        embedding_cache = EmbeddingCache(
+            cache_dir=self._embedding_cache_dir,
+            namespace=self.name,
+            config={
+                "embedding_type": self._embedding_type,
+                "embedding_model": self._embedding_model,
+                "embedding_url": self._embedding_url,
+            },
+            enabled=self._embedding_cache_enabled,
+        )
         embeddings = []
-        for t in task_list:
-            emb = _get_embedding(t["goal"], self._embedding_model, self._embedding_url, self._embedding_type)
-            embeddings.append(emb)
+        cache_hits = 0
+        cache_misses = 0
+        try:
+            for t in task_list:
+                emb = embedding_cache.get(t["goal"])
+                if emb is not None:
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
+                    emb = _get_embedding(
+                        t["goal"], self._embedding_model,
+                        self._embedding_url, self._embedding_type,
+                    )
+                    embedding_cache.put(t["goal"], emb)
+                    if cache_misses % self._embedding_cache_save_interval == 0:
+                        embedding_cache.save()
+                embeddings.append(emb)
+        finally:
+            # Preserve work already completed if an embedding provider fails
+            # partway through a large split; the next run can resume from it.
+            embedding_cache.save()
+        if self._embedding_cache_enabled:
+            print(
+                f"  Embedding cache: {cache_hits} hits, {cache_misses} misses "
+                f"({embedding_cache.size} entries) -> {embedding_cache.path}",
+                flush=True,
+            )
         self._pool = TaskPool(
             embeddings=np.array(embeddings),
             metadata=task_list,

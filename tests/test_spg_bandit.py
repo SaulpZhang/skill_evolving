@@ -9,6 +9,7 @@ import numpy as np
 
 from spg_bandit.modules.dataset import create_dataset, register_dataset
 from spg_bandit.modules.dataset.base import BaseDataset, TaskPool
+from spg_bandit.modules.dataset.embedding_cache import EmbeddingCache
 from spg_bandit.modules.selector.spg_bandit import (
     SPGBanditSelector, online_profile_update,
 )
@@ -132,6 +133,39 @@ class ConfigResolutionTests(unittest.TestCase):
             configured_path = Path(config["skill_evolving"]["skill_bank_path"])
             self.assertEqual(configured_path.name, "claude_style_skills.json")
             self.assertEqual(configured_path.parts[:2], ("resource", "skillrl"))
+
+
+class EmbeddingCacheTests(unittest.TestCase):
+    def test_embedding_cache_persists_and_isolated_by_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = EmbeddingCache(
+                directory, namespace="alfworld",
+                config={"embedding_model": "model-a", "embedding_type": "local"},
+            )
+            first.put("task A", [1.0, 2.0])
+            self.assertTrue(first.save())
+
+            second = EmbeddingCache(
+                directory, namespace="alfworld",
+                config={"embedding_model": "model-a", "embedding_type": "local"},
+            )
+            np.testing.assert_array_equal(second.get("task A"), [1.0, 2.0])
+            self.assertIsNone(second.get("task B"))
+
+            different_model = EmbeddingCache(
+                directory, namespace="alfworld",
+                config={"embedding_model": "model-b", "embedding_type": "local"},
+            )
+            self.assertIsNone(different_model.get("task A"))
+
+    def test_disabled_embedding_cache_never_reads_or_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = EmbeddingCache(
+                directory, namespace="alfworld", enabled=False,
+            )
+            cache.put("task A", [1.0, 2.0])
+            self.assertFalse(cache.save())
+            self.assertIsNone(cache.get("task A"))
 
     def test_skillrl_runtime_sources_are_vendored_under_resource(self):
         project_root = Path(__file__).resolve().parents[1]
