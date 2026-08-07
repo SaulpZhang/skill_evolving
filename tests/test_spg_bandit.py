@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from spg_bandit.modules.dataset.base import TaskPool
+from spg_bandit.modules.dataset import create_dataset, register_dataset
+from spg_bandit.modules.dataset.base import BaseDataset, TaskPool
 from spg_bandit.modules.selector.spg_bandit import (
     SPGBanditSelector, online_profile_update,
 )
@@ -142,6 +143,23 @@ class ConfigResolutionTests(unittest.TestCase):
         ):
             self.assertTrue((resource_root / relative_path).is_file())
 
+    def test_skillopt_configs_use_vendored_runtime_and_gate_split(self):
+        project_root = Path(__file__).resolve().parents[1]
+        skillopt_root = project_root / "resource" / "skillopt"
+        self.assertTrue((skillopt_root / "gradient" / "reflect.py").is_file())
+        self.assertTrue((skillopt_root / "envs" / "alfworld" / "skills" / "initial.md").is_file())
+
+        for config_name, selector_name in (("skillopt", "spg_bandit"), ("skillopt_uniform", "uniform")):
+            config = load_config(config_name)
+            self.assertEqual(config["selector"], selector_name)
+            self.assertEqual(config["skill_evolving"]["name"], "skillopt")
+            self.assertEqual(config["skill_selection"]["split"], "valid_seen")
+            self.assertEqual(config["evaluate"]["split"], "valid_unseen")
+
+        # The execution package must not contain a hard-coded checkout path.
+        for source in skillopt_root.rglob("*.py"):
+            self.assertNotIn("docs/SkillOpt", source.read_text(encoding="utf-8"))
+
 
 class WarmupSamplingTests(unittest.TestCase):
     def test_sampling_balances_task_types_without_repeating_tasks(self):
@@ -161,6 +179,73 @@ class WarmupSamplingTests(unittest.TestCase):
         self.assertEqual(len(sampled), 5)
         self.assertEqual(len(sampled), len(set(sampled)))
         self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+
+    def test_sampling_supports_string_types_without_ids_in_metadata(self):
+        pool = TaskPool(
+            embeddings=np.zeros((4, 2)),
+            metadata=[
+                {"task_type": "web", "goal": "a"},
+                {"task_type": "web", "goal": "b"},
+                {"task_type": "search", "goal": "c"},
+                {"task_type": "tool", "goal": "d"},
+            ],
+        )
+        sampled = sample_type_balanced_task_ids(pool, 4, random.Random(3))
+        self.assertEqual(sorted(sampled), [0, 1, 2, 3])
+        self.assertEqual([item["id"] for item in pool.metadata], [0, 1, 2, 3])
+
+
+class _FakeEnv:
+    def __init__(self):
+        self.closed = False
+
+    def reset(self):
+        return "start", {"actions": ["finish"]}
+
+    def step(self, action):
+        self.action = action
+        return "done", 1.0, True, {"success": True, "actions": []}
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeDataset(BaseDataset):
+    name = "fake"
+
+    def __init__(self, config):
+        self._pool = TaskPool(
+            embeddings=np.zeros((1, 2)),
+            metadata=[{"goal": "finish the task", "task_type": "toy"}],
+        )
+
+    @property
+    def task_pool(self):
+        return self._pool
+
+    def get_task_goal(self, task_id):
+        return self._pool.get_goal(task_id)
+
+    def load(self):
+        return None
+
+    def create_env(self, task_id):
+        return _FakeEnv()
+
+
+class DatasetInterfaceTests(unittest.TestCase):
+    def test_registry_and_generic_gym_protocol(self):
+        register_dataset("fake", _FakeDataset)
+        dataset = create_dataset("fake", {})
+        handle = dataset.create_env(0)
+        state = dataset.reset_env(handle)
+        self.assertEqual(state.observation, "start")
+        self.assertEqual(state.admissible_actions, ["finish"])
+        transition = dataset.step_env(handle, "finish")
+        self.assertTrue(transition.success)
+        self.assertTrue(transition.done)
+        dataset.close_env(handle)
+        self.assertTrue(handle.closed)
 
 
 if __name__ == "__main__":

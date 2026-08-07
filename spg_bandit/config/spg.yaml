@@ -2,6 +2,9 @@ embedding_model: Qwen/Qwen3-Embedding-0.6B
 embedding_type: local
 max_turns: 50
 
+dataset:
+  name: alfworld
+
 evolve:
   split: train
 

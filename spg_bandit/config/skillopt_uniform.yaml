@@ -1,0 +1,33 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 50
+
+dataset:
+  name: alfworld
+
+evolve:
+  split: train
+
+skill_selection:
+  split: valid_seen
+
+evaluate:
+  split: valid_unseen
+
+selector: uniform
+
+skill_evolving:
+  name: skillopt
+  rollouts_per_task: 1
+  batch_size: 8
+  reflection_minibatch_size: 8
+  edit_budget: 4
+  merge_batch_size: 8
+  reflection_workers: 1
+  failure_only: false
+  update_mode: patch
+  selection_size: 24
+  selection_rollouts: 1
+  gate_metric: hard
+  optimizer_backend: openai_compatible
+  initial_skill_path: resource/skillopt/envs/alfworld/skills/initial.md

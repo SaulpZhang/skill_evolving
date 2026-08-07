@@ -132,7 +132,11 @@ class SkillRLAgent(SimpleAgent):
                 if not seed_bank.is_absolute():
                     seed_bank = _PROJECT_ROOT / seed_bank
             else:
-                seed_bank = _SKILLRL_ROOT / "memory_data" / "alfworld" / "claude_style_skills.json"
+                dataset_name = str(getattr(self._dataset, "name", "dataset")).lower()
+                seed_bank = (
+                    _SKILLRL_ROOT / "memory_data" / dataset_name
+                    / "claude_style_skills.json"
+                )
             if not seed_bank.is_file():
                 raise FileNotFoundError(
                     f"SkillBank not found: {seed_bank}. "

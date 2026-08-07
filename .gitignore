@@ -68,3 +68,5 @@ record/
 *.pdf
 
 tests/
+
+data/

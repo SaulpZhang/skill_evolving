@@ -16,15 +16,18 @@ def sample_type_balanced_task_ids(task_pool: TaskPool, n_samples: int,
     if n_samples < 0:
         raise ValueError("n_samples must be non-negative")
 
-    type_to_ids: dict[int, list[int]] = {}
-    for item in task_pool.metadata:
-        type_to_ids.setdefault(item["dim"], []).append(item["id"])
+    type_to_ids = {}
+    for task_id in range(task_pool.M):
+        task_type = task_pool.get_task_type(task_id)
+        type_to_ids.setdefault(task_type, []).append(task_id)
     if n_samples and not type_to_ids:
         raise ValueError("Cannot sample warmup tasks from an empty task pool")
     if n_samples > task_pool.M:
         raise ValueError("Warmup samples cannot exceed the number of evolve tasks")
 
-    task_types = sorted(type_to_ids)
+    # Preserve adapter-provided order and support mixed category types (for
+    # example integer ALFWorld dimensions and string WebShop categories).
+    task_types = list(type_to_ids)
     counts = {task_type: 0 for task_type in task_types}
     for _ in range(n_samples):
         available = [

@@ -41,6 +41,11 @@ REFLECTION_BASE_URL=
 REFLECTION_API_KEY=
 REFLECTION_MODEL=
 
+# SkillOpt 可选的独立 optimizer endpoint；不设置则复用 reflection/target
+OPTIMIZER_BASE_URL=
+OPTIMIZER_API_KEY=
+OPTIMIZER_MODEL=
+
 # W&B（可选）
 wandb_key=your-wandb-key
 ```
@@ -65,6 +70,12 @@ embedding_model: all-MiniLM-L6-v2   # 任务 embedding 模型
 embedding_type: local               # local / openai / ollama
 max_turns: 51                       # 每任务最大执行步数
 
+# 数据集（省略时默认为 alfworld）
+dataset:
+  name: alfworld
+  # params:                         # 可选：传给数据集 adapter 的参数
+  #   data_root: /path/to/data
+
 # Evolving（bandit）阶段
 evolve:
   split: valid_seen
@@ -72,6 +83,10 @@ evolve:
 # Evaluation 阶段
 evaluate:
   split: valid_unseen               # 评估用 held-out split
+
+# SkillOpt gate（仅 skill_evolving.name: skillopt 使用）
+skill_selection:
+  split: valid_seen                 # 固定 gate pool，不进入 selector
 
 # 实验随机种子
 experiment:
@@ -162,6 +177,9 @@ class BaseSkillEvolving(ABC):
     
     def reflect(self, task_id: int, result: dict):
         """执行后反思，更新技能库（可选）"""
+
+    def finalize(self):
+        """实验结束时刷新批量反思缓存（可选）"""
     
     def get_usage(self) -> dict:
         """返回 API 调用统计"""
@@ -209,6 +227,50 @@ skill_evolving:
 
 框架会自动处理数据集加载、selector 调度、日志记录和 W&B 追踪。
 
+## 扩展数据集
+
+数据集通过 registry 加载。selector 不依赖具体环境，只要求 adapter
+提供 `TaskPool` 和统一的环境协议：
+
+```python
+from spg_bandit.modules.dataset.base import BaseDataset, TaskPool
+
+class MyDataset(BaseDataset):
+    name = "my_dataset"
+
+    @property
+    def task_pool(self) -> TaskPool:
+        ...  # embeddings + metadata["goal"] + metadata["task_type"]
+
+    def get_task_goal(self, task_id: int) -> str: ...
+    def load(self): ...
+    def create_env(self, task_id: int): ...
+
+    # 如果环境遵循 Gym/Gymnasium，可直接使用 BaseDataset 的 reset_env、
+    # step_env 和 close_env；否则只需重写这些方法。
+    # 需要自定义提示词时重写 build_action_prompt；需要自定义 skill
+    # 分类时重写 get_skill_task_type。
+```
+
+注册后即可在配置中使用：
+
+```python
+from spg_bandit.modules.dataset import register_dataset
+register_dataset("my_dataset", MyDataset)
+```
+
+```yaml
+dataset:
+  name: my_dataset
+  params:
+    data_root: /path/to/data
+```
+
+也可以直接使用外部类路径：
+`dataset.name: my_package.my_module:MyDataset`。如果需要 WebShop、Search
+等非 Gym 环境，只需在对应 adapter 中把动作、成功判断和轨迹格式映射到
+`EnvironmentState`/`EnvironmentStep`，selector 和 warmup 无需修改。
+
 ## 输出结构
 
 ```
@@ -222,8 +284,14 @@ logs/<run_id>/
     comparison.json              # 汇总结果
   <selector>/
     messages/                    # 每步 API 请求/响应 和 reflection 记录
+    skillopt/
+      predictions/               # SkillOpt 分析用 conversation.json
+      patches/                   # 每个批次的候选 patch
+      updates.jsonl              # aggregate/update/gate 记录
 
-skills/<run_id>/skills.json      # 实验过程中积累的 skill 库
+skills/<run_id>/skills.json      # SkillRL SkillBank（SkillRL 配置）
+skills/<run_id>/best_skill.md    # SkillOpt gate 接受的最佳 Markdown skill
+skills/<run_id>/current_skill.md # SkillOpt 当前 Markdown skill
 ```
 
 ## SkillRL adapter
@@ -247,3 +315,27 @@ python spg_bandit/main.py -c skillrl_uniform --evaluating --no-wandb # Uniform
 Both configs point to `resource/skillrl/memory_data/alfworld/claude_style_skills.json`.
 Set `skill_evolving.skill_bank_path` to another JSON SkillBank later without
 changing the agent implementation.
+
+## SkillOpt adapter
+
+SkillOpt is available as a separate backend through `-c skillopt` and
+`-c skillopt_uniform`. The runner keeps task selection in SPG-Bandit, while
+the vendored SkillOpt core performs minibatch reflection, patch aggregation,
+bounded edit selection, and a fixed validation-gate check. The gate pool is
+configured by `skill_selection.split` and is never sent to the selector or
+the final evaluation split.
+
+All runtime SkillOpt files are vendored under `resource/skillopt`; the
+upstream checkout in `docs` is only a development reference and is not
+imported. The default optimizer endpoint falls back to
+`REFLECTION_BASE_URL`/`REFLECTION_MODEL` and then the target `LLM_*` variables.
+
+```bash
+python spg_bandit/main.py -c skillopt --evaluating --no-wandb       # SPG
+python spg_bandit/main.py -c skillopt_uniform --evaluating --no-wandb # Uniform
+```
+
+The initial ALFWorld skill is
+`resource/skillopt/envs/alfworld/skills/initial.md`. Set
+`skill_evolving.initial_skill_path` (or inline `initial_skill`) to use a
+different Markdown skill without changing the adapter.

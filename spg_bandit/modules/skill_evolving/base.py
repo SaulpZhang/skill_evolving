@@ -30,6 +30,14 @@ class BaseSkillEvolving(ABC):
         Called by orchestrator after execute(). Default no-op.
         """
 
+    def finalize(self):
+        """Optional end-of-run hook.
+
+        Batch-oriented methods can use this hook to flush buffered evidence
+        after the orchestrator has selected its last task.  Existing methods
+        remain step-local and therefore inherit the no-op implementation.
+        """
+
     @abstractmethod
     def get_usage(self) -> dict:
         """Return token/call usage info."""

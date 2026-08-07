@@ -1,6 +1,12 @@
 from .base import BaseDataset, TaskPool
+from .base import EnvironmentState, EnvironmentStep
+from .registry import available_datasets, create_dataset, get_dataset_class, register_dataset
 
-__all__ = ["ALFWorldDataset", "BaseDataset", "TaskPool"]
+__all__ = [
+    "ALFWorldDataset", "BaseDataset", "EnvironmentState", "EnvironmentStep",
+    "TaskPool", "available_datasets", "create_dataset", "get_dataset_class",
+    "register_dataset",
+]
 
 
 def __getattr__(name):

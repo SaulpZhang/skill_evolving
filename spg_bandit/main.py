@@ -36,7 +36,7 @@ from spg_bandit.utils.logger import setup_logger
 from spg_bandit.utils.recorder import Recorder
 from spg_bandit.utils.wandb import init_wandb, log_metrics, finish_wandb
 from spg_bandit.utils.warmup import sample_type_balanced_task_ids
-from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
+from spg_bandit.modules.dataset import create_dataset
 from spg_bandit.modules.skill_evolving import BaseSkillEvolving, SimpleAgent
 from spg_bandit.modules.selector import UniformSelector, SPGBanditSelector
 
@@ -59,7 +59,7 @@ def build_parser():
 
 
 def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
-                    window_size=20):
+                    window_size=20, task_type_count=None):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector()
@@ -70,15 +70,18 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
             alpha=params.get("alpha", 0.1),
             tau=params.get("tau", 0.1),
             d_f=params.get("d_f", 16),
-            K=params.get("K", 6),
             seed=config.get("experiment", {}).get("seed", 42),
             warmup_ids=warmup_ids,
             window_size=window_size,
+            K=params.get("K", task_type_count or 6),
         )
     raise ValueError(f"Unknown selector: {name}")
 
 
-def create_skill_evolving(name, dataset, max_turns, records_dir=None, skill_config=None):
+def create_skill_evolving(
+    name, dataset, max_turns, records_dir=None, skill_config=None,
+    selection_dataset=None,
+):
     """Instantiate a registered skill-evolving implementation by its package name."""
     if name == "simple_agent":
         implementation = SimpleAgent
@@ -104,6 +107,10 @@ def create_skill_evolving(name, dataset, max_turns, records_dir=None, skill_conf
         kwargs["max_turns"] = max_turns
     if records_dir is not None and (accepts_kwargs or "records_dir" in parameters):
         kwargs["records_dir"] = records_dir
+    if selection_dataset is not None and (
+        accepts_kwargs or "selection_dataset" in parameters
+    ):
+        kwargs["selection_dataset"] = selection_dataset
     if skill_config is not None:
         if accepts_kwargs or "config" in parameters:
             kwargs["config"] = skill_config
@@ -123,7 +130,10 @@ def main():
 
     sel_name = config.get("selector", "uniform")
     agent_name = config.get("skill_evolving", {}).get("name", "unknown")
-    skill_config = config.get("skill_evolving", {})
+    skill_config = dict(config.get("skill_evolving", {}) or {})
+    # Pass the experiment seed into batch-oriented methods as well as the
+    # selector, unless a method explicitly requests its own seed.
+    skill_config.setdefault("seed", config.get("experiment", {}).get("seed", 42))
     rollouts_per_task = int(skill_config.get("rollouts_per_task", 1))
     if rollouts_per_task < 1:
         raise ValueError("skill_evolving.rollouts_per_task must be at least 1")
@@ -135,6 +145,22 @@ def main():
     logger = setup_logger(run_id, args.run_name, log_file_enabled=args.log_file)
     logger.info(f"Config: {args.config}")
     logger.info(f"Selector: {sel_name}")
+
+    dataset_setting = config.get("dataset", "alfworld")
+    if isinstance(dataset_setting, str):
+        dataset_name = dataset_setting
+        dataset_params = {}
+    elif isinstance(dataset_setting, dict):
+        dataset_name = dataset_setting.get("name", "alfworld")
+        dataset_params = dict(dataset_setting.get("params", {}) or {})
+        # Also accept flat dataset options for concise configs.  ``name`` and
+        # ``params`` are registry metadata, not constructor arguments.
+        for key, value in dataset_setting.items():
+            if key not in {"name", "params"}:
+                dataset_params.setdefault(key, value)
+    else:
+        raise ValueError("dataset must be a name or a mapping with a 'name' field")
+    logger.info(f"Dataset: {dataset_name}")
 
     wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb, resume=args.resume)
 
@@ -150,29 +176,52 @@ def main():
     logger.info(f"Records: {log_base / 'records'}")
 
     def _make_cfg(overrides):
-        cfg = {
-            "embedding_model": config.get("embedding_model", "all-MiniLM-L6-v2"),
-            "embedding_type": config.get("embedding_type", "local"),
-            "max_turns": config.get("max_turns", 51),
-            "task_types": "all",
-            "split": "valid_seen",
-        }
+        cfg = dict(dataset_params)
+        cfg.setdefault("task_types", "all")
+        cfg.setdefault("split", "valid_seen")
+        cfg.update({
+            "embedding_model": config.get(
+                "embedding_model", cfg.get("embedding_model", "all-MiniLM-L6-v2")
+            ),
+            "embedding_type": config.get("embedding_type", cfg.get("embedding_type", "local")),
+            "max_turns": config.get("max_turns", cfg.get("max_turns", 51)),
+        })
         cfg.update(overrides)
         return cfg
 
     logger.info("Loading evolve dataset...")
     evo_cfg = config.get("evolve", {})
-    evo_dataset = ALFWorldDataset(_make_cfg({
-        "split": evo_cfg.get("split", "valid_seen"),
-    }))
+    evo_overrides = dict(evo_cfg) if isinstance(evo_cfg, dict) else {}
+    evo_overrides.setdefault("split", "valid_seen")
+    evo_dataset = create_dataset(dataset_name, _make_cfg(evo_overrides))
     evo_pool = evo_dataset.task_pool
 
     logger.info("Loading evaluate dataset...")
     eva_cfg = config.get("evaluate", {})
-    eva_dataset = ALFWorldDataset(_make_cfg({
-        "split": eva_cfg.get("split", "valid_seen"),
-    }))
+    eva_overrides = dict(eva_cfg) if isinstance(eva_cfg, dict) else {}
+    eva_overrides.setdefault("split", "valid_seen")
+    eva_dataset = create_dataset(dataset_name, _make_cfg(eva_overrides))
     eva_pool = eva_dataset.task_pool
+
+    # SkillOpt uses a fixed, non-selector pool for its validation gate.  Keep
+    # this split separate from both the evolve and evaluate pools so neither
+    # selector receives gate tasks as evidence and the final test remains
+    # untouched.  Only dataset fields are forwarded; selection controls such
+    # as ``selection_size`` stay in the SkillOpt config.
+    skill_selection_dataset = None
+    if agent_name == "skillopt":
+        selection_cfg = config.get("skill_selection", {})
+        if not isinstance(selection_cfg, dict):
+            raise ValueError("skill_selection must be a mapping")
+        selection_split = selection_cfg.get("split", "valid_seen")
+        logger.info("Loading SkillOpt selection dataset (%s)...", selection_split)
+        skill_selection_dataset = create_dataset(
+            dataset_name,
+            _make_cfg({"split": selection_split}),
+        )
+        # Force pool construction here so the fixed ids are known before the
+        # agent starts consuming target-model calls.
+        _ = skill_selection_dataset.task_pool
 
     n_bandit = evo_pool.M
     n_eva = eva_pool.M
@@ -199,11 +248,12 @@ def main():
     records_dir = str(log_base / sel_name / "messages")
     method = create_skill_evolving(
         agent_name, evo_dataset, max_turns, records_dir, skill_config,
+        selection_dataset=skill_selection_dataset,
     )
     method.load_skills(skills_dir)
     selector = create_selector(
         sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm,
-        window_size=window_size,
+        window_size=window_size, task_type_count=len(evo_pool.task_types),
     )
 
     if selector.needs_warmup:
@@ -316,6 +366,11 @@ def main():
         raise
 
     _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
+
+    # Batch optimizers (SkillOpt) may have a partial minibatch left after the
+    # final selected task.  Flush it before saving metrics or evaluating the
+    # resulting skill.
+    method.finalize()
 
     if hasattr(selector, "get_metrics"):
         metrics = selector.get_metrics()

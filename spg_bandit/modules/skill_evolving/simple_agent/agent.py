@@ -1,4 +1,4 @@
-"""Simple skill evolving agent for ALFWorld — SkillRL-inspired design.
+"""Generic text-action skill-evolving agent — SkillRL-inspired design.
 
 - Structured prompt: system with Retrieved Relevant Experience, per-turn Current Progress
 - Model outputs <think>reasoning</think><action>command</action>
@@ -15,7 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from spg_bandit.modules.dataset.alfworld import ALFWorldDataset
+from spg_bandit.modules.dataset.base import BaseDataset
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving
 from spg_bandit.modules.skill_evolving.simple_agent.skill_manager import SkillManager
 
@@ -69,9 +69,9 @@ Return ONLY the JSON object, no other text."""
 
 
 class SimpleAgent(BaseSkillEvolving):
-    """ALFWorld agent with SkillRL-style prompt and skill evolution."""
+    """Agent that delegates environment and prompt details to a dataset adapter."""
 
-    def __init__(self, dataset: ALFWorldDataset, max_turns: int = 30,
+    def __init__(self, dataset: BaseDataset, max_turns: int = 30,
                  records_dir: str = None):
         self._dataset = dataset
         self.max_turns = max_turns
@@ -214,97 +214,96 @@ class SimpleAgent(BaseSkillEvolving):
         if self._skill_mgr:
             self.load_skills(str(self._skills_dir))
         calls_before = self._total_calls
-        task_type = self._detect_task_type(goal)
-        env, env_id = self._dataset.create_env(task_id)
-        obs_tuple, info = env.reset()
-        obs = obs_tuple[0]
+        task_type = self._detect_task_type(goal, task_id=task_id)
+        env_handle = self._dataset.create_env(task_id)
+        state = None
+        obs = ""
         actions = []
         traj_lines = []
         recent = []  # recent (obs, action) pairs for history
         history_window = 5
         triplets = []  # collect (system, user, assistant) per step
+        reasoning = ""
+        closed = False
 
-        # Build skill section (filtered by task type per SkillRL)
-        skill_section = self._get_skill_section(goal, task_type)
-        has_skills = bool(skill_section and skill_section != "(none)")
+        def close_env_once():
+            nonlocal closed
+            if not closed:
+                self._dataset.close_env(env_handle)
+                closed = True
 
-        for step in range(self.max_turns):
-            cmds = info.get("admissible_commands", [])
-            if cmds and isinstance(cmds[0], list):
-                cmds = cmds[0]
-            admissible = "; ".join(cmds) if cmds else ""
-
-            # Single user message per turn (SkillRL style — no system role)
-            if step == 0 and not has_skills and not recent:
-                prompt = TEMPLATE_NO_HISTORY.format(obs=obs, admissible=admissible)
-            else:
-                action_history = self._format_history(recent[-history_window:]) if recent else "(none)"
-                prompt = TEMPLATE_WITH_MEMORY.format(
+        try:
+            state = self._dataset.reset_env(env_handle)
+            obs = state.observation
+            # Build skill section (filtered by task type per SkillRL).
+            skill_section = self._get_skill_section(goal, task_type)
+            has_skills = bool(skill_section and skill_section != "(none)")
+            for step in range(self.max_turns):
+                admissible_actions = state.admissible_actions
+                prompt = self._dataset.build_action_prompt(
                     task_goal=goal,
-                    skill_section=skill_section,
-                    step_count=step,
-                    history_length=min(len(recent), history_window),
-                    action_history=action_history,
-                    current_step=step + 1,
-                    obs=obs,
-                    admissible=admissible,
+                    skill_section=skill_section if has_skills else "",
+                    observation=obs,
+                    admissible_actions=admissible_actions,
+                    step=step,
+                    recent=recent,
+                    history_window=history_window,
                 )
 
-            turn_msgs = [{"role": "user", "content": prompt}]
-            response = self._chat(turn_msgs)
-            action = self._parse_action(response)
-            triplets.append({
-                "step": step,
-                "user": prompt,
-                "assistant": response,
-            })
+                turn_msgs = [{"role": "user", "content": prompt}]
+                response = self._chat(turn_msgs)
+                action = self._parse_action(response)
+                triplets.append({
+                    "step": step,
+                    "user": prompt,
+                    "assistant": response,
+                })
 
-            think_m = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
-            reasoning = think_m.group(1).strip() if think_m else ""
+                think_m = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+                reasoning = think_m.group(1).strip() if think_m else ""
 
-            actions.append(action)
-            traj_lines.append(f"Agent: {action}")
-            print(f"    [{step}] {action}" + (f"  (reasoning: {reasoning[:80]})" if reasoning else ""), flush=True)
+                actions.append(action)
+                traj_lines.append(f"Agent: {action}")
+                print(f"    [{step}] {action}" + (f"  (reasoning: {reasoning[:80]})" if reasoning else ""), flush=True)
 
-            if not action or len(action) < 3:
-                continue
+                if not action or len(action) < 3:
+                    continue
 
-            try:
-                obs2, r, done, info2 = env.step([action])
-                ob = obs2[0]
-                won = info2.get("won", [False])
-                won_flag = isinstance(won, (list, tuple)) and len(won) > 0 and won[0]
-
-                if won_flag or "You win!" in ob:
-                    ALFWorldDataset.close_env(env, env_id)
+                try:
+                    transition = self._dataset.step_env(env_handle, action)
+                    ob = transition.observation
                     print(f"    -> {ob}", flush=True)
                     traj_lines.append(f"Obs: {ob}")
-                    res = {
-                        "success": True, "trajectory": "\n".join(traj_lines),
-                        "actions": actions, "reasoning": reasoning,
-                        "api_calls": self._total_calls - calls_before,
-                        "loaded_skill": self._loaded_skill,
-                    }
-                    self._save_triplets(task_id, triplets, res)
-                    return res
+                    if transition.success:
+                        res = {
+                            "success": True, "trajectory": "\n".join(traj_lines),
+                            "actions": actions, "reasoning": reasoning,
+                            "api_calls": self._total_calls - calls_before,
+                            "loaded_skill": self._loaded_skill,
+                        }
+                        self._save_triplets(task_id, triplets, res)
+                        return res
+                    recent.append((str(obs), action))
+                    obs = ob
+                    state = transition
+                    if transition.done:
+                        break
+                except Exception:
+                    # A malformed action should not leave an environment
+                    # allocated or make the selector crash.  The adapter can
+                    # expose details in its own logging if needed.
+                    continue
 
-                print(f"    -> {ob}", flush=True)
-                traj_lines.append(f"Obs: {ob}")
-                recent.append((obs, action))
-                obs = ob
-                info = info2
-            except Exception:
-                continue
-
-        ALFWorldDataset.close_env(env, env_id)
-        res = {
-            "success": False, "trajectory": "\n".join(traj_lines),
-            "actions": actions, "reasoning": reasoning,
-            "api_calls": self._total_calls - calls_before,
-            "loaded_skill": self._loaded_skill,
-        }
-        self._save_triplets(task_id, triplets, res)
-        return res
+            res = {
+                "success": False, "trajectory": "\n".join(traj_lines),
+                "actions": actions, "reasoning": reasoning,
+                "api_calls": self._total_calls - calls_before,
+                "loaded_skill": self._loaded_skill,
+            }
+            self._save_triplets(task_id, triplets, res)
+            return res
+        finally:
+            close_env_once()
 
     # ── Reflection (skill evolution) ───────────────────────────────────
 
@@ -319,11 +318,12 @@ class SimpleAgent(BaseSkillEvolving):
         steps_text = traj
         existing_titles = self._skill_mgr.existing_titles()
 
-        prompt = REFLECT_PROMPT.format(
-            outcome=outcome, task=goal,
-            task_type=self._detect_task_type(goal),
+        prompt = self._dataset.build_reflection_prompt(
+            outcome=outcome,
+            task_goal=goal,
+            task_type=self._detect_task_type(goal, task_id=task_id),
             trajectory=steps_text,
-            existing_titles=json.dumps(existing_titles),
+            existing_titles=existing_titles,
         )
 
         response = self._chat([{"role": "user", "content": prompt}], max_tokens=128 * 1024,
@@ -343,7 +343,7 @@ class SimpleAgent(BaseSkillEvolving):
             pattern = result_json.get("planning_pattern", "")
             title = result_json.get("title", "")
             principle = result_json.get("principle", "")
-            task_type = self._detect_task_type(goal)
+            task_type = self._detect_task_type(goal, task_id=task_id)
             if pattern and title:
                 skill = {"skill_id": f"dyn_{int(time.time())}", "title": title, "principle": pattern}
                 if self._skill_mgr.add_skill(skill, task_type):
@@ -366,22 +366,16 @@ class SimpleAgent(BaseSkillEvolving):
             self._skill_mgr.save()
             print(f"  >>> Reflection: added {added} new item(s)", flush=True)
 
-    def _detect_task_type(self, goal: str) -> str:
-        """Infer task category from goal string."""
-        goal = goal.lower()
-        if "look" in goal and "light" in goal:
-            return "look_at_obj_in_light"
-        if "clean" in goal:
-            return "clean"
-        if "heat" in goal or "microwave" in goal:
-            return "heat"
-        if "cool" in goal or "refrigerate" in goal or "fridge" in goal or "chill" in goal:
-            return "cool"
-        if "two" in goal:
-            return "pick_two_obj_and_place"
-        if "examine" in goal:
-            return "examine"
-        return "pick_and_place"
+    def _detect_task_type(self, goal: str, task_id: int | None = None) -> str:
+        """Return the dataset-provided skill category.
+
+        ``goal`` remains in the signature for compatibility with callers from
+        older integrations; task categorisation now belongs to the dataset
+        adapter rather than an ALFWorld-specific agent heuristic.
+        """
+        if task_id is not None:
+            return self._dataset.get_skill_task_type(task_id)
+        return "general"
 
     def _parse_reflection_json(self, response: str) -> dict:
         """Parse reflection JSON: {planning_pattern} or {mistakes_to_avoid}."""
