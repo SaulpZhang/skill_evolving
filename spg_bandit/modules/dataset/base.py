@@ -150,7 +150,14 @@ class BaseDataset(ABC):
     @staticmethod
     def _actions_from_info(info: dict[str, Any] | None) -> list[str]:
         info = info or {}
-        actions = info.get("admissible_actions", info.get("actions", []))
+        # TextWorld calls this field ``admissible_commands`` while most Gym
+        # adapters use ``admissible_actions`` (or the older ``actions``
+        # alias).  Keep all three names in the normalized interface; without
+        # the TextWorld spelling, ALFWorld prompts incorrectly contain [] at
+        # the initial state.
+        actions = info.get("admissible_actions")
+        if actions is None:
+            actions = info.get("admissible_commands", info.get("actions", []))
         if isinstance(actions, np.ndarray):
             actions = actions.tolist()
         if isinstance(actions, (list, tuple)) and actions and isinstance(actions[0], (list, tuple)):

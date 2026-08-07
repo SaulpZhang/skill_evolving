@@ -273,6 +273,14 @@ class DatasetInterfaceTests(unittest.TestCase):
         self.assertFalse(BaseDataset._as_bool(np.array([False])))
         self.assertTrue(BaseDataset._as_bool([True]))
 
+    def test_textworld_admissible_commands_are_normalized_to_actions(self):
+        self.assertEqual(
+            BaseDataset._actions_from_info(
+                {"admissible_commands": [["look", "take apple"]]}
+            ),
+            ["look", "take apple"],
+        )
+
     def test_registry_and_generic_gym_protocol(self):
         register_dataset("fake", _FakeDataset)
         dataset = create_dataset("fake", {})
