@@ -234,6 +234,11 @@ class _FakeDataset(BaseDataset):
 
 
 class DatasetInterfaceTests(unittest.TestCase):
+    def test_batch_boolean_normalization_does_not_treat_false_container_as_true(self):
+        self.assertFalse(BaseDataset._as_bool([False]))
+        self.assertFalse(BaseDataset._as_bool(np.array([False])))
+        self.assertTrue(BaseDataset._as_bool([True]))
+
     def test_registry_and_generic_gym_protocol(self):
         register_dataset("fake", _FakeDataset)
         dataset = create_dataset("fake", {})

@@ -175,7 +175,12 @@ class ALFWorldDataset(BaseDataset):
             admissible_actions=self._actions_from_info(info),
             info=info,
             reward=float(reward) if isinstance(reward, (int, float, np.number)) else 0.0,
-            done=bool(done) or success,
+            # TextWorld's batch-size-one API may return ``[False]`` or a
+            # one-element ndarray.  ``bool([False])`` is True because the
+            # container is non-empty, which made every episode terminate
+            # after exactly one action.  Normalize the batch value before
+            # deciding whether the rollout should continue.
+            done=self._as_bool(done) or success,
             success=success,
         )
 
