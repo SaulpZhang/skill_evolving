@@ -62,7 +62,9 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
                     window_size=20, task_type_count=None):
     params = config.get(name, {})
     if name == "uniform":
-        return UniformSelector()
+        return UniformSelector(
+            seed=config.get("experiment", {}).get("seed", 42),
+        )
     elif name == "spg_bandit":
         return SPGBanditSelector(
             task_pool=task_pool,
@@ -137,6 +139,13 @@ def main():
     rollouts_per_task = int(skill_config.get("rollouts_per_task", 1))
     if rollouts_per_task < 1:
         raise ValueError("skill_evolving.rollouts_per_task must be at least 1")
+    evaluation_rollouts_per_task = int(
+        skill_config.get("evaluation_rollouts_per_task", rollouts_per_task)
+    )
+    if evaluation_rollouts_per_task < 1:
+        raise ValueError(
+            "skill_evolving.evaluation_rollouts_per_task must be at least 1"
+        )
 
     run_id = args.run_id or f"{sel_name}_{agent_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     if not args.run_name:
@@ -311,6 +320,7 @@ def main():
             n_eva = ckpt.get("n_eva", n_eva)
             if hasattr(selector, "load_checkpoint"):
                 selector.load_checkpoint(ckpt.get("selector", {}))
+            method.load_checkpoint(ckpt.get("skill_evolving", {}))
             logger.info(f"Resumed from step {start_step}/{total_steps}")
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
@@ -327,6 +337,7 @@ def main():
             }
             if hasattr(selector, "save_checkpoint"):
                 data["selector"] = selector.save_checkpoint()
+            data["skill_evolving"] = method.save_checkpoint()
             with open(path or ckpt_path, "w") as f:
                 import json
                 json.dump(data, f, indent=2, cls=NumpyEncoder)
@@ -399,11 +410,17 @@ def main():
         logger.info(f"{'='*60}")
 
         method.reset()
+        eval_skill_config = dict(skill_config)
+        eval_skill_config["enable_dynamic_update"] = False
+        if "evaluation_temperature" in skill_config:
+            eval_skill_config["temperature"] = skill_config["evaluation_temperature"]
+        if "evaluation_max_tokens" in skill_config:
+            eval_skill_config["max_tokens"] = skill_config["evaluation_max_tokens"]
         eval_method = create_skill_evolving(
-            agent_name, eva_dataset, max_turns, skill_config=skill_config,
+            agent_name, eva_dataset, max_turns, skill_config=eval_skill_config,
         )
         eval_method.load_skills(skills_dir)
-        evaluating_selector = UniformSelector()
+        evaluating_selector = UniformSelector(seed=seed)
         evaluating_success = 0
         evaluating_rollouts = 0
         evaluating_records = []
@@ -415,7 +432,9 @@ def main():
             for step in range(eva_start, n_eva):
                 task_id = evaluating_selector.select(eva_pool)
                 t0 = time.time()
-                result = eval_method.execute(task_id, num_rollouts=rollouts_per_task)
+                result = eval_method.execute(
+                    task_id, num_rollouts=evaluation_rollouts_per_task,
+                )
                 elapsed = time.time() - t0
                 successes = int(result.get("successes", int(bool(result["success"]))))
                 num_rollouts = int(result.get("num_rollouts", 1))

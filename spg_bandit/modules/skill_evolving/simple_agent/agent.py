@@ -21,6 +21,8 @@ from spg_bandit.modules.skill_evolving.simple_agent.skill_manager import SkillMa
 
 load_dotenv(Path(__file__).parents[4] / ".env")
 
+_DEFAULT_TEMPERATURE = object()
+
 TEMPLATE_NO_HISTORY = """You are an expert agent operating in the ALFRED Embodied Environment.
 Your current observation is: {obs}
 Your admissible actions of the current situation are: [{admissible}].
@@ -94,6 +96,12 @@ class SimpleAgent(BaseSkillEvolving):
         self._skills_dir = None
         self._skill_mgr: SkillManager | None = None
         self._loaded_skill = None
+        # Subclasses may override these policy-runtime settings.  The defaults
+        # preserve SimpleAgent's historical API behaviour.
+        self._generation_temperature = 0.3
+        self._generation_max_tokens = 1024
+        self._history_window = 5
+        self._skills_on_initial_step = True
 
     def load_skills(self, skills_dir: str):
         """Load skills from a directory (skills.json)."""
@@ -111,17 +119,20 @@ class SimpleAgent(BaseSkillEvolving):
         self._total_calls = 0
         self._loaded_skill = None
 
-    def _chat(self, messages, max_tokens=1024, client=None, model=None):
+    def _chat(self, messages, max_tokens=1024, client=None, model=None,
+              temperature=_DEFAULT_TEMPERATURE):
         """Chat with automatic retry on transient errors."""
         c = client or self._client
         m = model or self._model
+        request = {"model": m, "messages": messages, "max_tokens": max_tokens}
+        if temperature is _DEFAULT_TEMPERATURE:
+            request["temperature"] = self._generation_temperature
+        elif temperature is not None:
+            request["temperature"] = temperature
         for attempt in range(3):
             try:
                 self._total_calls += 1
-                return c.chat.completions.create(
-                    model=m, messages=messages, max_tokens=max_tokens,
-                    temperature=0.3,
-                ).choices[0].message.content.strip()
+                return c.chat.completions.create(**request).choices[0].message.content.strip()
             except Exception as e:
                 if attempt < 2:
                     time.sleep(2)
@@ -188,6 +199,10 @@ class SimpleAgent(BaseSkillEvolving):
             return clean.split("\n")[0].strip()
         return response.strip()
 
+    def _project_action(self, response: str) -> str:
+        """Project a model response to an environment action."""
+        return self._parse_action(response)
+
     def _format_history(self, recent: list) -> str:
         """Format recent (obs, action) pairs for the history section."""
         lines = []
@@ -221,8 +236,9 @@ class SimpleAgent(BaseSkillEvolving):
         actions = []
         traj_lines = []
         recent = []  # recent (obs, action) pairs for history
-        history_window = 5
+        history_window = self._history_window
         triplets = []  # collect (system, user, assistant) per step
+        trajectory_steps = []
         reasoning = ""
         closed = False
 
@@ -240,9 +256,14 @@ class SimpleAgent(BaseSkillEvolving):
             has_skills = bool(skill_section and skill_section != "(none)")
             for step in range(self.max_turns):
                 admissible_actions = state.admissible_actions
+                visible_skill_section = (
+                    skill_section
+                    if has_skills and (step > 0 or self._skills_on_initial_step)
+                    else ""
+                )
                 prompt = self._dataset.build_action_prompt(
                     task_goal=goal,
-                    skill_section=skill_section if has_skills else "",
+                    skill_section=visible_skill_section,
                     observation=obs,
                     admissible_actions=admissible_actions,
                     step=step,
@@ -251,12 +272,20 @@ class SimpleAgent(BaseSkillEvolving):
                 )
 
                 turn_msgs = [{"role": "user", "content": prompt}]
-                response = self._chat(turn_msgs)
-                action = self._parse_action(response)
+                response = self._chat(
+                    turn_msgs,
+                    max_tokens=self._generation_max_tokens,
+                    temperature=self._generation_temperature,
+                )
+                action = self._project_action(response)
                 triplets.append({
                     "step": step,
                     "user": prompt,
                     "assistant": response,
+                })
+                trajectory_steps.append({
+                    "action": response,
+                    "observation": prompt,
                 })
 
                 think_m = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
@@ -278,6 +307,9 @@ class SimpleAgent(BaseSkillEvolving):
                         res = {
                             "success": True, "trajectory": "\n".join(traj_lines),
                             "actions": actions, "reasoning": reasoning,
+                            "trajectory_steps": self._finalize_trajectory_steps(
+                                trajectory_steps
+                            ),
                             "api_calls": self._total_calls - calls_before,
                             "loaded_skill": self._loaded_skill,
                         }
@@ -297,6 +329,7 @@ class SimpleAgent(BaseSkillEvolving):
             res = {
                 "success": False, "trajectory": "\n".join(traj_lines),
                 "actions": actions, "reasoning": reasoning,
+                "trajectory_steps": self._finalize_trajectory_steps(trajectory_steps),
                 "api_calls": self._total_calls - calls_before,
                 "loaded_skill": self._loaded_skill,
             }
@@ -304,6 +337,11 @@ class SimpleAgent(BaseSkillEvolving):
             return res
         finally:
             close_env_once()
+
+    @staticmethod
+    def _finalize_trajectory_steps(steps: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Detach the recorded model prompts/responses from mutable buffers."""
+        return [dict(step) for step in steps]
 
     # ── Reflection (skill evolution) ───────────────────────────────────
 

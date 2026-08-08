@@ -9,6 +9,10 @@ import numpy as np
 import textworld
 import textworld.gym
 from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInfos
+from spg_bandit.modules.skillrl_source import (
+    ALFWORLD_TEMPLATE_NO_HIS,
+    ALFWORLD_TEMPLATE_WITH_MEMORY,
+)
 
 from spg_bandit.modules.dataset.base import (
     BaseDataset, EnvironmentState, EnvironmentStep, TaskPool,
@@ -25,30 +29,6 @@ TASK_TYPES = [
 TYPE_TO_DIM = {t: i for i, t in enumerate(TASK_TYPES)}
 K = len(TASK_TYPES)
 
-
-_TEMPLATE_NO_HISTORY = """You are an expert agent operating in the ALFRED Embodied Environment.
-Your current observation is: {obs}
-Your admissible actions of the current situation are: [{admissible}].
-
-Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
-Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
-
-_TEMPLATE_WITH_MEMORY = """You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_goal}
-
-## Retrieved Relevant Experience
-
-{skill_section}
-
-## Current Progress
-
-Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
-You are now at step {current_step} and your current observation is: {obs}
-Your admissible actions of the current situation are: [{admissible}].
-
-Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
-Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
 _REFLECT_PROMPT = """Analyze the trajectory below.
 
@@ -210,24 +190,34 @@ class ALFWorldDataset(BaseDataset):
         admissible_actions: list[str], step: int,
         recent: list[tuple[str, str]], history_window: int,
     ) -> str:
-        admissible = "; ".join(admissible_actions)
+        # Keep the exact formatting used by SkillRL's
+        # AlfWorldEnvironmentManager: omit ``help`` and put each quoted action
+        # on its own line inside the brackets.
+        admissible = "\n ".join(
+            f"'{action}'" for action in admissible_actions if action != "help"
+        )
         if step == 0 and not skill_section and not recent:
-            return _TEMPLATE_NO_HISTORY.format(
-                obs=observation, admissible=admissible,
+            return ALFWORLD_TEMPLATE_NO_HIS.format(
+                current_observation=observation,
+                admissible_actions=admissible,
             )
+        recent_history = recent[-history_window:]
+        first_step_number = len(recent) - len(recent_history) + 1
         action_history = "\n".join(
             f"[Observation {i}: '{obs}', Action {i}: '{action}']"
-            for i, (obs, action) in enumerate(recent[-history_window:], 1)
-        ) or "(none)"
-        return _TEMPLATE_WITH_MEMORY.format(
-            task_goal=task_goal,
-            skill_section=skill_section or "(none)",
+            for i, (obs, action) in enumerate(
+                recent_history, first_step_number,
+            )
+        )
+        return ALFWORLD_TEMPLATE_WITH_MEMORY.format(
+            task_description=task_goal,
+            retrieved_memories=skill_section or "(none)",
             step_count=step,
             history_length=min(len(recent), history_window),
             action_history=action_history,
             current_step=step + 1,
-            obs=observation,
-            admissible=admissible,
+            current_observation=observation,
+            admissible_actions=admissible,
         )
 
     def build_reflection_prompt(

@@ -38,6 +38,13 @@ class BaseSkillEvolving(ABC):
         remain step-local and therefore inherit the no-op implementation.
         """
 
+    def save_checkpoint(self) -> dict:
+        """Return resumable method state. Stateless methods return no data."""
+        return {}
+
+    def load_checkpoint(self, state: dict):
+        """Restore method state written by :meth:`save_checkpoint`."""
+
     @abstractmethod
     def get_usage(self) -> dict:
         """Return token/call usage info."""

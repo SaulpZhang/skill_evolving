@@ -301,11 +301,13 @@ skills/<run_id>/current_skill.md # SkillOpt 当前 Markdown skill
 
 Run the direct SkillRL SkillBank integration with `-c skillrl`. It reuses
 the vendored SkillRL `SkillsOnlyMemory`, seed ALFWorld skills, retrieval
-formatter, and skill-update prompt/parser from `resource/skillrl`. The adapter supports
-`skill_evolving.rollouts_per_task`; each rollout remains an individual
+formatter, and skill-update prompt/parser from `resource/skillrl`. Its ALFWorld
+defaults match the upstream training rollout contract: train split, eight
+rollouts per selected task, two history steps, temperature 1.0, 512 output
+tokens, and top-k 6 skill retrieval. Each rollout remains an individual
 Bernoulli observation, while SPG performs one grouped MIRT update for the task
-selection. The original SkillRL GRPO/FSDP policy trainer is not run by this
-OpenAI-compatible environment runner.
+selection. The policy is frozen: the original SkillRL GRPO/FSDP trainer is not
+run by this OpenAI-compatible environment runner.
 
 The initial, un-evolved ALFWorld SkillBank is copied independently into each
 run at `skills/<run_id>/skills.json`. Use the same bank for a Uniform control:

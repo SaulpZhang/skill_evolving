@@ -142,7 +142,8 @@ def fit_mirt_em(R, K, trials=None, max_iter=200, tol=1e-4, verbose=False, seed=N
                 s -= 0.5 * np.linalg.solve(hess, grad)
             s_hist[t] = np.clip(s, 0.0, 1.0)
 
-        # M-step: optimize unconstrained task discrimination and difficulty.
+        # M-step: non-negative discrimination and difficulty keep the MIRT
+        # parameters semantically interpretable for the [0, 1] skill profile.
         for tau in range(M):
             t_idx = np.where(obs_mask[:, tau])[0]
             if len(t_idx) == 0:
@@ -159,6 +160,7 @@ def fit_mirt_em(R, K, trials=None, max_iter=200, tol=1e-4, verbose=False, seed=N
             res = minimize(
                 nll, np.concatenate([A[tau], [d_vec[tau]]]),
                 method="L-BFGS-B",
+                bounds=[(0.0, None)] * (K + 1),
                 options={"maxiter": 50},
             )
             A[tau], d_vec[tau] = res.x[:-1], res.x[-1]
@@ -412,11 +414,13 @@ class SPGBanditSelector(BaseSelector):
         ])
         reg = Ridge(alpha=self._lambda)
         reg.fit(X_seen, y_seen)
-        y_pred_train = reg.predict(X_seen)
+        # Ridge is unconstrained, so project its extrapolated item parameters
+        # back to the same non-negative MIRT domain used by EM.
+        y_pred_train = np.maximum(reg.predict(X_seen), 0.0)
         pred_mse = float(np.mean((y_pred_train - y_seen) ** 2))
         log_metrics({"mirt/pred_mse": pred_mse, "_step_mirt": 0})
         X_all = self._task_pool.embeddings
-        y_pred = reg.predict(X_all)
+        y_pred = np.maximum(reg.predict(X_all), 0.0)
         self._A_fit = y_pred[:, :self._K]
         self._d_fit = y_pred[:, self._K]
         for i, ll_val in enumerate(ll_history):
@@ -504,8 +508,14 @@ class SPGBanditSelector(BaseSelector):
         self._A = np.array(data["A"])
         self._B = np.array(data["B"])
         self._W = np.array(data["W"])
-        self._A_fit = np.array(data["A_fit"]) if data.get("A_fit") is not None else None
-        self._d_fit = np.array(data["d_fit"]) if data.get("d_fit") is not None else None
+        self._A_fit = (
+            np.maximum(np.array(data["A_fit"]), 0.0)
+            if data.get("A_fit") is not None else None
+        )
+        self._d_fit = (
+            np.maximum(np.array(data["d_fit"]), 0.0)
+            if data.get("d_fit") is not None else None
+        )
         self._warmup_task_ids = list(data["task_ids"])
         self._warmup_successes = list(data["successes"])
         self._warmup_trials = list(data.get("trials", [1] * len(self._warmup_task_ids)))

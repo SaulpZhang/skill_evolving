@@ -9,88 +9,51 @@ checkout being present on the execution server.
 from __future__ import annotations
 
 import shutil
-import sys
-import types
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from spg_bandit.modules.skillrl_source import (
+    PROJECT_ROOT as _PROJECT_ROOT,
+    SKILLRL_ROOT as _SKILLRL_ROOT,
+    SkillUpdater,
+    SkillsOnlyMemory,
+    alfworld_projection,
+)
 from spg_bandit.modules.skill_evolving.simple_agent import SimpleAgent
 
+class _OpenAICompatibleCompletions:
+    """Translate upstream Azure completion calls to the configured endpoint."""
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[4]
-_SKILLRL_ROOT = _PROJECT_ROOT / "resource" / "skillrl"
-if not _SKILLRL_ROOT.is_dir():
-    raise ImportError(
-        "SkillRL runtime resources are missing: "
-        f"{_SKILLRL_ROOT}. Copy the required files into resource/skillrl."
-    )
+    def __init__(self, agent: SimpleAgent):
+        self._agent = agent
 
-
-def _register_source_package(name: str, path: Path) -> None:
-    """Expose a source package without executing its heavy ``__init__``.
-
-    Upstream ``agent_system.memory.__init__`` eagerly imports FAISS-backed
-    retrieval memory.  The SkillBank-only adapter does not use it, so register
-    namespace packages and import the original individual modules directly.
-    """
-    package = types.ModuleType(name)
-    package.__path__ = [str(path)]
-    package.__package__ = name
-    sys.modules.setdefault(name, package)
-
-
-_SOURCE_PACKAGE = "_spg_skillrl_source"
-_register_source_package(_SOURCE_PACKAGE, _SKILLRL_ROOT / "agent_system")
-_register_source_package(
-    f"{_SOURCE_PACKAGE}.memory", _SKILLRL_ROOT / "agent_system" / "memory",
-)
-
-# These are intentionally the original SkillRL source modules.
-from _spg_skillrl_source.memory.skills_only_memory import SkillsOnlyMemory  # noqa: E402
-from _spg_skillrl_source.memory.skill_updater import SkillUpdater  # noqa: E402
+    def create(self, *, model, messages, max_completion_tokens):
+        content = self._agent._chat(
+            messages,
+            max_tokens=max_completion_tokens,
+            client=self._agent._reflect_client,
+            model=self._agent._reflect_model,
+            # Upstream o3 request does not set a sampling temperature.
+            temperature=None,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        )
 
 
 class _OpenAICompatibleSkillUpdater(SkillUpdater):
-    """Use SkillUpdater's prompt/parser with this project's API client.
-
-    The upstream updater is retained unchanged when its Azure credentials are
-    available.  This small transport adapter makes the same update protocol
-    work with the OpenAI-compatible reflection endpoint used by SimpleAgent.
-    """
+    """Run the unmodified upstream updater through a transport-only shim."""
 
     def __init__(self, agent: SimpleAgent, max_new_skills_per_update: int):
-        self.agent = agent
+        self.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=_OpenAICompatibleCompletions(agent)),
+        )
+        self.model = agent._reflect_model
         self.max_completion_tokens = 2048
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
-
-    def analyze_failures(self, failed_trajectories, current_skills):
-        if not failed_trajectories:
-            return []
-        next_dyn_idx = self._next_dyn_index(current_skills)
-        prompt = self._build_analysis_prompt(
-            failed_trajectories, current_skills, next_dyn_idx,
-        )
-        try:
-            response = self.agent._chat(
-                [{"role": "user", "content": prompt}],
-                max_tokens=self.max_completion_tokens,
-                client=self.agent._reflect_client,
-                model=self.agent._reflect_model,
-            )
-            skills = self._reassign_dyn_ids(
-                self._parse_skills_response(response), next_dyn_idx,
-            )[:self.max_new_skills_per_update]
-            self.update_history.append({
-                "num_failures_analyzed": len(failed_trajectories),
-                "num_skills_generated": len(skills),
-                "skill_ids": [skill.get("skill_id") for skill in skills],
-            })
-            return skills
-        except Exception as error:
-            print(f"[SkillRL adapter] Skill update failed: {error}")
-            return []
 
 
 class SkillRLAgent(SimpleAgent):
@@ -105,21 +68,49 @@ class SkillRLAgent(SimpleAgent):
                  config: dict[str, Any] | None = None):
         super().__init__(dataset, max_turns=max_turns, records_dir=records_dir)
         self._config = config or {}
+        # Match the upstream ALFWorld training rollout defaults.  These remain
+        # configurable so a frozen-policy evaluation can deliberately use the
+        # upstream validation settings instead.
+        self._generation_temperature = float(self._config.get("temperature", 1.0))
+        self._generation_max_tokens = int(self._config.get("max_tokens", 512))
+        self._history_window = int(self._config.get("history_length", 2))
+        self._skills_on_initial_step = False
         self._memory: SkillsOnlyMemory | None = None
         self._skill_path: Path | None = None
         self._retrieval_top_k = int(self._config.get("top_k", 6))
-        self._update_interval = int(self._config.get("update_interval", 10))
+        legacy_interval = "update_interval" in self._config
+        self._update_batch_size = int(self._config.get(
+            "update_batch_size", self._config.get("update_interval", 16),
+        ))
+        self._skill_update_freq = int(self._config.get("skill_update_freq", 1))
+        self._flush_partial_batch = bool(self._config.get(
+            "flush_partial_batch", legacy_interval,
+        ))
         self._update_threshold = float(self._config.get("update_threshold", 0.4))
         self._max_new_skills = int(self._config.get("max_new_skills", 3))
         self._dynamic_updates = bool(self._config.get("enable_dynamic_update", True))
-        if self._update_interval < 1:
-            raise ValueError("skill_evolving.update_interval must be at least 1")
+        if self._update_batch_size < 1:
+            raise ValueError("skill_evolving.update_batch_size must be at least 1")
+        if self._skill_update_freq < 1:
+            raise ValueError("skill_evolving.skill_update_freq must be at least 1")
         if not 0 <= self._update_threshold <= 1:
             raise ValueError("skill_evolving.update_threshold must be in [0, 1]")
         self._updater = None
         self._groups_since_update = 0
+        self._virtual_batch_step = 0
         self._outcomes_by_type: dict[str, list[bool]] = defaultdict(list)
         self._failed_trajectories: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _project_action(response: str) -> str:
+        """Use SkillRL's original ALFWorld projection semantics.
+
+        A well-formed response contributes the text inside ``<action>`` tags.
+        A malformed response is passed to ALFWorld as its final 30 characters,
+        exactly as the upstream projection does before recording validity.
+        """
+        actions, _valids = alfworld_projection([response], [[]])
+        return actions[0]
 
     def load_skills(self, skills_dir: str):
         directory = Path(skills_dir)
@@ -198,6 +189,7 @@ class SkillRLAgent(SimpleAgent):
             "rollout_results": rollout_results,
             "trajectory": representative.get("trajectory", ""),
             "trajectories": [result.get("trajectory", "") for result in rollout_results],
+            "trajectory_steps": representative.get("trajectory_steps", []),
             "actions": representative.get("actions", []),
             "api_calls": sum(result.get("api_calls", 0) for result in rollout_results),
             "loaded_skill": representative.get("loaded_skill"),
@@ -208,51 +200,152 @@ class SkillRLAgent(SimpleAgent):
         if not self._dynamic_updates or self._memory is None or self._updater is None:
             return
         goal = self._dataset.get_task_goal(task_id)
-        task_type = self._memory.retrieve(goal, top_k=0).get("task_type", "unknown")
+        # Upstream computes the update gate from the dataset/gamefile task
+        # labels, while the trajectory sent to SkillUpdater uses the coarser
+        # skill-bank category detected from the task text.
+        metric_task_type = self._dataset.get_task_type(task_id)
+        skill_task_type = self._memory.retrieve(goal, top_k=0).get(
+            "task_type", "unknown"
+        )
         rollout_results = result.get("rollout_results", [result])
         outcomes = result.get("rollout_successes", [result.get("success", False)])
-        self._outcomes_by_type[task_type].extend(bool(value) for value in outcomes)
+        self._outcomes_by_type[metric_task_type].extend(
+            bool(value) for value in outcomes
+        )
         for outcome, rollout in zip(outcomes, rollout_results):
             if not outcome:
-                self._failed_trajectories.append({
-                    "task": goal,
-                    "task_type": task_type,
-                    "trajectory": self._trajectory_steps(rollout),
-                })
+                self._failed_trajectories.extend(
+                    {
+                        "task": goal,
+                        "task_type": skill_task_type,
+                        "trajectory": trajectory,
+                    }
+                    for trajectory in self._failed_trajectory_entries(rollout)
+                )
         self._groups_since_update += 1
-        if self._groups_since_update < self._update_interval:
+        if self._groups_since_update < self._update_batch_size:
             return
+        self._virtual_batch_step += 1
+        if self._virtual_batch_step % self._skill_update_freq == 0:
+            self._flush_skill_update()
+        else:
+            # Upstream inspects only the current training batch at a scheduled
+            # global step; evidence from intervening batches is not carried
+            # into the next update.
+            self._clear_update_batch()
 
+    def _flush_skill_update(self):
+        """Apply SkillRL's training-batch update rule to buffered rollouts."""
         poor_types = {
             kind for kind, values in self._outcomes_by_type.items()
             if values and sum(values) / len(values) < self._update_threshold
         }
-        failures = [
-            trajectory for trajectory in self._failed_trajectories
-            if trajectory["task_type"] in poor_types
-        ][-10:]
-        if failures:
+        # Upstream uses per-type success only as a gate.  Once any type is
+        # below threshold, every failed trajectory in the current batch is
+        # eligible, preserving batch order and taking the first ten.
+        failures = self._failed_trajectories[:10]
+        if poor_types and failures:
             new_skills = self._updater.analyze_failures(failures, self._memory.skills)
             added = self._memory.add_skills(new_skills, category="general")
             if added and self._skill_path is not None:
                 self._memory.save_skills(str(self._skill_path))
                 print(f"  >>> SkillRL added {added} dynamic skills", flush=True)
+        self._clear_update_batch()
+
+    def _clear_update_batch(self):
         self._groups_since_update = 0
         self._outcomes_by_type.clear()
         self._failed_trajectories.clear()
 
     @staticmethod
     def _trajectory_steps(result: dict) -> list[dict[str, str]]:
+        conversation_steps = result.get("trajectory_steps")
+        if conversation_steps is not None:
+            return [
+                {
+                    "action": str(step.get("action", ""))[:1500],
+                    "observation": str(step.get("observation", ""))[:800],
+                }
+                for step in conversation_steps
+            ]
+
+        # Compatibility for records created before raw conversation steps were
+        # stored.  Pair each observation with the immediately preceding action
+        # instead of independently indexing the two lists (which shifted all
+        # later observations after an invalid action).
         actions = result.get("actions", [])
         lines = result.get("trajectory", "").splitlines()
-        observations = [line.removeprefix("Obs: ") for line in lines if line.startswith("Obs: ")]
-        return [
-            {"action": str(action), "observation": observations[index] if index < len(observations) else ""}
-            for index, action in enumerate(actions)
-        ]
+        steps = [{"action": str(action), "observation": ""} for action in actions]
+        action_index = -1
+        for line in lines:
+            if line.startswith("Agent: "):
+                action_index += 1
+            elif line.startswith("Obs: ") and 0 <= action_index < len(steps):
+                steps[action_index]["observation"] = line.removeprefix("Obs: ")
+        return steps
+
+    @classmethod
+    def _failed_trajectory_entries(
+        cls, result: dict,
+    ) -> list[list[dict[str, str]]]:
+        """Recreate the per-step entries consumed by upstream SkillUpdater.
+
+        SkillRL flattens an environment rollout into one training-batch row per
+        turn. Its parser sees each row as an input prompt plus the current
+        response, so a failed multi-turn episode contributes one failure entry
+        per turn rather than one synthesized whole-episode record.
+        """
+        conversation_steps = result.get("trajectory_steps")
+        if conversation_steps is not None:
+            return [
+                [
+                    {
+                        "action": "",
+                        "observation": str(step.get("observation", ""))[:3000],
+                    },
+                    {
+                        "action": str(step.get("action", ""))[:2000],
+                        "observation": "",
+                    },
+                ]
+                for step in conversation_steps
+            ]
+        return [cls._trajectory_steps(result)]
+
+    def finalize(self):
+        """Optionally flush a final partial virtual batch."""
+        if (
+            self._dynamic_updates
+            and self._memory is not None
+            and self._updater is not None
+            and self._flush_partial_batch
+            and self._groups_since_update > 0
+        ):
+            self._flush_skill_update()
+
+    def save_checkpoint(self) -> dict:
+        return {
+            "groups_since_update": self._groups_since_update,
+            "virtual_batch_step": self._virtual_batch_step,
+            "outcomes_by_type": dict(self._outcomes_by_type),
+            "failed_trajectories": list(self._failed_trajectories),
+        }
+
+    def load_checkpoint(self, state: dict):
+        if not state:
+            return
+        self._groups_since_update = int(state.get("groups_since_update", 0))
+        self._virtual_batch_step = int(state.get("virtual_batch_step", 0))
+        self._outcomes_by_type = defaultdict(
+            list,
+            {
+                str(task_type): [bool(value) for value in values]
+                for task_type, values in state.get("outcomes_by_type", {}).items()
+            },
+        )
+        self._failed_trajectories = list(state.get("failed_trajectories", []))
 
     def reset(self):
         super().reset()
-        self._groups_since_update = 0
-        self._outcomes_by_type.clear()
-        self._failed_trajectories.clear()
+        self._virtual_batch_step = 0
+        self._clear_update_batch()
