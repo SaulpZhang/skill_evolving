@@ -15,7 +15,7 @@ def init_wandb(config: dict, run_id: str = None, run_name: str = None,
         import wandb
         wandb.init(
             entity="saulpzhang",
-            project="spg-bandit-v1",
+            project="spg-bandit-v2",
             id=run_id,
             name=run_name,
             config=config,
