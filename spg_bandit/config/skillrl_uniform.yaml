@@ -15,7 +15,7 @@ selector: uniform
 
 skill_evolving:
   name: skillrl
-  rollouts_per_task: 8
+  rollouts_per_task: 1
   history_length: 2
   temperature: 1.0
   max_tokens: 512
