@@ -9,6 +9,7 @@ checkout being present on the execution server.
 from __future__ import annotations
 
 import shutil
+import json
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +55,7 @@ class _OpenAICompatibleSkillUpdater(SkillUpdater):
         self.max_completion_tokens = 2048
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
+        self.last_update_status = {"status": "not_called"}
 
 
 class SkillRLAgent(SimpleAgent):
@@ -100,6 +102,39 @@ class SkillRLAgent(SimpleAgent):
         self._virtual_batch_step = 0
         self._outcomes_by_type: dict[str, list[bool]] = defaultdict(list)
         self._failed_trajectories: list[dict[str, Any]] = []
+        self._update_diagnostics = self._new_update_diagnostics()
+
+    @staticmethod
+    def _new_update_diagnostics() -> dict[str, int]:
+        """Cumulative, resumable counters for the dynamic-update pipeline."""
+        return {
+            "batches_checked": 0,
+            "gate_passed": 0,
+            "skipped_no_poor_type": 0,
+            "skipped_no_failures": 0,
+            "teacher_calls": 0,
+            "teacher_errors": 0,
+            "teacher_empty": 0,
+            "skills_generated": 0,
+            "skills_added": 0,
+        }
+
+    def _record_update_diagnostic(self, event: dict[str, Any]):
+        """Emit one concise, machine-readable record for a flush attempt."""
+        reason = event["reason"]
+        print(
+            "  >>> [SkillRL diagnostic] "
+            f"batch={event['virtual_batch_step']} rates={event['success_rates']} "
+            f"poor_types={event['poor_types']} failures={event['failure_count']} "
+            f"teacher_called={event['teacher_called']} "
+            f"generated={event['generated']} added={event['added']} reason={reason}",
+            flush=True,
+        )
+        if self._records_dir is None:
+            return
+        self._records_dir.mkdir(parents=True, exist_ok=True)
+        with (self._records_dir / "skillrl_updates.jsonl").open("a") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _project_action(response: str) -> str:
@@ -209,7 +244,7 @@ class SkillRLAgent(SimpleAgent):
         )
         rollout_results = result.get("rollout_results", [result])
         outcomes = result.get("rollout_successes", [result.get("success", False)])
-        self._outcomes_by_type[metric_task_type].extend(
+        self._outcomes_by_type.setdefault(metric_task_type, []).extend(
             bool(value) for value in outcomes
         )
         for outcome, rollout in zip(outcomes, rollout_results):
@@ -236,20 +271,73 @@ class SkillRLAgent(SimpleAgent):
 
     def _flush_skill_update(self):
         """Apply SkillRL's training-batch update rule to buffered rollouts."""
+        success_rates = {
+            kind: round(sum(values) / len(values), 4)
+            for kind, values in self._outcomes_by_type.items()
+            if values
+        }
         poor_types = {
-            kind for kind, values in self._outcomes_by_type.items()
-            if values and sum(values) / len(values) < self._update_threshold
+            kind for kind, rate in success_rates.items()
+            if rate < self._update_threshold
         }
         # Upstream uses per-type success only as a gate.  Once any type is
         # below threshold, every failed trajectory in the current batch is
         # eligible, preserving batch order and taking the first ten.
         failures = self._failed_trajectories[:10]
+        self._update_diagnostics["batches_checked"] += 1
+        event: dict[str, Any] = {
+            "virtual_batch_step": self._virtual_batch_step,
+            "success_rates": success_rates,
+            "poor_types": sorted(poor_types),
+            "failure_count": len(failures),
+            "teacher_called": False,
+            "generated": 0,
+            "added": 0,
+            "reason": "",
+        }
         if poor_types and failures:
-            new_skills = self._updater.analyze_failures(failures, self._memory.skills)
+            self._update_diagnostics["gate_passed"] += 1
+            self._update_diagnostics["teacher_calls"] += 1
+            event["teacher_called"] = True
+            try:
+                new_skills = self._updater.analyze_failures(
+                    failures, self._memory.skills,
+                )
+            except Exception as exc:
+                # The vendored updater handles its own API exceptions, but
+                # preserve a clear record if another updater implementation
+                # leaks one through this boundary.
+                self._update_diagnostics["teacher_errors"] += 1
+                event["reason"] = f"teacher_exception:{type(exc).__name__}"
+                new_skills = []
+            status = getattr(self._updater, "last_update_status", {})
+            if isinstance(status, dict):
+                event["updater_status"] = status
+            event["generated"] = len(new_skills)
+            self._update_diagnostics["skills_generated"] += len(new_skills)
             added = self._memory.add_skills(new_skills, category="general")
+            event["added"] = added
+            self._update_diagnostics["skills_added"] += added
             if added and self._skill_path is not None:
                 self._memory.save_skills(str(self._skill_path))
                 print(f"  >>> SkillRL added {added} dynamic skills", flush=True)
+            if not event["reason"]:
+                event["reason"] = (
+                    status.get("status", "generated")
+                    if isinstance(status, dict) and not new_skills
+                    else "generated"
+                )
+            if not new_skills:
+                self._update_diagnostics["teacher_empty"] += 1
+                if isinstance(status, dict) and status.get("status") == "api_error":
+                    self._update_diagnostics["teacher_errors"] += 1
+        elif not poor_types:
+            self._update_diagnostics["skipped_no_poor_type"] += 1
+            event["reason"] = "no_poor_task_type"
+        else:
+            self._update_diagnostics["skipped_no_failures"] += 1
+            event["reason"] = "no_failed_trajectory"
+        self._record_update_diagnostic(event)
         self._clear_update_batch()
 
     def _clear_update_batch(self):
@@ -329,6 +417,7 @@ class SkillRLAgent(SimpleAgent):
             "virtual_batch_step": self._virtual_batch_step,
             "outcomes_by_type": dict(self._outcomes_by_type),
             "failed_trajectories": list(self._failed_trajectories),
+            "update_diagnostics": dict(self._update_diagnostics),
         }
 
     def load_checkpoint(self, state: dict):
@@ -344,8 +433,15 @@ class SkillRLAgent(SimpleAgent):
             },
         )
         self._failed_trajectories = list(state.get("failed_trajectories", []))
+        self._update_diagnostics = self._new_update_diagnostics()
+        self._update_diagnostics.update({
+            key: int(value)
+            for key, value in state.get("update_diagnostics", {}).items()
+            if key in self._update_diagnostics
+        })
 
     def reset(self):
         super().reset()
         self._virtual_batch_step = 0
         self._clear_update_batch()
+        self._update_diagnostics = self._new_update_diagnostics()

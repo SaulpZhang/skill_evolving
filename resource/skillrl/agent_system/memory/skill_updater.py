@@ -40,6 +40,7 @@ class SkillUpdater:
         self.max_completion_tokens = max_completion_tokens
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
+        self.last_update_status = {"status": "not_called"}
 
     def analyze_failures(
         self,
@@ -62,6 +63,7 @@ class SkillUpdater:
             ``SkillsOnlyMemory.add_skills()``.
         """
         if not failed_trajectories:
+            self.last_update_status = {"status": "no_failures"}
             return []
 
         # Compute the next available dyn_ index BEFORE calling the LLM so we
@@ -89,11 +91,19 @@ class SkillUpdater:
                 'num_skills_generated': len(reassigned),
                 'skill_ids': [s.get('skill_id') for s in reassigned],
             })
+            self.last_update_status = {
+                "status": "generated" if reassigned else "empty_parse",
+                "generated": len(reassigned),
+            }
 
             return reassigned[:self.max_new_skills_per_update]
 
         except Exception as e:
             print(f"[SkillUpdater] Error calling o3: {e}")
+            self.last_update_status = {
+                "status": "api_error",
+                "error_type": type(e).__name__,
+            }
             return []
 
     # ------------------------------------------------------------------ #
