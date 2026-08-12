@@ -18,7 +18,7 @@ class SkillUpdater:
     def __init__(
         self,
         max_new_skills_per_update: int = 3,
-        max_completion_tokens: int = 2048,
+        max_completion_tokens: int = 4096 * 1024,
     ):
         # Read credentials from environment variables — never hardcode secrets.
         api_key = os.environ.get("AZURE_OPENAI_API_KEY")
@@ -42,6 +42,7 @@ class SkillUpdater:
         self.update_history = []
         self.last_update_status = {"status": "not_called"}
         self._last_parse_status = {"parse_status": "not_called"}
+        self.last_reflection = {"prompt": "", "response": "", "error": None}
 
     def analyze_failures(
         self,
@@ -74,6 +75,7 @@ class SkillUpdater:
         prompt = self._build_analysis_prompt(
             failed_trajectories, current_skills, next_dyn_idx
         )
+        self.last_reflection = {"prompt": prompt, "response": "", "error": None}
 
         try:
             response = self.client.chat.completions.create(
@@ -82,6 +84,7 @@ class SkillUpdater:
                 max_completion_tokens=self.max_completion_tokens,
             )
             raw_response = response.choices[0].message.content or ""
+            self.last_reflection["response"] = raw_response
             raw_skills = self._parse_skills_response(raw_response)
 
             # Reassign dyn_ IDs on our side to guarantee no collisions,
@@ -107,6 +110,7 @@ class SkillUpdater:
 
         except Exception as e:
             print(f"[SkillUpdater] Error calling o3: {e}")
+            self.last_reflection["error"] = f"{type(e).__name__}: {e}"
             self.last_update_status = {
                 "status": "api_error",
                 "error_type": type(e).__name__,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,10 +53,11 @@ class _OpenAICompatibleSkillUpdater(SkillUpdater):
             chat=SimpleNamespace(completions=_OpenAICompatibleCompletions(agent)),
         )
         self.model = agent._reflect_model
-        self.max_completion_tokens = 2048
+        self.max_completion_tokens = 4096 * 1024
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
         self.last_update_status = {"status": "not_called"}
+        self.last_reflection = {"prompt": "", "response": ""}
 
 
 class SkillRLAgent(SimpleAgent):
@@ -135,6 +137,27 @@ class SkillRLAgent(SimpleAgent):
         self._records_dir.mkdir(parents=True, exist_ok=True)
         with (self._records_dir / "skillrl_updates.jsonl").open("a") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _save_skillrl_reflection(self, failure_count: int):
+        """Persist the complete teacher request and response for one update."""
+        if self._records_dir is None:
+            return
+        reflection = getattr(self._updater, "last_reflection", {})
+        self._records_dir.mkdir(parents=True, exist_ok=True)
+        path = self._records_dir / (
+            f"skillrl_reflection_batch_{self._virtual_batch_step}_{time.time_ns()}.json"
+        )
+        payload = {
+            "type": "skillrl_reflection",
+            "virtual_batch_step": self._virtual_batch_step,
+            "failure_count": failure_count,
+            "prompt": reflection.get("prompt", ""),
+            "response": reflection.get("response", ""),
+            "error": reflection.get("error"),
+            "updater_status": getattr(self._updater, "last_update_status", {}),
+        }
+        with path.open("w") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
 
     @staticmethod
     def _project_action(response: str) -> str:
@@ -310,6 +333,7 @@ class SkillRLAgent(SimpleAgent):
                 self._update_diagnostics["teacher_errors"] += 1
                 event["reason"] = f"teacher_exception:{type(exc).__name__}"
                 new_skills = []
+            self._save_skillrl_reflection(len(failures))
             status = getattr(self._updater, "last_update_status", {})
             if isinstance(status, dict):
                 event["updater_status"] = status
