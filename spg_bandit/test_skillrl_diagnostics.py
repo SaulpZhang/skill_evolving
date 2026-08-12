@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from spg_bandit.modules.skill_evolving.skillrl.agent import SkillRLAgent
+from spg_bandit.modules.skillrl_source import SkillUpdater
 
 
 class _Dataset:
@@ -67,3 +68,15 @@ def test_reflection_flush_persists_empty_teacher_diagnostic(tmp_path):
     assert event["reason"] == "empty_parse"
     assert event["generated"] == 0
     assert event["added"] == 0
+
+
+def test_skill_updater_accepts_skills_without_model_supplied_ids():
+    updater = SkillUpdater.__new__(SkillUpdater)
+
+    parsed = updater._parse_skills_response(
+        '{"skills": [{"title": "Check State First", '
+        '"principle": "Verify the object state before acting.", '
+        '"when_to_apply": "Before irreversible actions."}]}'
+    )
+
+    assert [skill["title"] for skill in parsed] == ["Check State First"]

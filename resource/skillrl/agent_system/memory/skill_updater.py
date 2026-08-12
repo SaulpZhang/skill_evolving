@@ -41,6 +41,7 @@ class SkillUpdater:
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
         self.last_update_status = {"status": "not_called"}
+        self._last_parse_status = {"parse_status": "not_called"}
 
     def analyze_failures(
         self,
@@ -80,7 +81,8 @@ class SkillUpdater:
                 messages=[{"role": "user", "content": prompt}],
                 max_completion_tokens=self.max_completion_tokens,
             )
-            raw_skills = self._parse_skills_response(response.choices[0].message.content)
+            raw_response = response.choices[0].message.content or ""
+            raw_skills = self._parse_skills_response(raw_response)
 
             # Reassign dyn_ IDs on our side to guarantee no collisions,
             # regardless of what the LLM returned.
@@ -94,7 +96,12 @@ class SkillUpdater:
             self.last_update_status = {
                 "status": "generated" if reassigned else "empty_parse",
                 "generated": len(reassigned),
+                **self._last_parse_status,
             }
+            if not reassigned:
+                # A bounded preview lets a failed run reveal the response
+                # shape without dumping its whole reflection transcript.
+                self.last_update_status["response_preview"] = raw_response[:1000]
 
             return reassigned[:self.max_new_skills_per_update]
 
@@ -200,17 +207,42 @@ Example format:
         return '\n'.join(lines)
 
     def _parse_skills_response(self, response: str) -> List[Dict]:
+        """Parse an array (or one object) while accepting model-omitted IDs.
+
+        IDs are reassigned by :meth:`_reassign_dyn_ids`, so requiring the
+        teacher to reproduce the requested ``dyn_*`` identifier only turns a
+        useful skill into an empty update.
+        """
+        self._last_parse_status = {"parse_status": "no_json_payload"}
         try:
             json_start = response.find('[')
             json_end = response.rfind(']') + 1
             if json_start != -1 and json_end > json_start:
                 skills = json.loads(response[json_start:json_end])
-                return [
-                    s for s in skills
-                    if all(k in s for k in ['skill_id', 'title', 'principle'])
-                ]
+            else:
+                object_start = response.find('{')
+                object_end = response.rfind('}') + 1
+                if object_start == -1 or object_end <= object_start:
+                    return []
+                skills = json.loads(response[object_start:object_end])
+                if isinstance(skills, dict):
+                    skills = skills.get("skills", skills.get("new_skills", [skills]))
+            if not isinstance(skills, list):
+                self._last_parse_status = {"parse_status": "json_not_skill_list"}
+                return []
+            valid = [
+                skill for skill in skills
+                if isinstance(skill, dict)
+                and all(str(skill.get(key, "")).strip() for key in ("title", "principle"))
+            ]
+            self._last_parse_status = {
+                "parse_status": "parsed" if valid else "no_valid_skill_fields",
+                "items_in_response": len(skills),
+            }
+            return valid
         except json.JSONDecodeError as e:
             print(f"[SkillUpdater] JSON parse error: {e}")
+            self._last_parse_status = {"parse_status": "json_decode_error"}
         return []
 
     def get_update_summary(self) -> Dict:
