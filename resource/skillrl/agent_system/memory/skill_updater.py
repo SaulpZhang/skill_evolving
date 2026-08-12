@@ -18,7 +18,7 @@ class SkillUpdater:
     def __init__(
         self,
         max_new_skills_per_update: int = 3,
-        max_completion_tokens: int = 4096 * 1024,
+        max_completion_tokens: int = 393216,
     ):
         # Read credentials from environment variables — never hardcode secrets.
         api_key = os.environ.get("AZURE_OPENAI_API_KEY")

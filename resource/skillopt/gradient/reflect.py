@@ -48,6 +48,30 @@ from skillopt.prompts import load_prompt
 from skillopt.utils import extract_json
 
 
+def _save_reflection_log(
+    path: str | None,
+    *,
+    source_type: str,
+    system: str,
+    user: str,
+    response: str = "",
+    error: str | None = None,
+) -> None:
+    """Persist an analyst request even when its response is unusable."""
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({
+            "type": "skillopt_reflection",
+            "source_type": source_type,
+            "system_prompt": system,
+            "user_prompt": user,
+            "response": response,
+            "error": error,
+        }, handle, ensure_ascii=False, indent=2)
+
+
 # ── Trajectory formatting ────────────────────────────────────────────────────
 
 
@@ -266,6 +290,7 @@ def run_error_analyst_minibatch(
     meta_skill_context: str = "",
     update_mode: str = "patch",
     skill_aware_reflection: bool = False,
+    reflection_log_path: str | None = None,
 ) -> dict | None:
     """Analyze a minibatch of failed trajectories in one optimizer call.
 
@@ -337,6 +362,13 @@ def run_error_analyst_minibatch(
             retries=3,
             stage="analyst",
         )
+        _save_reflection_log(
+            reflection_log_path,
+            source_type="failure",
+            system=actual_system,
+            user=user,
+            response=response,
+        )
         result = extract_json(response)
         if not result:
             return None
@@ -358,7 +390,14 @@ def run_error_analyst_minibatch(
                 "patch": {"reasoning": "execution-lapse only", "edits": []},
                 "appendix_notes": notes,
             }
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _save_reflection_log(
+            reflection_log_path,
+            source_type="failure",
+            system=actual_system,
+            user=user,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         traceback.print_exc()
     return None
 
@@ -376,6 +415,7 @@ def run_success_analyst_minibatch(
     update_mode: str = "patch",
     skill_aware_reflection: bool = False,
     emit_appendix_notes: bool = True,
+    reflection_log_path: str | None = None,
 ) -> dict | None:
     """Analyze a minibatch of successful trajectories in one optimizer call.
 
@@ -434,6 +474,13 @@ def run_success_analyst_minibatch(
             retries=3,
             stage="analyst",
         )
+        _save_reflection_log(
+            reflection_log_path,
+            source_type="success",
+            system=actual_system,
+            user=user,
+            response=response,
+        )
         result = extract_json(response)
         if result and "patch" in result:
             result["source_type"] = "success"
@@ -442,7 +489,14 @@ def run_success_analyst_minibatch(
             if sa_emit:
                 result["appendix_notes"] = extract_appendix_notes(result)
             return result
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _save_reflection_log(
+            reflection_log_path,
+            source_type="success",
+            system=actual_system,
+            user=user,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         traceback.print_exc()
     return None
 
@@ -489,6 +543,7 @@ def run_minibatch_reflect(
     update_mode: str = "patch",
     skill_aware_reflection: bool | None = None,
     skill_aware_appendix_source: str | None = None,
+    reflection_log_dir: str | None = None,
 ) -> list[dict | None]:
     """Full minibatch reflect stage: group → parallel optimizer calls → patches.
 
@@ -532,6 +587,8 @@ def run_minibatch_reflect(
         skill_aware_appendix_source = get_skill_aware_appendix_source()
 
     os.makedirs(patches_dir, exist_ok=True)
+    if reflection_log_dir:
+        os.makedirs(reflection_log_dir, exist_ok=True)
 
     # Separate failure / success
     failures = [r for r in results if not r.get("hard") or float(r.get("hard", 0)) < 1e-9]
@@ -587,6 +644,10 @@ def run_minibatch_reflect(
             meta_skill_context=meta_skill_context,
             update_mode=update_mode,
             skill_aware_reflection=skill_aware_reflection,
+            reflection_log_path=(
+                os.path.join(reflection_log_dir, f"minibatch_fail_{idx:03d}.json")
+                if reflection_log_dir else None
+            ),
         )
         return f"minibatch_fail_{idx:03d}", patch
 
@@ -601,6 +662,10 @@ def run_minibatch_reflect(
             update_mode=update_mode,
             skill_aware_reflection=skill_aware_reflection,
             emit_appendix_notes=(skill_aware_appendix_source != "failure_only"),
+            reflection_log_path=(
+                os.path.join(reflection_log_dir, f"minibatch_succ_{idx:03d}.json")
+                if reflection_log_dir else None
+            ),
         )
         return f"minibatch_succ_{idx:03d}", patch
 

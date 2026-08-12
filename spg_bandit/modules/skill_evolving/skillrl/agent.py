@@ -53,7 +53,7 @@ class _OpenAICompatibleSkillUpdater(SkillUpdater):
             chat=SimpleNamespace(completions=_OpenAICompatibleCompletions(agent)),
         )
         self.model = agent._reflect_model
-        self.max_completion_tokens = 4096 * 1024
+        self.max_completion_tokens = 393216
         self.max_new_skills_per_update = max_new_skills_per_update
         self.update_history = []
         self.last_update_status = {"status": "not_called"}

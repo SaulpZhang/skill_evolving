@@ -167,9 +167,11 @@ class SkillOptAgent(SimpleAgent):
         self._work_dir = records_root / "skillopt"
         self._prediction_dir = self._work_dir / "predictions"
         self._patches_dir = self._work_dir / "patches"
+        self._reflections_dir = self._work_dir / "reflections"
         self._work_dir.mkdir(parents=True, exist_ok=True)
         self._prediction_dir.mkdir(parents=True, exist_ok=True)
         self._patches_dir.mkdir(parents=True, exist_ok=True)
+        self._reflections_dir.mkdir(parents=True, exist_ok=True)
         self._history_path = self._work_dir / "updates.jsonl"
         self._rollout_index = sum(
             1 for path in self._prediction_dir.iterdir()
@@ -512,6 +514,9 @@ class SkillOptAgent(SimpleAgent):
                 step_buffer_context=self._step_buffer_context(),
                 update_mode="patch",
                 skill_aware_reflection=self._skill_aware_reflection,
+                reflection_log_dir=str(
+                    self._reflections_dir / f"step_{update_step:06d}"
+                ),
             )
             failure_patches = [
                 item["patch"] for item in raw_patches
