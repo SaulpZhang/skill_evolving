@@ -28,7 +28,19 @@ class BaseSkillEvolving(ABC):
     def reflect(self, task_id: int, result: dict):
         """Optional: reflect on execution and evolve skills.
         Called by orchestrator after execute(). Default no-op.
+
+        Implementations may return a list of update events.  Each event has
+        ``skill_update_completed``, ``skill_updated``, and the selected
+        ``task_ids`` whose trajectories were used by that update.
         """
+
+    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+        """Whether ``reflect`` will apply a skill update for this selection.
+
+        The runner uses this to take a pre-update probe measurement.  The
+        default keeps non-batched methods backwards compatible.
+        """
+        return False
 
     def finalize(self):
         """Optional end-of-run hook.

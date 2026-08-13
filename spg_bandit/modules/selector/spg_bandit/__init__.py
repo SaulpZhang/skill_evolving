@@ -240,6 +240,10 @@ class SPGBanditSelector(BaseSelector):
         self._B = np.zeros((d_f, K))
         self._W = np.zeros((d_f, K))
         self._last_phi = None
+        # A selected task is observed immediately for MIRT state estimation,
+        # but its bandit label is deferred until the skill update it helped
+        # trigger has been evaluated on a fixed probe set.
+        self._pending_skill_observations = deque()
         self._window = deque()
 
         # Internal profile (SPG own concept)
@@ -266,6 +270,10 @@ class SPGBanditSelector(BaseSelector):
 
     def get_metrics(self) -> dict:
         return dict(self._metrics)
+
+    def get_profile(self) -> np.ndarray:
+        """Return a copy of the current MIRT ability profile."""
+        return self._profile.copy()
 
     def save_warmup_data(self, path: str):
         """Save warmup data to JSON for future --warmup-data runs."""
@@ -347,16 +355,56 @@ class SPGBanditSelector(BaseSelector):
         elif self._warmup_ready:
             a_tau = self._A_fit[task_id]
             d_tau = self._d_fit[task_id]
-            profile_before = self._profile.copy()
             self._profile = online_profile_update(
                 self._profile, a_tau, d_tau, successes, trials,
             )
-
-            # Ridge regression: learn from real skill progress
             if self._last_phi is not None:
-                delta = self._profile - profile_before
-                self._append_window_observation(self._last_phi, delta)
-                self._W = np.linalg.solve(self._A, self._B)
+                self._pending_skill_observations.append((task_id, self._last_phi.copy()))
+
+    def estimate_profile_from_results(self, results: list[dict], *, base_profile=None):
+        """Estimate ability from probe outcomes without mutating selector state."""
+        if not self._warmup_ready:
+            raise RuntimeError("probe profiles require completed SPG warmup")
+        profile = np.array(
+            self._profile if base_profile is None else base_profile, dtype=float,
+        ).copy()
+        for item in results:
+            task_id = int(item["task_id"])
+            outcomes = item.get("rollout_successes")
+            if outcomes is None:
+                outcomes = [bool(item["success"])]
+            outcomes = [bool(value) for value in outcomes]
+            if not outcomes:
+                raise ValueError("probe result.rollout_successes must not be empty")
+            profile = online_profile_update(
+                profile, self._A_fit[task_id], self._d_fit[task_id],
+                sum(outcomes), len(outcomes),
+            )
+        return profile
+
+    def commit_skill_update(self, profile_before, profile_after, *, updated: bool):
+        """Assign a post-reflection probe gain to tasks since the last update.
+
+        The MLP target remains an ability-profile delta.  Unlike the old
+        immediate outcome label, this delta is measured after the skill bank
+        has actually changed, so it estimates the selected batch's effect on
+        skill-mediated competence.
+        """
+        if not self._warmup_ready:
+            return {"committed": 0, "delta": [0.0] * self._K}
+        delta = np.asarray(profile_after, dtype=float) - np.asarray(profile_before, dtype=float)
+        if not updated:
+            delta = np.zeros(self._K)
+        count = len(self._pending_skill_observations)
+        while self._pending_skill_observations:
+            _task_id, phi = self._pending_skill_observations.popleft()
+            self._append_window_observation(phi, delta)
+        if count:
+            self._W = np.linalg.solve(self._A, self._B)
+        # Post-update probes are the freshest ability evidence available.
+        if updated:
+            self._profile = np.asarray(profile_after, dtype=float).copy()
+        return {"committed": count, "delta": delta.tolist()}
 
     def _compute_gap(self, profile):
         raw = (1.0 - profile) / max(self._tau, 1e-10)
@@ -466,6 +514,7 @@ class SPGBanditSelector(BaseSelector):
         self._B = np.zeros((self._d_f, self._K))
         self._W = np.zeros((self._d_f, self._K))
         self._last_phi = None
+        self._pending_skill_observations.clear()
         self._window.clear()
         self._warmup_task_ids.clear()
         self._warmup_successes.clear()
@@ -493,6 +542,10 @@ class SPGBanditSelector(BaseSelector):
             "window": [
                 {"phi": phi.tolist(), "delta": delta.tolist()}
                 for phi, delta in self._window
+            ],
+            "pending_skill_observations": [
+                {"task_id": task_id, "phi": phi.tolist()}
+                for task_id, phi in self._pending_skill_observations
             ],
             "window_size": self._window_size,
             "mlp": self._mlp.get_state() if self._mlp is not None else None,
@@ -526,6 +579,10 @@ class SPGBanditSelector(BaseSelector):
         self._window = deque(
             (np.array(item["phi"]), np.array(item["delta"]))
             for item in data.get("window", [])
+        )
+        self._pending_skill_observations = deque(
+            (int(item["task_id"]), np.array(item["phi"]))
+            for item in data.get("pending_skill_observations", [])
         )
         if data.get("mlp") and self._mlp is None:
             mlp_cfg = data["mlp_cfg"]

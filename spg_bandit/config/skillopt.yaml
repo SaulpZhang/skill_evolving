@@ -40,6 +40,8 @@ skill_evolving:
 spg_bandit:
   warmup_ratio: 0.4
   window_size: 20
+  # Fixed, type-balanced probes run before/after every accepted SkillOpt update.
+  probe_size: 12
   K: 4
   alpha: 0.1
   d_f: 16

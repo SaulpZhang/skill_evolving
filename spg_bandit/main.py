@@ -277,6 +277,18 @@ def main():
     if selector.needs_warmup:
         n_bandit = evo_pool.M - n_warm
 
+    # A fixed, type-balanced probe subset measures the ability-profile change
+    # caused by a SkillRL/SkillOpt update.  It is never reflected on and is
+    # therefore evaluation evidence rather than additional training data.
+    probe_ids = []
+    if sel_name == "spg_bandit":
+        probe_size = int(spg_cfg.get("probe_size", 0))
+        if probe_size:
+            if probe_size < 1 or probe_size > evo_pool.M:
+                raise ValueError("spg_bandit.probe_size must be in [1, evolve pool size]")
+            probe_ids = sample_type_balanced_task_ids(evo_pool, probe_size, random)
+            logger.info("SPG skill-gain probes: %s fixed type-balanced tasks", len(probe_ids))
+
     logger.info(f"Warmup pool: evolve pool ({evo_pool.M} tasks), {n_warm} steps")
     logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
     logger.info(f"Eval pool: {eva_pool.M} tasks, {n_eva} steps")
@@ -308,6 +320,55 @@ def main():
         if not args.run_id:
             logger.error("--resume requires --run_id")
             return
+
+    def _run_skill_gain_probes():
+        """Execute the fixed probes without letting them modify the SkillBank."""
+        observations = []
+        for probe_task_id in probe_ids:
+            probe_result = method.execute(probe_task_id, num_rollouts=rollouts_per_task)
+            observations.append({"task_id": probe_task_id, **probe_result})
+        return observations
+
+    def _commit_skill_gain(events, anchor_profile, before_profile):
+        """Train SPG on post-reflection probe gain for each completed batch."""
+        if not events or not isinstance(selector, SPGBanditSelector):
+            return
+        for event in events:
+            if not isinstance(event, dict) or not event.get("skill_update_completed"):
+                continue
+            updated = bool(event.get("skill_updated", False))
+            measured_before = None
+            measured_after = None
+            if updated and probe_ids and anchor_profile is not None:
+                after_profile = selector.estimate_profile_from_results(
+                    _run_skill_gain_probes(), base_profile=anchor_profile,
+                )
+                measured_before = before_profile.tolist()
+                measured_after = after_profile.tolist()
+                committed = selector.commit_skill_update(
+                    before_profile, after_profile, updated=True,
+                )
+            else:
+                committed = selector.commit_skill_update(
+                    anchor_profile if anchor_profile is not None else selector.get_profile(),
+                    anchor_profile if anchor_profile is not None else selector.get_profile(),
+                    updated=False,
+                )
+            record = {
+                "event": "skill_gain_label",
+                "update": event,
+                "committed": committed,
+                "probe_task_ids": probe_ids if updated else [],
+                "profile_before": measured_before,
+                "profile_after": measured_after,
+            }
+            recorder.append_jsonl("spg_skill_gain", record)
+            log_metrics({
+                **{f"spg/skill_gain_dim_{i}": value for i, value in enumerate(committed["delta"])},
+                "spg/skill_gain_batch_size": committed["committed"],
+                "_step_evolving": step + 1,
+            })
+    if args.resume:
         try:
             import json
             ckpt = json.load(open(ckpt_path))
@@ -352,8 +413,24 @@ def main():
             t0 = time.time()
             result = method.execute(task_id, num_rollouts=rollouts_per_task)
             elapsed = time.time() - t0
-            method.reflect(task_id, result)
             selector.update(task_id, result)
+            # The selected-task outcome updates the current MIRT state.  If a
+            # skill update is due, probe that same state before reflection;
+            # probe again after reflection and use the profile difference as
+            # the MLP supervision signal.
+            anchor_profile = None
+            before_profile = None
+            if (
+                probe_ids and isinstance(selector, SPGBanditSelector)
+                and selector._warmup_ready
+                and method.will_update_after_reflect(task_id, result)
+            ):
+                anchor_profile = selector.get_profile()
+                before_profile = selector.estimate_profile_from_results(
+                    _run_skill_gain_probes(), base_profile=anchor_profile,
+                )
+            update_events = method.reflect(task_id, result) or []
+            _commit_skill_gain(update_events, anchor_profile, before_profile)
 
             successes = int(result.get("successes", int(bool(result["success"]))))
             num_rollouts = int(result.get("num_rollouts", 1))
@@ -390,7 +467,11 @@ def main():
     # Batch optimizers (SkillOpt) may have a partial minibatch left after the
     # final selected task.  Flush it before saving metrics or evaluating the
     # resulting skill.
-    method.finalize()
+    final_events = method.finalize() or []
+    # A final partial batch has no pre-update probe snapshot, so it is safely
+    # committed as a zero-gain observation rather than attributing a later
+    # measurement to the wrong pre-update skill state.
+    _commit_skill_gain(final_events, None, None)
 
     if hasattr(selector, "get_metrics"):
         metrics = selector.get_metrics()
@@ -417,7 +498,11 @@ def main():
         if "evaluation_max_tokens" in skill_config:
             eval_skill_config["max_tokens"] = skill_config["evaluation_max_tokens"]
         eval_method = create_skill_evolving(
-            agent_name, eva_dataset, max_turns, skill_config=eval_skill_config,
+            agent_name,
+            eva_dataset,
+            max_turns,
+            records_dir=str(log_base / sel_name / "evaluating_messages"),
+            skill_config=eval_skill_config,
         )
         eval_method.load_skills(skills_dir)
         evaluating_selector = UniformSelector(seed=seed)
@@ -441,17 +526,24 @@ def main():
                 evaluating_success += successes
                 evaluating_rollouts += num_rollouts
                 log_metrics({"evaluating/success_rate": evaluating_success / evaluating_rollouts, "_step_evaluating": step + 1})
-                evaluating_records.append({
+                evaluating_record = {
                     "step": step, "task_id": task_id,
                     "success": result["success"], "api_calls": result["api_calls"],
                     "successes": successes, "num_rollouts": num_rollouts,
                     "success_rate": successes / num_rollouts,
                     "rollout_successes": result.get("rollout_successes"),
                     "duration_s": round(elapsed, 1),
-                })
-                if step % 5 == 0 or step == n_eva - 1:
-                    logger.info(f"  evaluating step {step+1}/{n_eva}: task {task_id} -> "
-                                f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.0f}s)")
+                }
+                evaluating_records.append(evaluating_record)
+                # Emit and persist every evaluation task: evaluations can take
+                # many minutes per rollout, so five-step batching hides liveness
+                # and loses all task records if the job is interrupted early.
+                recorder.append_jsonl("evaluating_steps", evaluating_record)
+                logger.info(
+                    f"  evaluating step {step + 1}/{n_eva}: task {task_id} -> "
+                    f"{'OK' if result['success'] else 'FAIL'} ({elapsed:.1f}s); "
+                    f"running SR={evaluating_success / evaluating_rollouts:.3f}"
+                )
                 if (step + 1) % ckpt_interval == 0:
                     _save_ckpt(step + 1, warmup_steps, success_count, step_records,
                                "eval_interval", path=eval_ckpt_path)
@@ -465,8 +557,6 @@ def main():
         _save_ckpt(n_eva, warmup_steps, success_count, step_records,
                    "eval_end", path=eval_ckpt_path)
         evaluating_api = sum(r["api_calls"] for r in evaluating_records)
-        for rec in evaluating_records:
-            recorder.append_jsonl("evaluating_steps", rec)
         recorder.save_json("evaluating_result", {
             "label": sel_name, "success": evaluating_success,
             "total": evaluating_rollouts, "api_calls": evaluating_api,

@@ -345,10 +345,15 @@ class SimpleAgent(BaseSkillEvolving):
 
     # ── Reflection (skill evolution) ───────────────────────────────────
 
+    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+        """SimpleAgent attempts one immediate skill update per reflection."""
+        del task_id, result
+        return self._skill_mgr is not None
+
     def reflect(self, task_id: int, result: dict):
         """Reflect on task execution and evolve skills via LLM analysis."""
         if not self._skill_mgr:
-            return
+            return []
 
         outcome = "succeeded" if result["success"] else "failed"
         goal = self._dataset.get_task_goal(task_id)
@@ -372,7 +377,12 @@ class SimpleAgent(BaseSkillEvolving):
         result_json = self._parse_reflection_json(response)
         if not result_json:
             print(f"  >>> Reflection: no skills generated", flush=True)
-            return
+            return [{
+                "skill_update_completed": True,
+                "skill_updated": False,
+                "task_ids": [task_id],
+                "reason": "empty_reflection",
+            }]
 
         added = 0
 
@@ -403,6 +413,12 @@ class SimpleAgent(BaseSkillEvolving):
         if added:
             self._skill_mgr.save()
             print(f"  >>> Reflection: added {added} new item(s)", flush=True)
+        return [{
+            "skill_update_completed": True,
+            "skill_updated": bool(added),
+            "task_ids": [task_id],
+            "reason": "reflection",
+        }]
 
     def _detect_task_type(self, goal: str, task_id: int | None = None) -> str:
         """Return the dataset-provided skill category.

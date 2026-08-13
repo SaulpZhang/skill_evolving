@@ -444,20 +444,26 @@ class SkillOptAgent(SimpleAgent):
 
     def reflect(self, task_id: int, result: dict):
         """Buffer all rollouts for a selected task and optimize in batches."""
-        del task_id
         items = result.get("skillopt_items") or []
         self._evidence.extend(copy.deepcopy(items))
+        events = []
         while len(self._evidence) >= self._batch_size:
             batch = self._evidence[: self._batch_size]
             del self._evidence[: self._batch_size]
-            self._optimize_batch(batch)
+            events.append(self._optimize_batch(batch))
+        return events
+
+    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+        del task_id
+        return len(self._evidence) + len(result.get("skillopt_items") or []) >= self._batch_size
 
     def finalize(self):
         """Flush a final partial minibatch at the end of evolving."""
         if self._evidence:
             batch = list(self._evidence)
             self._evidence.clear()
-            self._optimize_batch(batch)
+            return [self._optimize_batch(batch)]
+        return []
 
     def _gate_score(self, skill: str, hard: float, soft: float) -> float:
         from skillopt.evaluation.gate import select_gate_score
@@ -495,11 +501,20 @@ class SkillOptAgent(SimpleAgent):
             self._gate_mode = old_gate_mode
         return compute_score(results)
 
-    def _optimize_batch(self, batch: list[dict[str, Any]]) -> None:
+    def _optimize_batch(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         self._optimizer_updates += 1
         self._global_step += 1
         update_step = self._global_step
         before = self._active_skill
+        event = {
+            "skill_update_completed": True,
+            "skill_updated": False,
+            "task_ids": sorted({
+                int(item["spg_task_id"])
+                for item in batch if item.get("spg_task_id") is not None
+            }),
+            "update_step": update_step,
+        }
         try:
             raw_patches = run_minibatch_reflect(
                 batch,
@@ -534,7 +549,8 @@ class SkillOptAgent(SimpleAgent):
                     "step": update_step,
                     "batch_size": len(batch),
                 })
-                return
+                event["reason"] = "no_patch"
+                return event
             merged = merge_patches(
                 before,
                 failure_patches,
@@ -561,7 +577,8 @@ class SkillOptAgent(SimpleAgent):
                     "num_edits": len(edits),
                     "reports": reports,
                 })
-                return
+                event["reason"] = "no_change"
+                return event
 
             cand_hard, cand_soft = self._evaluate_skill(candidate)
             gate = evaluate_gate(
@@ -615,6 +632,9 @@ class SkillOptAgent(SimpleAgent):
                 f"(hard={cand_hard:.3f}, soft={cand_soft:.3f})",
                 flush=True,
             )
+            event["skill_updated"] = bool(accepted)
+            event["reason"] = gate.action
+            return event
         except Exception as exc:  # noqa: BLE001
             self._save_history({
                 "event": "error",
@@ -623,6 +643,8 @@ class SkillOptAgent(SimpleAgent):
                 "error": repr(exc),
             })
             print(f"  >>> SkillOpt update failed: {exc}", flush=True)
+            event["reason"] = f"error:{type(exc).__name__}"
+            return event
 
     def _save_history(self, record: dict[str, Any]) -> None:
         record = {"timestamp": time.time(), **record}

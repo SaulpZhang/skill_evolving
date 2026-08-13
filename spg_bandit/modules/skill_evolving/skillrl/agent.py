@@ -102,6 +102,7 @@ class SkillRLAgent(SimpleAgent):
         self._updater = None
         self._groups_since_update = 0
         self._virtual_batch_step = 0
+        self._batch_task_ids: list[int] = []
         self._outcomes_by_type: dict[str, list[bool]] = defaultdict(list)
         self._failed_trajectories: list[dict[str, Any]] = []
         self._update_diagnostics = self._new_update_diagnostics()
@@ -281,16 +282,35 @@ class SkillRLAgent(SimpleAgent):
                     for trajectory in self._failed_trajectory_entries(rollout)
                 )
         self._groups_since_update += 1
+        self._batch_task_ids.append(int(task_id))
         if self._groups_since_update < self._update_batch_size:
-            return
+            return []
         self._virtual_batch_step += 1
         if self._virtual_batch_step % self._skill_update_freq == 0:
-            self._flush_skill_update()
+            return [self._flush_skill_update()]
         else:
             # Upstream inspects only the current training batch at a scheduled
             # global step; evidence from intervening batches is not carried
             # into the next update.
+            task_ids = list(self._batch_task_ids)
             self._clear_update_batch()
+            return [{
+                "skill_update_completed": True,
+                "skill_updated": False,
+                "task_ids": task_ids,
+                "reason": "unscheduled_update",
+            }]
+
+    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+        del task_id, result
+        next_group = self._groups_since_update + 1
+        next_batch = self._virtual_batch_step + 1
+        return (
+            self._dynamic_updates and self._memory is not None
+            and self._updater is not None
+            and next_group >= self._update_batch_size
+            and next_batch % self._skill_update_freq == 0
+        )
 
     def _flush_skill_update(self):
         """Apply SkillRL's training-batch update rule to buffered rollouts."""
@@ -317,6 +337,9 @@ class SkillRLAgent(SimpleAgent):
             "generated": 0,
             "added": 0,
             "reason": "",
+            "skill_update_completed": True,
+            "skill_updated": False,
+            "task_ids": list(self._batch_task_ids),
         }
         if poor_types and failures:
             self._update_diagnostics["gate_passed"] += 1
@@ -345,6 +368,7 @@ class SkillRLAgent(SimpleAgent):
             if added and self._skill_path is not None:
                 self._memory.save_skills(str(self._skill_path))
                 print(f"  >>> SkillRL added {added} dynamic skills", flush=True)
+            event["skill_updated"] = bool(added)
             if not event["reason"]:
                 event["reason"] = (
                     status.get("status", "generated")
@@ -363,11 +387,13 @@ class SkillRLAgent(SimpleAgent):
             event["reason"] = "no_failed_trajectory"
         self._record_update_diagnostic(event)
         self._clear_update_batch()
+        return event
 
     def _clear_update_batch(self):
         self._groups_since_update = 0
         self._outcomes_by_type.clear()
         self._failed_trajectories.clear()
+        self._batch_task_ids.clear()
 
     @staticmethod
     def _trajectory_steps(result: dict) -> list[dict[str, str]]:
@@ -433,7 +459,8 @@ class SkillRLAgent(SimpleAgent):
             and self._flush_partial_batch
             and self._groups_since_update > 0
         ):
-            self._flush_skill_update()
+            return [self._flush_skill_update()]
+        return []
 
     def save_checkpoint(self) -> dict:
         return {
@@ -441,6 +468,7 @@ class SkillRLAgent(SimpleAgent):
             "virtual_batch_step": self._virtual_batch_step,
             "outcomes_by_type": dict(self._outcomes_by_type),
             "failed_trajectories": list(self._failed_trajectories),
+            "batch_task_ids": list(self._batch_task_ids),
             "update_diagnostics": dict(self._update_diagnostics),
         }
 
@@ -457,6 +485,7 @@ class SkillRLAgent(SimpleAgent):
             },
         )
         self._failed_trajectories = list(state.get("failed_trajectories", []))
+        self._batch_task_ids = [int(value) for value in state.get("batch_task_ids", [])]
         self._update_diagnostics = self._new_update_diagnostics()
         self._update_diagnostics.update({
             key: int(value)
