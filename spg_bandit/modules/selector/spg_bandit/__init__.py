@@ -317,9 +317,6 @@ class SPGBanditSelector(BaseSelector):
 
         # Log profile to wandb
         wb = {f"profile/dim_{i}": float(self._profile[i]) for i in range(len(self._profile))}
-        wb["profile/mean"] = float(np.mean(self._profile))
-        wb["profile/min"] = float(np.min(self._profile))
-        wb["profile/max"] = float(np.max(self._profile))
         wb["_step_evolving"] = self._step - self._n_warm + 1
         log_metrics(wb)
 
