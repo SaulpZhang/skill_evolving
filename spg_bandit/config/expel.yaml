@@ -46,3 +46,6 @@ spg_bandit:
   tau: 0.1
   # Uses CUDA when torch can see it; otherwise cleanly falls back to CPU.
   device: auto
+  # In auto mode, leave this much *currently free* GPU memory for vLLM and
+  # other workloads; SPG warmup computation falls back to CPU below it.
+  gpu_min_free_memory_mb: 2048

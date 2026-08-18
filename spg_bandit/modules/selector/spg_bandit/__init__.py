@@ -15,16 +15,41 @@ from spg_bandit.utils.wandb import log_metrics
 from spg_bandit.modules.selector.base import BaseSelector
 
 
-def _resolve_torch_device(requested: str = "auto") -> str:
-    """Resolve the optional accelerator used for warmup-only dense algebra."""
+def _resolve_torch_device(requested: str = "auto", min_free_memory_mb: int = 0) -> str:
+    """Resolve warmup acceleration, safely falling back for ``device=auto``.
+
+    The actor/vLLM owns the GPU budget.  SPG's MLP and ridge regression are
+    optional accelerators, so automatic mode only uses CUDA when its currently
+    *free* memory clears a configurable safety floor.  An explicit ``cuda``
+    request remains an opt-in override for users who want strict placement.
+    """
     if requested not in {"auto", "cpu", "cuda"} and not requested.startswith("cuda:"):
         raise ValueError("spg_bandit.device must be auto, cpu, cuda, or cuda:<index>")
+    if min_free_memory_mb < 0:
+        raise ValueError("spg_bandit.gpu_min_free_memory_mb must be non-negative")
     try:
         import torch
     except ImportError:
         return "cpu"
     if requested == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if not torch.cuda.is_available():
+            return "cpu"
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_mb = free_bytes / (1024 ** 2)
+        if free_mb < min_free_memory_mb:
+            print(
+                "  [SPG] CUDA has only "
+                f"{free_mb:.0f}/{total_bytes / (1024 ** 2):.0f} MiB free; "
+                f"need {min_free_memory_mb} MiB for auto mode, using CPU",
+                flush=True,
+            )
+            return "cpu"
+        print(
+            "  [SPG] CUDA auto mode enabled "
+            f"({free_mb:.0f}/{total_bytes / (1024 ** 2):.0f} MiB free)",
+            flush=True,
+        )
+        return "cuda"
     if requested.startswith("cuda") and not torch.cuda.is_available():
         print("  [SPG] CUDA requested but unavailable; falling back to CPU", flush=True)
         return "cpu"
@@ -317,7 +342,7 @@ class SPGBanditSelector(BaseSelector):
                  lambda_reg: float = 1.0, seed: int = 42,
                  K: int = 6, warmup_ids: list[int] | None = None,
                  window_size: int = 20, device: str = "auto",
-                 task_state_dim: int = 0):
+                 task_state_dim: int = 0, gpu_min_free_memory_mb: int = 2048):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -325,7 +350,11 @@ class SPGBanditSelector(BaseSelector):
         self._lambda = lambda_reg
         self._seed = seed
         self._d_f, self._d_h = d_f, d_h
-        self._device = _resolve_torch_device(device)
+        self._requested_device = device
+        self._gpu_min_free_memory_mb = int(gpu_min_free_memory_mb)
+        self._device = _resolve_torch_device(
+            device, self._gpu_min_free_memory_mb,
+        )
         self._task_state_dim = int(task_state_dim)
         if self._task_state_dim < 0:
             raise ValueError("task_state_dim must be non-negative")
@@ -601,6 +630,12 @@ class SPGBanditSelector(BaseSelector):
 
     def _finalize_warmup(self):
         print(f"\n  [SPG] Finalizing warmup ({self._n_warm} tasks)...")
+
+        # Re-check just before the only GPU-heavy work.  vLLM may have
+        # allocated more KV cache after selector construction.
+        self._device = _resolve_torch_device(
+            self._requested_device, self._gpu_min_free_memory_mb,
+        )
 
         N = len(self._warmup_task_ids)
         if N == 0:

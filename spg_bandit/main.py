@@ -77,6 +77,7 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
             window_size=window_size,
             K=params.get("K", task_type_count or 6),
             device=params.get("device", "auto"),
+            gpu_min_free_memory_mb=params.get("gpu_min_free_memory_mb", 2048),
             task_state_dim=task_state_dim,
         )
     raise ValueError(f"Unknown selector: {name}")
