@@ -15,14 +15,58 @@ from spg_bandit.utils.wandb import log_metrics
 from spg_bandit.modules.selector.base import BaseSelector
 
 
+def _resolve_torch_device(requested: str = "auto") -> str:
+    """Resolve the optional accelerator used for warmup-only dense algebra."""
+    if requested not in {"auto", "cpu", "cuda"} and not requested.startswith("cuda:"):
+        raise ValueError("spg_bandit.device must be auto, cpu, cuda, or cuda:<index>")
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print("  [SPG] CUDA requested but unavailable; falling back to CPU", flush=True)
+        return "cpu"
+    return requested
+
+
+def _ridge_predict(X_seen, y_seen, X_all, alpha: float, device: str) -> np.ndarray:
+    """Multi-output ridge with an optional CUDA implementation.
+
+    sklearn's default Ridge fits an intercept.  The torch path implements the
+    same centered closed-form solution and returns predictions for ``X_all``.
+    """
+    if device != "cpu":
+        try:
+            import torch
+            dtype = torch.float32
+            x = torch.as_tensor(X_seen, dtype=dtype, device=device)
+            y = torch.as_tensor(y_seen, dtype=dtype, device=device)
+            query = torch.as_tensor(X_all, dtype=dtype, device=device)
+            x_mean, y_mean = x.mean(dim=0, keepdim=True), y.mean(dim=0, keepdim=True)
+            xc, yc = x - x_mean, y - y_mean
+            gram = xc.T @ xc + float(alpha) * torch.eye(xc.shape[1], dtype=dtype, device=device)
+            coef = torch.linalg.solve(gram, xc.T @ yc)
+            prediction = (query - x_mean) @ coef + y_mean
+            return prediction.detach().cpu().numpy()
+        except Exception as exc:
+            print(f"  [SPG] GPU ridge failed ({type(exc).__name__}); using sklearn CPU", flush=True)
+    reg = Ridge(alpha=alpha)
+    reg.fit(X_seen, y_seen)
+    return reg.predict(X_all)
+
+
 # ── MLP Featurizer ──────────────────────────────────────────────────────────
 
 class MLPFeaturizer:
     """Two-layer MLP: R^d_c → R^d_h → R^d_f."""
 
-    def __init__(self, d_c: int, d_h: int = 32, d_f: int = 16, seed: int = 42):
+    def __init__(self, d_c: int, d_h: int = 32, d_f: int = 16, seed: int = 42,
+                 device: str = "cpu"):
         self.d_c, self.d_h, self.d_f = d_c, d_h, d_f
         self.lr = 1e-3
+        self.device = _resolve_torch_device(device)
         self.rng = np.random.default_rng(seed)
         b1 = np.sqrt(6.0 / (d_c + d_h))
         self.W1 = self.rng.uniform(-b1, b1, (d_c, d_h))
@@ -55,6 +99,58 @@ class MLPFeaturizer:
         self._head_b = np.array(state["head_b"]) if state.get("head_b") is not None else None
 
     def train(self, X, y, epochs=50, batch_size=32, wandb_prefix="mlp"):
+        """Train on CUDA when available, retaining NumPy as a dependency-free fallback."""
+        if self.device != "cpu":
+            try:
+                return self._train_torch(X, y, epochs, batch_size, wandb_prefix)
+            except Exception as exc:
+                print(f"  [SPG] GPU MLP failed ({type(exc).__name__}); using NumPy CPU", flush=True)
+        return self._train_numpy(X, y, epochs, batch_size, wandb_prefix)
+
+    def _train_torch(self, X, y, epochs, batch_size, wandb_prefix):
+        import torch
+        x = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        target = torch.as_tensor(y, dtype=torch.float32, device=self.device)
+        N, K = x.shape[0], target.shape[1]
+        if self._head_W is None:
+            bound = np.sqrt(6.0 / (self.d_f + K))
+            self._head_W = self.rng.uniform(-bound, bound, (self.d_f, K))
+            self._head_b = np.zeros(K)
+        params = [
+            torch.tensor(self.W1, dtype=torch.float32, device=self.device, requires_grad=True),
+            torch.tensor(self.b1, dtype=torch.float32, device=self.device, requires_grad=True),
+            torch.tensor(self.W2, dtype=torch.float32, device=self.device, requires_grad=True),
+            torch.tensor(self.b2, dtype=torch.float32, device=self.device, requires_grad=True),
+            torch.tensor(self._head_W, dtype=torch.float32, device=self.device, requires_grad=True),
+            torch.tensor(self._head_b, dtype=torch.float32, device=self.device, requires_grad=True),
+        ]
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+        loss_history = []
+        for epoch in range(epochs):
+            permutation = torch.randperm(N, device=self.device)
+            total_loss, examples = 0.0, 0
+            for start in range(0, N, batch_size):
+                idx = permutation[start:min(start + batch_size, N)]
+                xb, yb = x[idx], target[idx]
+                phi = torch.relu(xb @ params[0] + params[1]) @ params[2] + params[3]
+                prediction = phi @ params[4] + params[5]
+                loss = torch.mean((prediction - yb) ** 2)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.detach()) * len(idx)
+                examples += len(idx)
+            avg_loss = total_loss / max(examples, 1)
+            loss_history.append(avg_loss)
+            if epoch % 10 == 9:
+                print(f"  MLP epoch {epoch + 1}: MSE = {avg_loss:.6f}", flush=True)
+            log_metrics({f"{wandb_prefix}/mse": avg_loss, "_step_spg": epoch})
+        self.W1, self.b1, self.W2, self.b2, self._head_W, self._head_b = [
+            value.detach().cpu().numpy() for value in params
+        ]
+        return loss_history
+
+    def _train_numpy(self, X, y, epochs=50, batch_size=32, wandb_prefix="mlp"):
         N, K = X.shape[0], y.shape[1]
         if self._head_W is None:
             bound = np.sqrt(6.0 / (self.d_f + K))
@@ -220,7 +316,8 @@ class SPGBanditSelector(BaseSelector):
                  d_f: int = 16, d_h: int = 32,
                  lambda_reg: float = 1.0, seed: int = 42,
                  K: int = 6, warmup_ids: list[int] | None = None,
-                 window_size: int = 20):
+                 window_size: int = 20, device: str = "auto",
+                 task_state_dim: int = 0):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -228,6 +325,12 @@ class SPGBanditSelector(BaseSelector):
         self._lambda = lambda_reg
         self._seed = seed
         self._d_f, self._d_h = d_f, d_h
+        self._device = _resolve_torch_device(device)
+        self._task_state_dim = int(task_state_dim)
+        if self._task_state_dim < 0:
+            raise ValueError("task_state_dim must be non-negative")
+        self._task_state_provider = None
+        self._last_task_state = np.zeros(self._task_state_dim)
         self._window_size = window_size
         if self._window_size <= 0:
             raise ValueError("window_size must be positive")
@@ -259,6 +362,9 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_outcomes = []
         self._warmup_deltas = []
         self._warmup_embeds = []
+        # Raw before/after probe observations for ExpeL-style online skill
+        # updates. They are replayed after warmup once MIRT is identifiable.
+        self._warmup_gain_measurements = []
 
         # MIRT fitted params for online update
         self._A_fit = None
@@ -275,6 +381,30 @@ class SPGBanditSelector(BaseSelector):
         """Return a copy of the current MIRT ability profile."""
         return self._profile.copy()
 
+    def set_task_state_provider(self, provider, feature_dim: int):
+        """Attach optional method state without making it part of the selector seam."""
+        feature_dim = int(feature_dim)
+        if feature_dim != self._task_state_dim:
+            if self._mlp is not None:
+                raise ValueError("Cannot change task-state feature size after warmup")
+            self._task_state_dim = feature_dim
+            self._last_task_state = np.zeros(feature_dim)
+        self._task_state_provider = provider
+
+    def _task_state(self, task_id: int) -> np.ndarray:
+        if self._task_state_dim == 0 or self._task_state_provider is None:
+            return np.zeros(self._task_state_dim)
+        state = np.asarray(self._task_state_provider(int(task_id)), dtype=float)
+        if state.shape != (self._task_state_dim,):
+            raise ValueError(
+                f"Task-state provider returned {state.shape}; expected ({self._task_state_dim},)"
+            )
+        return state
+
+    def _model_input(self, task_id: int, profile: np.ndarray, task_state: np.ndarray | None = None):
+        state = self._task_state(task_id) if task_state is None else task_state
+        return np.concatenate([self._task_pool.get_embedding(task_id), profile, state])
+
     def save_warmup_data(self, path: str):
         """Save warmup data to JSON for future --warmup-data runs."""
         data = {
@@ -283,6 +413,8 @@ class SPGBanditSelector(BaseSelector):
             "trials": self._warmup_trials,
             "outcomes": self._warmup_outcomes,
             "deltas": [d.tolist() for d in self._warmup_deltas],
+            "gain_measurements": self._warmup_gain_measurements,
+            "task_states": [state.tolist() for state in self._warmup_embeds],
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -299,6 +431,11 @@ class SPGBanditSelector(BaseSelector):
             [[bool(success)] for success in self._warmup_successes],
         )
         self._warmup_deltas = [np.array(d) for d in data["deltas"]]
+        self._warmup_gain_measurements = list(data.get("gain_measurements", []))
+        self._warmup_embeds = [
+            np.asarray(state, dtype=float)
+            for state in data.get("task_states", [np.zeros(self._task_state_dim)] * len(self._warmup_task_ids))
+        ]
         self._n_warm = len(self._warmup_task_ids)
         self._finalize_warmup()
         self._step = self._n_warm
@@ -307,6 +444,7 @@ class SPGBanditSelector(BaseSelector):
         if self._step < self._n_warm:
             tid = self._warmup_ids[self._step % len(self._warmup_ids)]
             self._last_phi = None
+            self._last_task_state = self._task_state(tid)
             self._step += 1
             return tid
 
@@ -323,13 +461,15 @@ class SPGBanditSelector(BaseSelector):
         A_inv = np.linalg.inv(self._A)
         best_score, best_tid = -np.inf, 0
         for tau in range(task_pool.M):
-            inp = np.concatenate([task_pool.get_embedding(tau), self._profile])
+            task_state = self._task_state(tau)
+            inp = self._model_input(tau, self._profile, task_state)
             phi = self._mlp.forward(inp)
             delta_hat = self._W.T @ phi
             ucb = self._alpha * np.linalg.norm(g) * np.sqrt(max(phi @ A_inv @ phi, 1e-10))
             score = g @ delta_hat + ucb
             if score > best_score:
                 best_score, best_tid, self._last_phi = score, tau, phi
+                self._last_task_state = task_state.copy()
 
         self._step += 1
         return best_tid
@@ -349,6 +489,7 @@ class SPGBanditSelector(BaseSelector):
             self._warmup_trials.append(trials)
             self._warmup_outcomes.append(outcomes)
             self._warmup_deltas.append(result.get("delta", np.zeros(self._K)))
+            self._warmup_embeds.append(self._last_task_state.copy())
         elif self._warmup_ready:
             a_tau = self._A_fit[task_id]
             d_tau = self._d_fit[task_id]
@@ -357,6 +498,56 @@ class SPGBanditSelector(BaseSelector):
             )
             if self._last_phi is not None:
                 self._pending_skill_observations.append((task_id, self._last_phi.copy()))
+
+    @staticmethod
+    def _compact_probe_results(results: list[dict]) -> list[dict]:
+        """Store only grouped success observations, never large trajectories."""
+        compact = []
+        for item in results:
+            outcomes = item.get("rollout_successes")
+            if outcomes is None:
+                outcomes = [bool(item.get("success", False))]
+            compact.append({
+                "task_id": int(item["task_id"]),
+                "rollout_successes": [bool(value) for value in outcomes],
+            })
+        return compact
+
+    def record_warmup_skill_measurement(self, task_id: int, before_results: list[dict],
+                                        after_results: list[dict] | None, *, updated: bool):
+        """Record an ExpeL update's raw probe evidence during warmup.
+
+        The warmup schedule is fixed, so no MIRT estimate is needed yet.  At
+        warmup end the final item parameters are used to reconstruct these
+        causal labels on one consistent latent scale.
+        """
+        if self._warmup_ready or not self._warmup_task_ids:
+            return
+        self._warmup_gain_measurements.append({
+            "task_id": int(task_id),
+            "warmup_index": len(self._warmup_task_ids) - 1,
+            "updated": bool(updated),
+            "before": self._compact_probe_results(before_results),
+            "after": self._compact_probe_results(after_results or []),
+        })
+
+    def _profile_from_probe_results(self, results: list[dict], base_profile: np.ndarray) -> np.ndarray:
+        profile = np.asarray(base_profile, dtype=float).copy()
+        for item in results:
+            outcomes = [bool(value) for value in item.get("rollout_successes", [])]
+            if not outcomes:
+                continue
+            task_id = int(item["task_id"])
+            profile = online_profile_update(
+                profile, self._A_fit[task_id], self._d_fit[task_id],
+                sum(outcomes), len(outcomes),
+            )
+        return profile
+
+    def discard_latest_pending_observation(self):
+        """Drop an unlabelled immediate-attribution selection safely."""
+        if self._pending_skill_observations:
+            self._pending_skill_observations.pop()
 
     def estimate_profile_from_results(self, results: list[dict], *, base_profile=None):
         """Estimate ability from probe outcomes without mutating selector state."""
@@ -432,6 +623,7 @@ class SPGBanditSelector(BaseSelector):
 
         # Sequential MIRT EM: run EM with cumulative data to compute per-step deltas
         profiles_before = []
+        profiles_after_task = []
         profile = np.zeros(self._K)
         deltas = []
         for t in range(N):
@@ -443,6 +635,7 @@ class SPGBanditSelector(BaseSelector):
             profiles_before.append(profile.copy())
             deltas.append(new_profile - profile)
             profile = new_profile
+            profiles_after_task.append(profile.copy())
 
         # Final EM on all N (verbose, for logging + item params)
         s_hist, self._A_fit, self._d_fit, ll, ll_history = fit_mirt_em(
@@ -457,26 +650,69 @@ class SPGBanditSelector(BaseSelector):
         y_seen = np.column_stack([
             self._A_fit[warmup_ids], self._d_fit[warmup_ids].reshape(-1, 1),
         ])
-        reg = Ridge(alpha=self._lambda)
-        reg.fit(X_seen, y_seen)
+        y_pred_train = _ridge_predict(
+            X_seen, y_seen, X_seen, self._lambda, self._device,
+        )
         # Ridge is unconstrained, so project its extrapolated item parameters
         # back to the same non-negative MIRT domain used by EM.
-        y_pred_train = np.maximum(reg.predict(X_seen), 0.0)
+        y_pred_train = np.maximum(y_pred_train, 0.0)
         pred_mse = float(np.mean((y_pred_train - y_seen) ** 2))
         log_metrics({"mirt/pred_mse": pred_mse, "_step_mirt": 0})
         X_all = self._task_pool.embeddings
-        y_pred = np.maximum(reg.predict(X_all), 0.0)
+        y_pred = np.maximum(
+            _ridge_predict(X_seen, y_seen, X_all, self._lambda, self._device), 0.0,
+        )
         self._A_fit = y_pred[:, :self._K]
         self._d_fit = y_pred[:, self._K]
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i + 1})
 
-        # MLP training: X = [embedding(384) | profile_before(K)], y = delta(K)
-        embeds = [self._task_pool.get_embedding(tid) for tid in self._warmup_task_ids]
-        X = np.array([np.concatenate([e, p]) for e, p in zip(embeds, profiles_before)])
-        y = np.array(deltas)
-        self._warmup_deltas = deltas
-        self._mlp = MLPFeaturizer(self._task_pool.d_c + self._K, self._d_h, self._d_f, self._seed)
+        # ExpeL labels are measured after reflection on a fixed probe set.  A
+        # legacy run without these records retains the historical sequential
+        # MIRT target, keeping old warmup JSON files usable.
+        train_ids = list(self._warmup_task_ids)
+        train_profiles = list(profiles_before)
+        train_deltas = list(deltas)
+        train_task_states = list(self._warmup_embeds)
+        if len(train_task_states) != len(train_ids):
+            train_task_states = [np.zeros(self._task_state_dim) for _ in train_ids]
+        last_measured_profile = None
+        if self._warmup_gain_measurements:
+            measured_ids, measured_profiles, measured_deltas, measured_task_states = [], [], [], []
+            for measurement in self._warmup_gain_measurements:
+                index = int(measurement.get("warmup_index", -1))
+                if not 0 <= index < len(profiles_after_task):
+                    continue
+                anchor = profiles_after_task[index]
+                before = self._profile_from_probe_results(measurement.get("before", []), anchor)
+                if measurement.get("updated"):
+                    after = self._profile_from_probe_results(measurement.get("after", []), anchor)
+                    delta = after - before
+                    last_measured_profile = after
+                else:
+                    delta = np.zeros(self._K)
+                measured_ids.append(int(measurement["task_id"]))
+                measured_profiles.append(before)
+                measured_deltas.append(delta)
+                measured_task_states.append(self._warmup_embeds[index].copy())
+            if measured_ids:
+                train_ids, train_profiles, train_deltas, train_task_states = (
+                    measured_ids, measured_profiles, measured_deltas, measured_task_states,
+                )
+                self._metrics["warmup_causal_gain_labels"] = len(measured_ids)
+        # MLP training: X = [embedding | profile_before], y = skill gain.
+        embeds = [self._task_pool.get_embedding(tid) for tid in train_ids]
+        X = np.array([
+            np.concatenate([e, p, state])
+            for e, p, state in zip(embeds, train_profiles, train_task_states)
+        ])
+        y = np.array(train_deltas)
+        self._warmup_deltas = train_deltas
+        self._mlp = MLPFeaturizer(
+            self._task_pool.d_c + self._K + self._task_state_dim,
+            self._d_h, self._d_f, self._seed,
+            device=self._device,
+        )
         loss_hist = self._mlp.train(X, y, 50, wandb_prefix="spg")
         self._metrics["mlp_loss_history"] = [round(v, 6) for v in loss_hist]
         print(f"  [SPG] MLP final MSE: {loss_hist[-1]:.6f}")
@@ -486,10 +722,14 @@ class SPGBanditSelector(BaseSelector):
         self._window.clear()
         self._A = self._lambda * np.eye(self._d_f)
         self._B = np.zeros((self._d_f, self._K))
-        for embedding, profile_before, delta in zip(embeds, profiles_before, deltas):
-            phi = self._mlp.forward(np.concatenate([embedding, profile_before]))
+        for embedding, profile_before, task_state, delta in zip(
+            embeds, train_profiles, train_task_states, train_deltas,
+        ):
+            phi = self._mlp.forward(np.concatenate([embedding, profile_before, task_state]))
             self._append_window_observation(phi, delta)
         self._W = np.linalg.solve(self._A, self._B)
+        if last_measured_profile is not None:
+            self._profile = last_measured_profile.copy()
         self._warmup_ready = True
 
     def _append_window_observation(self, phi: np.ndarray, delta: np.ndarray):
@@ -519,6 +759,7 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_outcomes.clear()
         self._warmup_deltas.clear()
         self._warmup_embeds.clear()
+        self._warmup_gain_measurements.clear()
         self._A_fit = None
         self._d_fit = None
 
@@ -536,6 +777,9 @@ class SPGBanditSelector(BaseSelector):
             "successes": list(self._warmup_successes),
             "trials": list(self._warmup_trials),
             "outcomes": list(self._warmup_outcomes),
+            "gain_measurements": list(self._warmup_gain_measurements),
+            "task_states": [state.tolist() for state in self._warmup_embeds],
+            "task_state_dim": self._task_state_dim,
             "window": [
                 {"phi": phi.tolist(), "delta": delta.tolist()}
                 for phi, delta in self._window
@@ -546,7 +790,7 @@ class SPGBanditSelector(BaseSelector):
             ],
             "window_size": self._window_size,
             "mlp": self._mlp.get_state() if self._mlp is not None else None,
-            "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed} if self._mlp is not None else None,
+            "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed, "device": self._device} if self._mlp is not None else None,
         }
 
     def load_checkpoint(self, data: dict):
@@ -572,6 +816,12 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_outcomes = list(data.get(
             "outcomes", [[bool(success)] for success in self._warmup_successes],
         ))
+        self._warmup_gain_measurements = list(data.get("gain_measurements", []))
+        self._task_state_dim = int(data.get("task_state_dim", self._task_state_dim))
+        self._warmup_embeds = [
+            np.asarray(item, dtype=float)
+            for item in data.get("task_states", [np.zeros(self._task_state_dim)] * len(self._warmup_task_ids))
+        ]
         self._window_size = data.get("window_size", self._window_size)
         self._window = deque(
             (np.array(item["phi"]), np.array(item["delta"]))
@@ -584,6 +834,9 @@ class SPGBanditSelector(BaseSelector):
         if data.get("mlp") and self._mlp is None:
             mlp_cfg = data["mlp_cfg"]
             import numpy as np
-            self._mlp = MLPFeaturizer(mlp_cfg["d_c"], mlp_cfg["d_h"], mlp_cfg["d_f"], mlp_cfg["seed"])
+            self._mlp = MLPFeaturizer(
+                mlp_cfg["d_c"], mlp_cfg["d_h"], mlp_cfg["d_f"], mlp_cfg["seed"],
+                device=mlp_cfg.get("device", self._device),
+            )
         if data.get("mlp"):
             self._mlp.set_state(data["mlp"])

@@ -25,6 +25,26 @@ class BaseSkillEvolving(ABC):
         Default no-op.
         """
 
+    @property
+    def selection_feature_dim(self) -> int:
+        """Number of task-state features exposed to a stateful selector."""
+        return 0
+
+    def get_selection_features(self, task_id: int):
+        """Return current task-local learning-state features.
+
+        The default deliberately exposes no method-specific state.  ExpeL
+        overrides this so SPG can learn marginal value without hand-written
+        repetition penalties.
+        """
+        del task_id
+        return []
+
+    @property
+    def immediate_gain_attribution(self) -> bool:
+        """Whether an unlabeled selection must not be credited to a later update."""
+        return False
+
     def reflect(self, task_id: int, result: dict):
         """Optional: reflect on execution and evolve skills.
         Called by orchestrator after execute(). Default no-op.

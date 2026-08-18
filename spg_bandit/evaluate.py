@@ -101,7 +101,7 @@ def _make_dataset_config(
 
 
 def _evaluation_skill_config(skill_config: dict[str, Any]) -> dict[str, Any]:
-    """Return the saved SkillRL/SkillOpt config in no-update evaluation mode."""
+    """Return a skill-evolving config in no-update evaluation mode."""
     evaluation_config = dict(skill_config)
     evaluation_config["enable_dynamic_update"] = False
     if "evaluation_temperature" in skill_config:

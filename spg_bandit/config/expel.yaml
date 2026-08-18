@@ -1,0 +1,48 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 50
+
+dataset:
+  name: alfworld
+
+evolve:
+  split: train
+
+evaluate:
+  split: valid_unseen
+
+selector: spg_bandit
+
+skill_evolving:
+  name: expel
+  # One selected task is one ExpeL learning unit.  Multiple rollouts create
+  # success/failure evidence before the immediate reflection attempt.
+  rollouts_per_task: 2
+  evaluation_rollouts_per_task: 1
+  temperature: 0.3
+  max_tokens: 1024
+  evaluation_temperature: 0.3
+  evaluation_max_tokens: 1024
+  history_length: 5
+  enable_dynamic_update: true
+  min_evidence: 2
+  min_failures_for_critique: 2
+  top_k: 2
+  max_examples_per_prompt: 2
+  max_rules: 10
+  max_task_history: 12
+  reflection_max_tokens: 4096
+  reflection_temperature: 0.0
+
+spg_bandit:
+  warmup_ratio: 0.4
+  window_size: 20
+  # A fixed internal probe set is executed before/after actual ExpeL rule
+  # changes. Probe trajectories never enter the ExpeL experience store.
+  probe_size: 12
+  K: 4
+  alpha: 0.1
+  d_f: 16
+  tau: 0.1
+  # Uses CUDA when torch can see it; otherwise cleanly falls back to CPU.
+  device: auto

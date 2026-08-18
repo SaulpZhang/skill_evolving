@@ -41,11 +41,6 @@ REFLECTION_BASE_URL=
 REFLECTION_API_KEY=
 REFLECTION_MODEL=
 
-# SkillOpt 可选的独立 optimizer endpoint；不设置则复用 reflection/target
-OPTIMIZER_BASE_URL=
-OPTIMIZER_API_KEY=
-OPTIMIZER_MODEL=
-
 # W&B（可选）
 wandb_key=your-wandb-key
 ```
@@ -86,10 +81,6 @@ evolve:
 # Evaluation 阶段
 evaluate:
   split: valid_unseen               # 评估用 held-out split
-
-# SkillOpt gate（仅 skill_evolving.name: skillopt 使用）
-skill_selection:
-  split: valid_seen                 # 固定 gate pool，不进入 selector
 
 # 实验随机种子
 experiment:
@@ -287,14 +278,14 @@ logs/<run_id>/
     comparison.json              # 汇总结果
   <selector>/
     messages/                    # 每步 API 请求/响应 和 reflection 记录
-    skillopt/
-      predictions/               # SkillOpt 分析用 conversation.json
-      patches/                   # 每个批次的候选 patch
-      updates.jsonl              # aggregate/update/gate 记录
+    expel/
+      experiences.jsonl          # ExpeL experience event stream
+      reflections.jsonl          # 完整 reflection 请求/响应/错误
+      rule_updates.jsonl         # 规则更新和 provenance
+      gain_measurements.jsonl    # probe + MIRT skill-gain 标签
 
 skills/<run_id>/skills.json      # SkillRL SkillBank（SkillRL 配置）
-skills/<run_id>/best_skill.md    # SkillOpt gate 接受的最佳 Markdown skill
-skills/<run_id>/current_skill.md # SkillOpt 当前 Markdown skill
+skills/<run_id>/expel_state.json # ExpeL rule bank 与 experience store
 ```
 
 ## SkillRL adapter
@@ -321,26 +312,22 @@ Both configs point to `resource/skillrl/memory_data/alfworld/claude_style_skills
 Set `skill_evolving.skill_bank_path` to another JSON SkillBank later without
 changing the agent implementation.
 
-## SkillOpt adapter
+## ExpeL adapter
 
-SkillOpt is available as a separate backend through `-c skillopt` and
-`-c skillopt_uniform`. The runner keeps task selection in SPG-Bandit, while
-the vendored SkillOpt core performs minibatch reflection, patch aggregation,
-bounded edit selection, and a fixed validation-gate check. The gate pool is
-configured by `skill_selection.split` and is never sent to the selector or
-the final evaluation split.
-
-All runtime SkillOpt files are vendored under `resource/skillopt`; the
-upstream checkout in `docs` is only a development reference and is not
-imported. The default optimizer endpoint falls back to
-`REFLECTION_BASE_URL`/`REFLECTION_MODEL` and then the target `LLM_*` variables.
+`-c expel` runs the online ExpeL adapter with SPG-Bandit; `-c expel_uniform`
+is the matching Uniform control. A selected task produces multiple rollouts,
+then an ExpeL reflection attempt can add, edit, or remove reusable rules.
+Successful experiences are retrieved into later prompts. Reflection always
+uses `REFLECTION_*`; action generation uses `LLM_*`.
 
 ```bash
-python spg_bandit/main.py -c skillopt --evaluating --no-wandb       # SPG
-python spg_bandit/main.py -c skillopt_uniform --evaluating --no-wandb # Uniform
+python spg_bandit/main.py -c expel --evaluating --no-wandb
+python spg_bandit/main.py -c expel_uniform --evaluating --no-wandb
 ```
 
-The initial ALFWorld skill is
-`resource/skillopt/envs/alfworld/skills/initial.md`. Set
-`skill_evolving.initial_skill_path` (or inline `initial_skill`) to use a
-different Markdown skill without changing the adapter.
+For SPG, the fixed internal probe set supplies pre/post-rule-update outcomes.
+At warmup end, MIRT fits one latent scale and reconstructs those observations
+into causal profile-delta labels before training the MLP. Set
+`spg_bandit.device: auto` (default) or `cuda` to run warmup MLP training and
+the embedding-to-`a,d` ridge regression on a visible GPU. MIRT-EM itself
+currently uses SciPy on CPU.

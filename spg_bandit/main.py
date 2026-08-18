@@ -59,7 +59,7 @@ def build_parser():
 
 
 def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
-                    window_size=20, task_type_count=None):
+                    window_size=20, task_type_count=None, task_state_dim=0):
     params = config.get(name, {})
     if name == "uniform":
         return UniformSelector(
@@ -76,6 +76,8 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
             warmup_ids=warmup_ids,
             window_size=window_size,
             K=params.get("K", task_type_count or 6),
+            device=params.get("device", "auto"),
+            task_state_dim=task_state_dim,
         )
     raise ValueError(f"Unknown selector: {name}")
 
@@ -221,26 +223,6 @@ def main():
     eva_dataset = create_dataset(dataset_name, _make_cfg(eva_overrides))
     eva_pool = eva_dataset.task_pool
 
-    # SkillOpt uses a fixed, non-selector pool for its validation gate.  Keep
-    # this split separate from both the evolve and evaluate pools so neither
-    # selector receives gate tasks as evidence and the final test remains
-    # untouched.  Only dataset fields are forwarded; selection controls such
-    # as ``selection_size`` stay in the SkillOpt config.
-    skill_selection_dataset = None
-    if agent_name == "skillopt":
-        selection_cfg = config.get("skill_selection", {})
-        if not isinstance(selection_cfg, dict):
-            raise ValueError("skill_selection must be a mapping")
-        selection_split = selection_cfg.get("split", "valid_seen")
-        logger.info("Loading SkillOpt selection dataset (%s)...", selection_split)
-        skill_selection_dataset = create_dataset(
-            dataset_name,
-            _make_cfg({"split": selection_split}),
-        )
-        # Force pool construction here so the fixed ids are known before the
-        # agent starts consuming target-model calls.
-        _ = skill_selection_dataset.task_pool
-
     n_bandit = evo_pool.M
     n_eva = eva_pool.M
     max_turns = config.get("max_turns", 51)
@@ -266,19 +248,24 @@ def main():
     records_dir = str(log_base / sel_name / "messages")
     method = create_skill_evolving(
         agent_name, evo_dataset, max_turns, records_dir, skill_config,
-        selection_dataset=skill_selection_dataset,
     )
     method.load_skills(skills_dir)
     selector = create_selector(
         sel_name, evo_pool, config, warmup_ids=warmup_ids, n_warm=n_warm,
         window_size=window_size, task_type_count=len(evo_pool.task_types),
+        task_state_dim=getattr(method, "selection_feature_dim", 0),
     )
+    if isinstance(selector, SPGBanditSelector):
+        selector.set_task_state_provider(
+            method.get_selection_features,
+            getattr(method, "selection_feature_dim", 0),
+        )
 
     if selector.needs_warmup:
         n_bandit = evo_pool.M - n_warm
 
     # A fixed, type-balanced probe subset measures the ability-profile change
-    # caused by a SkillRL/SkillOpt update.  It is never reflected on and is
+    # caused by a skill-bank update.  It is never reflected on and is
     # therefore evaluation evidence rather than additional training data.
     probe_ids = []
     if sel_name == "spg_bandit":
@@ -334,7 +321,11 @@ def main():
         if not events or not isinstance(selector, SPGBanditSelector):
             return
         for event in events:
-            if not isinstance(event, dict) or not event.get("skill_update_completed"):
+            if (
+                not isinstance(event, dict)
+                or not event.get("skill_update_completed")
+                or not event.get("bandit_label_ready", True)
+            ):
                 continue
             updated = bool(event.get("skill_updated", False))
             measured_before = None
@@ -363,6 +354,8 @@ def main():
                 "profile_after": measured_after,
             }
             recorder.append_jsonl("spg_skill_gain", record)
+            if hasattr(method, "record_gain_measurement"):
+                method.record_gain_measurement(record)
             log_metrics({
                 **{f"spg/skill_gain_dim_{i}": value for i, value in enumerate(committed["delta"])},
                 "spg/skill_gain_batch_size": committed["committed"],
@@ -420,17 +413,64 @@ def main():
             # the MLP supervision signal.
             anchor_profile = None
             before_profile = None
+            warmup_before_results = None
             if (
                 probe_ids and isinstance(selector, SPGBanditSelector)
-                and selector._warmup_ready
                 and method.will_update_after_reflect(task_id, result)
             ):
-                anchor_profile = selector.get_profile()
-                before_profile = selector.estimate_profile_from_results(
-                    _run_skill_gain_probes(), base_profile=anchor_profile,
-                )
+                if selector._warmup_ready:
+                    anchor_profile = selector.get_profile()
+                    before_profile = selector.estimate_profile_from_results(
+                        _run_skill_gain_probes(), base_profile=anchor_profile,
+                    )
+                else:
+                    # Warmup still evolves ExpeL online.  Store raw probes now
+                    # and replay them after fitting one consistent MIRT scale.
+                    warmup_before_results = _run_skill_gain_probes()
             update_events = method.reflect(task_id, result) or []
-            _commit_skill_gain(update_events, anchor_profile, before_profile)
+            if (
+                isinstance(selector, SPGBanditSelector)
+                and selector._warmup_ready
+                and getattr(method, "immediate_gain_attribution", False)
+                and not any(
+                    isinstance(event, dict)
+                    and event.get("skill_update_completed")
+                    and event.get("bandit_label_ready", True)
+                    for event in update_events
+                )
+            ):
+                # ExpeL's action is one task-local learning unit.  If no
+                # update label was produced (insufficient evidence/API error),
+                # do not credit this task with a later task's rule change.
+                selector.discard_latest_pending_observation()
+            if warmup_before_results is not None:
+                for event in update_events:
+                    if (
+                        isinstance(event, dict)
+                        and event.get("skill_update_completed")
+                        and event.get("bandit_label_ready", True)
+                    ):
+                        updated = bool(event.get("skill_updated", False))
+                        after_results = _run_skill_gain_probes() if updated else None
+                        selector.record_warmup_skill_measurement(
+                            task_id, warmup_before_results, after_results,
+                            updated=updated,
+                        )
+                        recorder.append_jsonl("spg_skill_gain", {
+                            "event": "warmup_skill_gain_observation",
+                            "update": event,
+                            "probe_task_ids": probe_ids,
+                            "updated": updated,
+                        })
+                        if hasattr(method, "record_gain_measurement"):
+                            method.record_gain_measurement({
+                                "event": "warmup_skill_gain_observation",
+                                "update": event,
+                                "probe_task_ids": probe_ids,
+                                "updated": updated,
+                            })
+            else:
+                _commit_skill_gain(update_events, anchor_profile, before_profile)
 
             successes = int(result.get("successes", int(bool(result["success"]))))
             num_rollouts = int(result.get("num_rollouts", 1))
@@ -462,9 +502,7 @@ def main():
         finish_wandb()
         raise
 
-    # Batch optimizers (SkillOpt) may have a partial minibatch left after the
-    # final selected task.  Flush it before saving metrics or evaluating the
-    # resulting skill.
+    # A method may have a final partial update after the last selected task.
     final_anchor_profile = None
     final_before_profile = None
     if (
@@ -479,8 +517,7 @@ def main():
     final_events = method.finalize() or []
     _commit_skill_gain(final_events, final_anchor_profile, final_before_profile)
 
-    # Save only after `finalize`: a final partial SkillOpt minibatch can
-    # modify both the active skill and buffered optimizer state.
+    # Save only after `finalize`, which may modify method state.
     _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
 
     if hasattr(selector, "get_metrics"):

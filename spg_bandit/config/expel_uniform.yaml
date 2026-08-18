@@ -1,0 +1,33 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 50
+
+dataset:
+  name: alfworld
+
+evolve:
+  split: train
+
+evaluate:
+  split: valid_unseen
+
+selector: uniform
+
+skill_evolving:
+  name: expel
+  rollouts_per_task: 2
+  evaluation_rollouts_per_task: 1
+  temperature: 0.3
+  max_tokens: 1024
+  evaluation_temperature: 0.3
+  evaluation_max_tokens: 1024
+  history_length: 5
+  enable_dynamic_update: true
+  min_evidence: 2
+  min_failures_for_critique: 2
+  top_k: 2
+  max_examples_per_prompt: 2
+  max_rules: 10
+  max_task_history: 12
+  reflection_max_tokens: 4096
+  reflection_temperature: 0.0
