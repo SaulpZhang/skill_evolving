@@ -30,6 +30,7 @@ skill_evolving:
   update_mode: patch
   selection_size: 24
   selection_rollouts: 1
+  gate_temperature: 0.0
   gate_metric: hard
   optimizer_backend: openai_compatible
   # Defaults fall back to REFLECTION_* and then LLM_* environment variables.

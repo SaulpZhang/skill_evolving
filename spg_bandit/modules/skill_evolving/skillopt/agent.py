@@ -127,6 +127,9 @@ class SkillOptAgent(SimpleAgent):
         self._seed = int(self._config.get("seed", 42))
         self._selection_size = int(self._config.get("selection_size", 24))
         self._selection_rollouts = int(self._config.get("selection_rollouts", 1))
+        # Candidate selection is a validation decision, not exploration.  A
+        # fixed temperature makes the current/candidate comparison stable.
+        self._gate_temperature = float(self._config.get("gate_temperature", 0.0))
         self._gate_metric = str(self._config.get("gate_metric", "hard"))
         self._mixed_weight = float(self._config.get("mixed_weight", 0.5))
         self._use_semantic_density = bool(
@@ -262,7 +265,7 @@ class SkillOptAgent(SimpleAgent):
         # SkillOpt resource.
         default = dataset_default if dataset_default and dataset_default.is_file() else None
         path = configured if configured and configured.is_file() else default
-        if path.is_file():
+        if path is not None and path.is_file():
             return path.read_text(encoding="utf-8")
         return (
             "# Agent Skill\n\n"
@@ -284,12 +287,15 @@ class SkillOptAgent(SimpleAgent):
     def load_skills(self, skills_dir: str):
         directory = Path(skills_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        best_path = directory / "best_skill.md"
         current_path = directory / "current_skill.md"
-        if best_path.is_file():
-            skill = best_path.read_text(encoding="utf-8")
-        elif current_path.is_file():
+        best_path = directory / "best_skill.md"
+        # `current` is the policy that actually generated the next target
+        # rollout.  Prefer it over the historical best so a resumed run does
+        # not silently change policy before checkpoint state is restored.
+        if current_path.is_file():
             skill = current_path.read_text(encoding="utf-8")
+        elif best_path.is_file():
+            skill = best_path.read_text(encoding="utf-8")
         else:
             skill = self._initial_skill_content()
         self._skills_dir = directory
@@ -485,9 +491,11 @@ class SkillOptAgent(SimpleAgent):
         old_dataset = self._dataset
         old_skill = self._active_skill
         old_gate_mode = self._gate_mode
+        old_temperature = self._generation_temperature
         self._dataset = self._selection_dataset
         self._active_skill = skill
         self._gate_mode = True
+        self._generation_temperature = self._gate_temperature
         results: list[dict[str, float]] = []
         try:
             for task_id in self._selection_task_ids:
@@ -499,6 +507,7 @@ class SkillOptAgent(SimpleAgent):
             self._dataset = old_dataset
             self._active_skill = old_skill
             self._gate_mode = old_gate_mode
+            self._generation_temperature = old_temperature
         return compute_score(results)
 
     def _optimize_batch(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -651,6 +660,64 @@ class SkillOptAgent(SimpleAgent):
         self._history.append(record)
         with self._history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    def save_checkpoint(self) -> dict:
+        """Serialize all state that affects future SkillOpt updates.
+
+        Skill documents on disk alone are insufficient: the buffered
+        trajectories, validation scores, update counter, and rejected-patch
+        context change what the next optimization step will do.
+        """
+        return {
+            "version": 1,
+            "active_skill": self._active_skill,
+            "best_skill": self._best_skill,
+            "current_score": self._current_score,
+            "best_score": self._best_score,
+            "best_step": self._best_step,
+            "global_step": self._global_step,
+            "optimizer_updates": self._optimizer_updates,
+            "rollout_index": self._rollout_index,
+            "evidence": copy.deepcopy(self._evidence),
+            "pending_triplets": copy.deepcopy(self._pending_triplets),
+            "rejected_context": copy.deepcopy(self._rejected_context),
+            "selection_task_ids": list(self._selection_task_ids),
+        }
+
+    def load_checkpoint(self, state: dict):
+        """Restore a checkpoint written by :meth:`save_checkpoint`."""
+        if not isinstance(state, dict) or not state:
+            return
+        self._active_skill = str(state.get("active_skill", self._active_skill))
+        self._best_skill = str(state.get("best_skill", self._best_skill))
+        self._current_score = float(state.get("current_score", self._current_score))
+        self._best_score = float(state.get("best_score", self._best_score))
+        self._best_step = int(state.get("best_step", self._best_step))
+        self._global_step = int(state.get("global_step", self._global_step))
+        self._optimizer_updates = int(
+            state.get("optimizer_updates", self._optimizer_updates)
+        )
+        self._rollout_index = max(
+            self._rollout_index, int(state.get("rollout_index", self._rollout_index))
+        )
+        evidence = state.get("evidence")
+        if isinstance(evidence, list):
+            self._evidence = copy.deepcopy(evidence)
+        pending = state.get("pending_triplets")
+        if isinstance(pending, dict):
+            self._pending_triplets = copy.deepcopy(pending)
+        rejected = state.get("rejected_context")
+        if isinstance(rejected, list):
+            self._rejected_context = copy.deepcopy(rejected)
+        selection_ids = state.get("selection_task_ids")
+        if isinstance(selection_ids, list):
+            self._selection_task_ids = [int(task_id) for task_id in selection_ids]
+        self._save_skill_state()
+        self._save_history({
+            "event": "checkpoint_restored",
+            "step": self._global_step,
+            "buffered_rollouts": len(self._evidence),
+        })
 
     # ── Prompt/runner lifecycle ─────────────────────────────────────────
 

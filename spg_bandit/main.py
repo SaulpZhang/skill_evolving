@@ -462,16 +462,26 @@ def main():
         finish_wandb()
         raise
 
-    _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
-
     # Batch optimizers (SkillOpt) may have a partial minibatch left after the
     # final selected task.  Flush it before saving metrics or evaluating the
     # resulting skill.
+    final_anchor_profile = None
+    final_before_profile = None
+    if (
+        probe_ids and isinstance(selector, SPGBanditSelector)
+        and selector._warmup_ready
+        and method.get_usage().get("buffered_rollouts", 0) > 0
+    ):
+        final_anchor_profile = selector.get_profile()
+        final_before_profile = selector.estimate_profile_from_results(
+            _run_skill_gain_probes(), base_profile=final_anchor_profile,
+        )
     final_events = method.finalize() or []
-    # A final partial batch has no pre-update probe snapshot, so it is safely
-    # committed as a zero-gain observation rather than attributing a later
-    # measurement to the wrong pre-update skill state.
-    _commit_skill_gain(final_events, None, None)
+    _commit_skill_gain(final_events, final_anchor_profile, final_before_profile)
+
+    # Save only after `finalize`: a final partial SkillOpt minibatch can
+    # modify both the active skill and buffered optimizer state.
+    _save_ckpt(total_steps, warmup_steps, success_count, step_records, "evolving_end")
 
     if hasattr(selector, "get_metrics"):
         metrics = selector.get_metrics()
