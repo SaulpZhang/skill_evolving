@@ -15,7 +15,7 @@ selector: uniform
 
 skill_evolving:
   name: expel
-  rollouts_per_task: 2
+  rollouts_per_task: 1
   evaluation_rollouts_per_task: 1
   temperature: 0.3
   max_tokens: 1024
@@ -23,7 +23,7 @@ skill_evolving:
   evaluation_max_tokens: 1024
   history_length: 5
   enable_dynamic_update: true
-  min_evidence: 2
+  min_evidence: 1
   min_failures_for_critique: 2
   top_k: 2
   max_examples_per_prompt: 2

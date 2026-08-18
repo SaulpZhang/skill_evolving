@@ -297,6 +297,7 @@ def main():
 
     success_count = 0
     rollout_count = 0
+    execution_count = 0
     step_records = []
     ckpt_interval = 30
     start_step = 0
@@ -308,11 +309,47 @@ def main():
             logger.error("--resume requires --run_id")
             return
 
-    def _run_skill_gain_probes():
+    def _record_execution_progress(kind: str, task_id: int, result: dict, *, outer_step: int):
+        """Persist a heartbeat as soon as any environment execution finishes.
+
+        A selected ExpeL task can be followed by reflection and two probe
+        passes.  Keeping this independent stream avoids an apparently silent
+        run while that longer causal-measurement unit is still in progress.
+        """
+        nonlocal execution_count
+        execution_count += 1
+        outcomes = result.get("rollout_successes")
+        if outcomes is None:
+            outcomes = [bool(result.get("success", False))]
+        outcomes = [bool(value) for value in outcomes]
+        record = {
+            "event": "execution_completed",
+            "execution_index": execution_count,
+            "kind": kind,
+            "outer_step": outer_step,
+            "task_id": int(task_id),
+            "successes": sum(outcomes),
+            "num_rollouts": len(outcomes),
+            "success_rate": sum(outcomes) / len(outcomes) if outcomes else 0.0,
+            "timestamp": time.time(),
+        }
+        recorder.append_jsonl("execution_progress", record)
+        log_metrics({
+            "runtime/executions_completed": execution_count,
+            "runtime/last_execution_success_rate": record["success_rate"],
+            "_step_runtime": execution_count,
+        })
+
+    def _run_skill_gain_probes(phase: str):
         """Execute the fixed probes without letting them modify the SkillBank."""
         observations = []
         for probe_task_id in probe_ids:
-            probe_result = method.execute(probe_task_id, num_rollouts=rollouts_per_task)
+            # Probe measurement stays a single rollout even if a future
+            # training configuration changes its selected-task rollout count.
+            probe_result = method.execute(probe_task_id, num_rollouts=1)
+            _record_execution_progress(
+                f"probe_{phase}", probe_task_id, probe_result, outer_step=step + 1,
+            )
             observations.append({"task_id": probe_task_id, **probe_result})
         return observations
 
@@ -332,7 +369,7 @@ def main():
             measured_after = None
             if updated and probe_ids and anchor_profile is not None:
                 after_profile = selector.estimate_profile_from_results(
-                    _run_skill_gain_probes(), base_profile=anchor_profile,
+                    _run_skill_gain_probes("after"), base_profile=anchor_profile,
                 )
                 measured_before = before_profile.tolist()
                 measured_after = after_profile.tolist()
@@ -406,6 +443,18 @@ def main():
             t0 = time.time()
             result = method.execute(task_id, num_rollouts=rollouts_per_task)
             elapsed = time.time() - t0
+            _record_execution_progress("selected_task", task_id, result, outer_step=step + 1)
+            # Report the primary outcome immediately.  Reflection/probing can
+            # take much longer than the rollout itself, and should not delay
+            # the visible evolving success curve.
+            successes = int(result.get("successes", int(bool(result["success"]))))
+            num_rollouts = int(result.get("num_rollouts", 1))
+            success_count += successes
+            rollout_count += num_rollouts
+            log_metrics({
+                "evolving/success_rate": success_count / rollout_count,
+                "_step_evolving": step + 1,
+            })
             selector.update(task_id, result)
             # The selected-task outcome updates the current MIRT state.  If a
             # skill update is due, probe that same state before reflection;
@@ -421,12 +470,12 @@ def main():
                 if selector._warmup_ready:
                     anchor_profile = selector.get_profile()
                     before_profile = selector.estimate_profile_from_results(
-                        _run_skill_gain_probes(), base_profile=anchor_profile,
+                        _run_skill_gain_probes("before"), base_profile=anchor_profile,
                     )
                 else:
                     # Warmup still evolves ExpeL online.  Store raw probes now
                     # and replay them after fitting one consistent MIRT scale.
-                    warmup_before_results = _run_skill_gain_probes()
+                    warmup_before_results = _run_skill_gain_probes("before")
             update_events = method.reflect(task_id, result) or []
             if (
                 isinstance(selector, SPGBanditSelector)
@@ -451,7 +500,7 @@ def main():
                         and event.get("bandit_label_ready", True)
                     ):
                         updated = bool(event.get("skill_updated", False))
-                        after_results = _run_skill_gain_probes() if updated else None
+                        after_results = _run_skill_gain_probes("after") if updated else None
                         selector.record_warmup_skill_measurement(
                             task_id, warmup_before_results, after_results,
                             updated=updated,
@@ -472,12 +521,7 @@ def main():
             else:
                 _commit_skill_gain(update_events, anchor_profile, before_profile)
 
-            successes = int(result.get("successes", int(bool(result["success"]))))
-            num_rollouts = int(result.get("num_rollouts", 1))
-            success_count += successes
-            rollout_count += num_rollouts
             bandit_done = step + 1
-            log_metrics({"evolving/success_rate": success_count / rollout_count, "_step_evolving": bandit_done})
 
             record = {
                 "step": step, "selector": sel_name, "task_id": task_id,
@@ -512,7 +556,7 @@ def main():
     ):
         final_anchor_profile = selector.get_profile()
         final_before_profile = selector.estimate_profile_from_results(
-            _run_skill_gain_probes(), base_profile=final_anchor_profile,
+            _run_skill_gain_probes("final_before"), base_profile=final_anchor_profile,
         )
     final_events = method.finalize() or []
     _commit_skill_gain(final_events, final_anchor_profile, final_before_profile)
