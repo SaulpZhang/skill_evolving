@@ -1,6 +1,33 @@
 """Skill evolving method interface."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class SelectionContext:
+    """Method-specific context consumed by a task selector.
+
+    ``eligible`` is a semantic marginal-value gate, not a sampling cooldown:
+    a method should return false only when executing the task cannot currently
+    consume new evidence or validate a changed policy.  ``features`` must be a
+    fixed-size, bounded vector so contextual uncertainty remains calibrated.
+    """
+
+    features: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    eligible: bool = True
+    reason: str = "eligible"
+    policy_version: str = ""
+
+    def __post_init__(self):
+        features = np.asarray(self.features, dtype=float)
+        if features.ndim != 1:
+            raise ValueError("SelectionContext.features must be one-dimensional")
+        if not np.all(np.isfinite(features)):
+            raise ValueError("SelectionContext.features must contain finite values")
+        object.__setattr__(self, "features", features)
 
 
 class BaseSkillEvolving(ABC):
@@ -39,6 +66,16 @@ class BaseSkillEvolving(ABC):
         """
         del task_id
         return []
+
+    def get_selection_context(self, task_id: int) -> SelectionContext:
+        """Return selector context while preserving legacy feature adapters."""
+        features = np.asarray(self.get_selection_features(task_id), dtype=float)
+        if features.shape != (self.selection_feature_dim,):
+            raise ValueError(
+                "Selection feature shape does not match selection_feature_dim "
+                f"({features.shape} != ({self.selection_feature_dim},))"
+            )
+        return SelectionContext(features=features)
 
     @property
     def immediate_gain_attribution(self) -> bool:

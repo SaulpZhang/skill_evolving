@@ -151,14 +151,6 @@ def main():
             "skill_evolving.evaluation_rollouts_per_task must be at least 1"
         )
 
-    run_id = args.run_id or f"{sel_name}_{agent_name}_{time.strftime('%Y%m%d_%H%M%S')}"
-    if not args.run_name:
-        args.run_name = run_id
-
-    logger = setup_logger(run_id, args.run_name, log_file_enabled=args.log_file)
-    logger.info(f"Config: {args.config}")
-    logger.info(f"Selector: {sel_name}")
-
     dataset_setting = config.get("dataset", "alfworld")
     if isinstance(dataset_setting, str):
         dataset_name = dataset_setting
@@ -173,6 +165,18 @@ def main():
                 dataset_params.setdefault(key, value)
     else:
         raise ValueError("dataset must be a name or a mapping with a 'name' field")
+
+    # Include the dataset in automatically generated IDs so records, skills,
+    # and W&B runs stay unambiguous when several benchmarks run concurrently.
+    run_id = args.run_id or (
+        f"{dataset_name}_{sel_name}_{agent_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+    if not args.run_name:
+        args.run_name = run_id
+
+    logger = setup_logger(run_id, args.run_name, log_file_enabled=args.log_file)
+    logger.info(f"Config: {args.config}")
+    logger.info(f"Selector: {sel_name}")
     logger.info(f"Dataset: {dataset_name}")
 
     wandb_active = init_wandb(config, run_id, args.run_name, enabled=not args.no_wandb, resume=args.resume)
@@ -258,8 +262,8 @@ def main():
         task_state_dim=getattr(method, "selection_feature_dim", 0),
     )
     if isinstance(selector, SPGBanditSelector):
-        selector.set_task_state_provider(
-            method.get_selection_features,
+        selector.set_selection_context_provider(
+            method.get_selection_context,
             getattr(method, "selection_feature_dim", 0),
         )
 
@@ -452,6 +456,18 @@ def main():
         for step in range(start_step, total_steps):
             is_warmup = step < warmup_steps
             task_id = selector.select(evo_pool)
+            if isinstance(selector, SPGBanditSelector):
+                selection_diagnostics = selector.get_last_selection_diagnostics()
+                recorder.append_jsonl("spg_selection", {
+                    "step": step,
+                    "is_warmup": is_warmup,
+                    **selection_diagnostics,
+                })
+                if selection_diagnostics.get("fallback_all_ineligible"):
+                    logger.warning(
+                        "SPG selection context marked every task ineligible; "
+                        "falling back to score ranking over the full pool"
+                    )
             t0 = time.time()
             result = method.execute(task_id, num_rollouts=rollouts_per_task)
             elapsed = time.time() - t0

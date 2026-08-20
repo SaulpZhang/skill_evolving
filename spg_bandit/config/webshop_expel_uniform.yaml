@@ -3,13 +3,25 @@ embedding_type: local
 max_turns: 50
 
 dataset:
-  name: alfworld
+  max_turns: 50
+  name: webshop
+  server_url: http://127.0.0.1:3000
+  # Keep the ExpeL fixed-100 set held out for evaluation.  The evolving
+  # pool uses the non-overlapping fixed_100..fixed_199 sessions.
+  fixed_session_ranges:
+    train:
+      start: 100
+      count: 100
+  task_file: docs/ExpeL/data/webshop/webshop.fixed100.json
+  request_timeout: 30
 
 evolve:
-  split: valid_unseen
+  split: train
+  n_tasks: 100
 
 evaluate:
-  split: valid_unseen
+  split: test
+  n_tasks: 100
 
 selector: uniform
 

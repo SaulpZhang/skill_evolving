@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
 from spg_bandit.modules.skillrl_source import (
     PROJECT_ROOT as _PROJECT_ROOT,
     SKILLRL_ROOT as _SKILLRL_ROOT,
@@ -23,6 +25,7 @@ from spg_bandit.modules.skillrl_source import (
     SkillsOnlyMemory,
     alfworld_projection,
 )
+from spg_bandit.modules.skill_evolving.base import SelectionContext
 from spg_bandit.modules.skill_evolving.simple_agent import SimpleAgent
 
 class _OpenAICompatibleCompletions:
@@ -106,6 +109,8 @@ class SkillRLAgent(SimpleAgent):
         self._outcomes_by_type: dict[str, list[bool]] = defaultdict(list)
         self._failed_trajectories: list[dict[str, Any]] = []
         self._update_diagnostics = self._new_update_diagnostics()
+        self._skill_version = 0
+        self._task_last_skill_version: dict[int, int] = {}
 
     @staticmethod
     def _new_update_diagnostics() -> dict[str, int]:
@@ -283,6 +288,10 @@ class SkillRLAgent(SimpleAgent):
                 )
         self._groups_since_update += 1
         self._batch_task_ids.append(int(task_id))
+        # This task has now contributed evidence under the current SkillBank.
+        # It becomes selectable again only after a real skill update changes
+        # the policy version.
+        self._task_last_skill_version[int(task_id)] = self._skill_version
         if self._groups_since_update < self._update_batch_size:
             return []
         self._virtual_batch_step += 1
@@ -369,6 +378,8 @@ class SkillRLAgent(SimpleAgent):
                 self._memory.save_skills(str(self._skill_path))
                 print(f"  >>> SkillRL added {added} dynamic skills", flush=True)
             event["skill_updated"] = bool(added)
+            if added:
+                self._skill_version += 1
             if not event["reason"]:
                 event["reason"] = (
                     status.get("status", "generated")
@@ -394,6 +405,52 @@ class SkillRLAgent(SimpleAgent):
         self._outcomes_by_type.clear()
         self._failed_trajectories.clear()
         self._batch_task_ids.clear()
+
+    @property
+    def selection_feature_dim(self) -> int:
+        return 4
+
+    def get_selection_context(self, task_id: int) -> SelectionContext:
+        """Expose SkillRL batch-evidence value to SPG.
+
+        SkillRL consumes a task once per SkillBank version.  A successful
+        update opens a new evidence round; an empty/failed teacher update does
+        not make repeating the same trajectory informative.
+        """
+        if not self._dynamic_updates:
+            return SelectionContext(
+                features=np.zeros(self.selection_feature_dim),
+                eligible=True,
+                reason="dynamic_updates_disabled",
+                policy_version=f"skillrl:{self._skill_version}",
+            )
+
+        task_id = int(task_id)
+        task_type = self._dataset.get_task_type(task_id)
+        outcomes = self._outcomes_by_type.get(task_type, [])
+        evidence_ratio = min(len(outcomes) / max(self._update_batch_size, 1), 1.0)
+        failure_ratio = (
+            1.0 - sum(outcomes) / len(outcomes) if outcomes else 0.0
+        )
+        observed = self._task_last_skill_version.get(task_id) == self._skill_version
+        features = np.asarray([
+            float(observed),
+            min(self._groups_since_update / max(self._update_batch_size, 1), 1.0),
+            evidence_ratio,
+            failure_ratio,
+        ])
+        return SelectionContext(
+            features=features,
+            eligible=not observed,
+            reason=(
+                "already_observed_for_skill_version" if observed else "new_batch_evidence"
+            ),
+            policy_version=f"skillrl:{self._skill_version}",
+        )
+
+    def get_selection_features(self, task_id: int):
+        """Compatibility view for callers predating SelectionContext."""
+        return self.get_selection_context(task_id).features
 
     @staticmethod
     def _trajectory_steps(result: dict) -> list[dict[str, str]]:
@@ -470,6 +527,11 @@ class SkillRLAgent(SimpleAgent):
             "failed_trajectories": list(self._failed_trajectories),
             "batch_task_ids": list(self._batch_task_ids),
             "update_diagnostics": dict(self._update_diagnostics),
+            "skill_version": self._skill_version,
+            "task_last_skill_version": {
+                str(task_id): version
+                for task_id, version in self._task_last_skill_version.items()
+            },
         }
 
     def load_checkpoint(self, state: dict):
@@ -492,9 +554,16 @@ class SkillRLAgent(SimpleAgent):
             for key, value in state.get("update_diagnostics", {}).items()
             if key in self._update_diagnostics
         })
+        self._skill_version = int(state.get("skill_version", 0))
+        self._task_last_skill_version = {
+            int(task_id): int(version)
+            for task_id, version in state.get("task_last_skill_version", {}).items()
+        }
 
     def reset(self):
         super().reset()
         self._virtual_batch_step = 0
         self._clear_update_batch()
         self._update_diagnostics = self._new_update_diagnostics()
+        self._skill_version = 0
+        self._task_last_skill_version.clear()

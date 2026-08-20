@@ -60,6 +60,14 @@ class WebShopDataset(BaseDataset):
     def __init__(self, config: dict):
         self._server_url = str(config.get("server_url", "http://127.0.0.1:3000")).rstrip("/")
         default_file = Path(__file__).resolve().parents[4] / "docs" / "ExpeL" / "data" / "webshop" / "webshop.fixed100.json"
+        self._split = str(config.get("split", "test")).lower()
+        fixed_ranges = config.get("fixed_session_ranges", {}) or {}
+        if not isinstance(fixed_ranges, dict):
+            raise ValueError("WebShop fixed_session_ranges must be a mapping")
+        split_range = fixed_ranges.get(self._split)
+        if split_range is not None and not isinstance(split_range, dict):
+            raise ValueError(f"WebShop range for split {self._split!r} must be a mapping")
+        self._fixed_session_range = dict(split_range) if split_range is not None else None
         self._task_file = Path(config.get("task_file", default_file)).expanduser()
         self.max_turns = int(config.get("max_turns", config.get("max_steps", 15)))
         self._n_tasks = config.get("n_tasks", config.get("num_tasks", "all"))
@@ -144,14 +152,19 @@ class WebShopDataset(BaseDataset):
         return observation.strip(), info
 
     def _observe(self, state: _Session) -> tuple[str, dict[str, Any]]:
+        # WebShop's Flask routes use a single path segment for ``keywords``.
+        # A literal slash (including a once-percent-encoded ``%2F``) is decoded
+        # before route matching and produces a 404.  In free-form searches it
+        # acts as a word separator, so normalize it before serializing the URL.
+        query = quote(state.query_string.replace("/", " "), safe="")
         if state.page_type == "init":
             path = f"/{quote(state.session, safe='')}"
         elif state.page_type == "search":
-            path = f"/search_results/{quote(state.session, safe='')}/{quote(state.query_string, safe='')}/{state.page_num}"
+            path = f"/search_results/{quote(state.session, safe='')}/{query}/{state.page_num}"
         elif state.page_type == "item":
-            path = f"/item_page/{quote(state.session, safe='')}/{quote(state.asin, safe='')}/{quote(state.query_string, safe='')}/{state.page_num}/{quote(str(state.options), safe='')}"
+            path = f"/item_page/{quote(state.session, safe='')}/{quote(state.asin, safe='')}/{query}/{state.page_num}/{quote(str(state.options), safe='')}"
         elif state.page_type == "item_sub":
-            path = f"/item_sub_page/{quote(state.session, safe='')}/{quote(state.asin, safe='')}/{quote(state.query_string, safe='')}/{state.page_num}/{quote(state.subpage, safe='')}/{quote(str(state.options), safe='')}"
+            path = f"/item_sub_page/{quote(state.session, safe='')}/{quote(state.asin, safe='')}/{query}/{state.page_num}/{quote(state.subpage, safe='')}/{quote(str(state.options), safe='')}"
         elif state.page_type == "end":
             path = f"/done/{quote(state.session, safe='')}/{quote(state.asin, safe='')}/{quote(str(state.options), safe='')}"
         else:  # pragma: no cover - internal invariant
@@ -170,6 +183,68 @@ class WebShopDataset(BaseDataset):
 
     def create_env(self, task_id: int):
         return _Session(session=str(self._tasks[task_id]["session_idx"]))
+
+    @staticmethod
+    def _goal_from_fixed_observation(observation: str, session: str) -> str:
+        """Extract a WebShop instruction from its fixed-session landing page."""
+        match = re.search(
+            r"(?:(?:WebShop\s+)?Instruction:\s*)?(.*?)\s*\[Search\]\s*$",
+            observation,
+            flags=re.DOTALL,
+        )
+        if match is None:
+            raise ValueError(
+                f"Could not parse the instruction returned for WebShop session {session!r}"
+            )
+        return " ".join(match.group(1).split())
+
+    def _load_fixed_session_rows(self) -> list[dict[str, Any]]:
+        """Materialize a deterministic non-overlapping range of fixed sessions.
+
+        WebShop maps ``fixed_<index>`` to a seeded goal, enabling an explicit
+        train/test partition without reusing the upstream fixed-100 benchmark.
+        The resolved instructions are cached so later runs do not make the 100
+        setup requests again.
+        """
+        assert self._fixed_session_range is not None
+        try:
+            start = int(self._fixed_session_range["start"])
+            count = int(self._fixed_session_range["count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"WebShop split {self._split!r} requires integer 'start' and 'count'"
+            ) from exc
+        if start < 0 or count < 1:
+            raise ValueError("WebShop fixed-session range must have start >= 0 and count >= 1")
+
+        project_root = Path(__file__).resolve().parents[4]
+        manifest_dir = Path(
+            self._fixed_session_range.get(
+                "cache_dir", project_root / "cache" / "webshop" / "task_manifests"
+            )
+        ).expanduser()
+        manifest_path = manifest_dir / f"{self._split}_fixed_{start}_{count}.json"
+        if manifest_path.is_file():
+            rows = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(rows, list) and len(rows) == count:
+                return rows
+            raise ValueError(f"Invalid cached WebShop manifest: {manifest_path}")
+
+        rows = []
+        for index in range(start, start + count):
+            session = f"fixed_{index}"
+            observation, _ = self._parse_html(self._get(f"/{session}"))
+            goal = self._goal_from_fixed_observation(observation, session)
+            rows.append({
+                "task": f"Instruction: {goal}\n[Search]\n",
+                "session_idx": session,
+                "key": {},
+            })
+
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+        print(f"WebShop ({self._split}): cached fixed-session manifest -> {manifest_path}")
+        return rows
 
     def reset_env(self, env_handle: _Session) -> EnvironmentState:
         env_handle.__dict__.update(_Session(session=env_handle.session).__dict__)
@@ -237,12 +312,22 @@ class WebShopDataset(BaseDataset):
         return EnvironmentStep(observation, self._admissible(observation), info, reward, state.done or success, success)
 
     def load(self):
-        if not self._task_file.is_file():
-            raise FileNotFoundError(f"WebShop task file not found: {self._task_file}")
-        rows = json.loads(self._task_file.read_text(encoding="utf-8"))
+        if self._fixed_session_range is not None:
+            rows = self._load_fixed_session_rows()
+            source = f"fixed sessions ({self._split})"
+        else:
+            if not self._task_file.is_file():
+                raise FileNotFoundError(f"WebShop task file not found: {self._task_file}")
+            rows = json.loads(self._task_file.read_text(encoding="utf-8"))
+            source = str(self._task_file)
         if not isinstance(rows, list):
             raise ValueError("WebShop task file must contain a JSON array")
         if isinstance(self._n_tasks, int) and self._n_tasks > 0:
+            if self._n_tasks > len(rows):
+                raise ValueError(
+                    f"WebShop {self._split} split has only {len(rows)} tasks, "
+                    f"but n_tasks={self._n_tasks} was requested"
+                )
             rows = rows[:self._n_tasks]
         self._tasks = []
         for index, row in enumerate(rows):
@@ -251,7 +336,7 @@ class WebShopDataset(BaseDataset):
             if not goal or "session_idx" not in row:
                 raise ValueError(f"Invalid WebShop task at index {index}")
             self._tasks.append({"id": index, "goal": goal, "task_type": "webshop_purchase", "session_idx": row["session_idx"], "key": row.get("key", {})})
-        print(f"WebShop: {len(self._tasks)} tasks loaded from {self._task_file}")
+        print(f"WebShop ({self._split}): {len(self._tasks)} tasks loaded from {source}")
         cache = EmbeddingCache(self._embedding_cache_dir, self.name, {"embedding_type": self._embedding_type, "embedding_model": self._embedding_model, "embedding_url": self._embedding_url}, self._embedding_cache_enabled)
         embeddings, hits, misses = [], 0, 0
         try:
