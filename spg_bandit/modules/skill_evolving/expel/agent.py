@@ -615,7 +615,6 @@ class ExpelAgent(BaseSkillEvolving):
                 kind="reflection", system=system, user=user,
                 max_tokens=self._reflection_max_tokens,
                 temperature=self._reflection_temperature,
-                stop=["\n"],
             )
             reflection_text = re.sub(
                 r"^\s*(?:STATUS:\s*FAIL\s*)?(?:New\s+plan\s*:\s*)?",
