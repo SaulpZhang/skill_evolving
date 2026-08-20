@@ -346,6 +346,26 @@ injects a saved reflection when that task is selected again. Set it to
 selection. `insight_strategy: incremental` evolves rules online;
 `deferred` performs insight extraction in `finalize` after gathering trials.
 
+### WebShop
+
+The built-in `webshop` adapter uses ExpeL's vendored fixed-100 task file and
+the official WebShop HTTP text protocol (`search[...]`, `click[...]`). Start a
+Princeton WebShop server separately—this project does not launch or bundle the
+server—then set `dataset.server_url` if it is not `http://127.0.0.1:3000`.
+
+```bash
+pip install -r requirements.txt
+python spg_bandit/main.py -c webshop_expel --no-wandb
+# A generic-agent smoke/baseline configuration:
+python spg_bandit/main.py -c webshop_simple_agent --no-wandb
+```
+
+`webshop_expel` loads the WebShop few-shot and reflection examples from
+`docs/ExpeL/prompts/webshop.py`; unlike the self-contained ALFWorld fallback,
+that vendored source directory must be present. A terminal WebShop reward of
+`1.0` is recorded as success; lower partial rewards are retained in the
+trajectory but are not counted as solved tasks.
+
 For SPG, `gain_measurement: mirt_transition` is the default/proposal path: the
 MLP target is the selected task's immediate MIRT profile change. The old fixed
 pre/post probe procedure is retained only as an explicit

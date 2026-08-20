@@ -56,6 +56,7 @@ Do not mention the trials in the rules because all the rules should be GENERALLY
 
 @dataclass(frozen=True)
 class OfficialPromptAssets:
+    benchmark: str
     system_instruction: str
     react_examples: dict[str, list[str]]
     reflection_examples: list[str]
@@ -63,21 +64,27 @@ class OfficialPromptAssets:
     source_sha256: str
 
     @classmethod
-    def load(cls, source_dir: str | Path | None = None) -> "OfficialPromptAssets":
+    def load(
+        cls, source_dir: str | Path | None = None, benchmark: str = "alfworld",
+    ) -> "OfficialPromptAssets":
+        benchmark = str(benchmark).lower()
+        if benchmark not in {"alfworld", "webshop"}:
+            raise ValueError(f"ExpeL prompt assets do not support benchmark {benchmark!r}")
         explicitly_configured = source_dir is not None
         if not explicitly_configured:
             source_dir = Path(__file__).resolve().parents[4] / "docs" / "ExpeL"
-        source_path = Path(source_dir) / "prompts" / "alfworld.py"
+        source_path = Path(source_dir) / "prompts" / f"{benchmark}.py"
         if not source_path.is_file():
             if explicitly_configured:
                 raise FileNotFoundError(
-                    "Configured ExpeL ALFWorld prompts were not found at "
+                    f"Configured ExpeL {benchmark} prompts were not found at "
                     f"{source_path}."
                 )
             payload = json.loads(zlib.decompress(
                 base64.b85decode(_EMBEDDED_ASSETS_B85.encode("ascii"))
             ))
             return cls(
+                benchmark="alfworld",
                 system_instruction=str(payload["system_instruction"]),
                 react_examples={
                     str(key): [str(item) for item in value]
@@ -105,6 +112,15 @@ class OfficialPromptAssets:
                         raise ValueError(f"ExpeL prompt asset {name} is not a literal") from exc
             raise KeyError(f"ExpeL prompt asset {name} was not found in {source_path}")
 
+        if benchmark == "webshop":
+            return cls(
+                benchmark="webshop",
+                system_instruction=str(literal("SYSTEM_INSTRUCTION")),
+                react_examples={"webshop": [str(item) for item in literal("FEWSHOTS")]},
+                reflection_examples=[str(item) for item in literal("REFLECTION_FEWSHOTS")],
+                source_path=str(source_path),
+                source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            )
         examples = literal("d")
         reflections = literal("REFLECTION_FEWSHOTS")
         instruction = literal("SYSTEM_INSTRUCTION")
@@ -119,6 +135,7 @@ class OfficialPromptAssets:
                 "set official_source_dir explicitly to opt into another ExpeL revision"
             )
         return cls(
+            benchmark="alfworld",
             system_instruction=str(instruction),
             react_examples=react_examples,
             reflection_examples=[str(item) for item in reflections],
@@ -127,6 +144,8 @@ class OfficialPromptAssets:
         )
 
     def examples_for(self, task_type: str) -> list[str]:
+        if self.benchmark == "webshop":
+            return list(self.react_examples["webshop"])
         prefix = TASK_PREFIX.get(task_type)
         if prefix is None:
             raise ValueError(f"No official ExpeL ALFWorld prompt mapping for {task_type!r}")
@@ -151,6 +170,11 @@ def format_alfworld_task(initial_observation: str, task_goal: str) -> str:
     )
 
 
+def format_webshop_task(task_goal: str) -> str:
+    """Match ExpeL's WebShop task representation."""
+    return f"Instruction:\n{task_goal.strip()}\n[Search]"
+
+
 def build_actor_context(
     *,
     assets: OfficialPromptAssets,
@@ -164,6 +188,26 @@ def build_actor_context(
 ) -> tuple[str, str]:
     """Build the immutable part of one ExpeL ReAct trial."""
     official_examples = assets.examples_for(task_type)
+    if assets.benchmark == "webshop":
+        learned_examples = [
+            f"{format_webshop_task(str(item['task_goal']))}\n{str(item['trajectory']).strip()}"
+            for item in retrieved_demonstrations[:2]
+        ]
+        examples = learned_examples + official_examples[:max(0, 2 - len(learned_examples))]
+        sections = [
+            f"You may take maximum of {max_steps} steps.\nHere are two examples:\n\n"
+            + "\n\n".join(examples) + "\n\n(END OF EXAMPLES)"
+        ]
+        if rules:
+            sections.append(
+                "The following are experiences gathered while purchasing requested items "
+                "from an online store. Use them as useful references:\n" + rules
+            )
+        task_memory = format_task_memory(reflections)
+        if task_memory:
+            sections.append(task_memory)
+        sections.append("Now it's your turn!\n" + format_webshop_task(task_goal) + "\n\nAction:")
+        return assets.system_instruction, "\n\n".join(sections)
     learned_examples = [
         f"{format_alfworld_task(str(item.get('initial_observation', '')), str(item['task_goal']))}"
         f"\n{str(item['trajectory']).strip()}"
@@ -199,6 +243,13 @@ def build_reflection_prompt(
     task_goal: str, trajectory: str,
 ) -> tuple[str, str]:
     """Build ExpeL/Reflexion's task-specific ``New plan`` prompt."""
+    if assets.benchmark == "webshop":
+        user = (
+            "Here are two examples:\n\n" + "\n\n".join(assets.reflection_examples)
+            + "\n\n(END OF EXAMPLES)\n\nPrevious Trial:\n"
+            + format_webshop_task(task_goal) + f"\n{trajectory.strip()}\n\nNext plan:"
+        )
+        return "You improve an online-shopping agent after a failed purchase trial.", user
     system = (
         "You are an advanced reasoning agent that improves from self-reflection. "
         "Analyze the failed household-task trial and propose a concrete new plan."

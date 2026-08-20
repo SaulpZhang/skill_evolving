@@ -39,6 +39,7 @@ from spg_bandit.modules.skill_evolving.expel.prompts import (
     build_insight_prompt,
     build_reflection_prompt,
     format_alfworld_task,
+    format_webshop_task,
 )
 from spg_bandit.modules.skill_evolving.expel.retrieval import retrieve_successes
 from spg_bandit.modules.skill_evolving.expel.rules import RuleBank, parse_operations
@@ -112,7 +113,15 @@ class ExpelAgent(BaseSkillEvolving):
         ):
             raise ValueError("Invalid ExpeL runtime configuration")
 
-        self._assets = OfficialPromptAssets.load(self._config.get("official_source_dir"))
+        # Custom datasets used by tests and downstream extensions retain the
+        # original ALFWorld protocol unless they explicitly identify as WebShop.
+        self._benchmark = (
+            "webshop" if str(getattr(self._dataset, "name", "")).lower() == "webshop"
+            else "alfworld"
+        )
+        self._assets = OfficialPromptAssets.load(
+            self._config.get("official_source_dir"), benchmark=self._benchmark,
+        )
         self._rule_bank = RuleBank(max_rules)
         self._skills_dir: Path | None = None
         self._expel_dir: Path | None = None
@@ -359,6 +368,16 @@ class ExpelAgent(BaseSkillEvolving):
         # output is treated as another thought, not silently executed.
         return "thought", text
 
+    @staticmethod
+    def _parse_webshop_output(output: str) -> tuple[str, str]:
+        """Match ExpeL's WebShop parser: every response is one environment action."""
+        text = re.sub(r"(?i)^\s*action\s*\d*\s*:\s*", "", (output or "").strip())
+        if "[" not in text:
+            text = f"think[{text.removeprefix('Observation:').strip()}]"
+        elif not text.endswith("]"):
+            text += "]"
+        return "action", text
+
     def _raw_task_type(self, task_id: int) -> str:
         return str(self._dataset.get_task_type(task_id))
 
@@ -452,19 +471,25 @@ class ExpelAgent(BaseSkillEvolving):
                     prompt = base_context
                     if transcript:
                         prompt += "\n" + "\n".join(transcript)
-                    prompt += "\n>"
+                    prompt += "\nAction:" if self._benchmark == "webshop" else "\n>"
                     output = self._chat(
                         kind="actor", system=system, user=prompt,
                         max_tokens=self._max_tokens, temperature=self._temperature,
                         stop=["\n"],
                     )
                     model_outputs.append(output)
-                    message_type, content = self._parse_react_output(output)
+                    message_type, content = (
+                        self._parse_webshop_output(output)
+                        if self._benchmark == "webshop" else self._parse_react_output(output)
+                    )
                     if message_type == "action":
                         action = content
                         break
                     thought_count += 1
-                    transcript.append(f"> think: {content}\nOK.")
+                    transcript.append(
+                        f"Action: think[{content}]\nObservation: OK."
+                        if self._benchmark == "webshop" else f"> think: {content}\nOK."
+                    )
                     if thought_count > 2:
                         action = "N/A"
                         break
@@ -474,7 +499,10 @@ class ExpelAgent(BaseSkillEvolving):
                     "You are thinking too many times without taking action."
                     if action == "N/A" and thought_count > 2 else str(step.observation)
                 )
-                transcript.append(f"> {action}\n{current_observation}")
+                transcript.append(
+                    f"Action: {action}\nObservation: {current_observation}"
+                    if self._benchmark == "webshop" else f"> {action}\n{current_observation}"
+                )
                 actions.append(action)
                 steps.append({
                     "step": step_index + 1,
@@ -616,12 +644,13 @@ class ExpelAgent(BaseSkillEvolving):
                 max_tokens=self._reflection_max_tokens,
                 temperature=self._reflection_temperature,
             )
+            prefix = "Next" if self._benchmark == "webshop" else "New"
             reflection_text = re.sub(
-                r"^\s*(?:STATUS:\s*FAIL\s*)?(?:New\s+plan\s*:\s*)?",
+                rf"^\s*(?:STATUS:\s*FAIL\s*)?(?:{prefix}\s+plan\s*:\s*)?",
                 "", response, flags=re.IGNORECASE,
             ).strip()
             if not reflection_text:
-                raise ValueError("reflection model returned an empty New plan")
+                raise ValueError(f"reflection model returned an empty {prefix} plan")
         except Exception as exc:
             reflection_text = ""
             error = f"{type(exc).__name__}: {exc}"
@@ -818,17 +847,14 @@ class ExpelAgent(BaseSkillEvolving):
                 experience_ids=[success["experience_id"], failure["experience_id"]],
                 success_history=success["trajectory"],
                 failure_history=failure["trajectory"],
-                task_goal=format_alfworld_task(
-                    str(success.get("initial_observation", "")),
-                    str(success["task_goal"]),
-                ),
+                task_goal=self._format_task_for_insight(success),
             )
             if event["status"] != "error":
                 self._processed_pairs.add(pair_id)
             events.append(event)
         for chunk_id, chunk in self._success_chunks(include_partial=include_partial_success):
             success_history = "\n\n".join(
-                f"{format_alfworld_task(str(item.get('initial_observation', '')), str(item['task_goal']))}"
+                f"{self._format_task_for_insight(item)}"
                 f"\n{item['trajectory']}"
                 for item in chunk
             )
@@ -841,6 +867,13 @@ class ExpelAgent(BaseSkillEvolving):
                 self._processed_success_chunks.add(chunk_id)
             events.append(event)
         return events
+
+    def _format_task_for_insight(self, item: dict[str, Any]) -> str:
+        if self._benchmark == "webshop":
+            return format_webshop_task(str(item["task_goal"]))
+        return format_alfworld_task(
+            str(item.get("initial_observation", "")), str(item["task_goal"]),
+        )
 
     def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
         del task_id, result

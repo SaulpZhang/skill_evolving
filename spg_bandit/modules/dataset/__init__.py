@@ -4,7 +4,7 @@ from .embedding_cache import EmbeddingCache
 from .registry import available_datasets, create_dataset, get_dataset_class, register_dataset
 
 __all__ = [
-    "ALFWorldDataset", "BaseDataset", "EnvironmentState", "EnvironmentStep",
+    "ALFWorldDataset", "WebShopDataset", "BaseDataset", "EnvironmentState", "EnvironmentStep",
     "TaskPool", "EmbeddingCache", "available_datasets", "create_dataset", "get_dataset_class",
     "register_dataset",
 ]
@@ -15,4 +15,7 @@ def __getattr__(name):
     if name == "ALFWorldDataset":
         from .alfworld import ALFWorldDataset
         return ALFWorldDataset
+    if name == "WebShopDataset":
+        from .webshop import WebShopDataset
+        return WebShopDataset
     raise AttributeError(name)

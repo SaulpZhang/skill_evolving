@@ -1,0 +1,31 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 15
+
+dataset:
+  name: webshop
+  # Start the Princeton WebShop server separately. Change this for a remote server.
+  server_url: http://127.0.0.1:3000
+  task_file: docs/ExpeL/data/webshop/webshop.fixed100.json
+  n_tasks: 100
+  request_timeout: 30
+
+selector: spg_bandit
+
+skill_evolving:
+  name: simple_agent
+  rollouts_per_task: 1
+  evaluation_rollouts_per_task: 1
+  max_tokens: 1024
+  temperature: 0.3
+
+spg_bandit:
+  warmup_ratio: 0.4
+  window_size: 20
+  gain_measurement: mirt_transition
+  K: 4
+  alpha: 0.1
+  d_f: 16
+  tau: 0.1
+  device: auto
+  gpu_min_free_memory_mb: 2048

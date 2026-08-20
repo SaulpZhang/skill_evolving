@@ -19,6 +19,10 @@ _DATASET_IMPORTS = {
         "spg_bandit.modules.dataset.alfworld",
         "ALFWorldDataset",
     ),
+    "webshop": (
+        "spg_bandit.modules.dataset.webshop",
+        "WebShopDataset",
+    ),
 }
 _DATASET_CLASSES: dict[str, Type[BaseDataset]] = {}
 

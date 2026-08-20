@@ -1,0 +1,47 @@
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_type: local
+max_turns: 15
+
+dataset:
+  name: webshop
+  # Princeton WebShop must be started separately, e.g. on this host/port.
+  server_url: http://127.0.0.1:3000
+  task_file: docs/ExpeL/data/webshop/webshop.fixed100.json
+  n_tasks: 100
+  request_timeout: 30
+
+selector: spg_bandit
+
+skill_evolving:
+  name: expel
+  mode: spg_online
+  insight_strategy: incremental
+  rollouts_per_task: 1
+  evaluation_rollouts_per_task: 1
+  temperature: 0.3
+  max_tokens: 1024
+  evaluation_temperature: 0.3
+  evaluation_max_tokens: 1024
+  enable_dynamic_update: true
+  use_learned_memory_during_evolve: true
+  max_reflection_depth: 3
+  success_critique_num: 8
+  top_k: 2
+  max_fewshot_tokens: 1000
+  max_num_rules: 20
+  reflection_max_tokens: 4096
+  insight_max_tokens: 4096
+  reflection_temperature: 0.0
+
+spg_bandit:
+  warmup_ratio: 0.4
+  window_size: 20
+  gain_measurement: mirt_transition
+  # WebShop has one coarse task label, but selection still benefits from a
+  # multi-dimensional latent profile (querying, attribute checks, pricing...).
+  K: 4
+  alpha: 0.1
+  d_f: 16
+  tau: 0.1
+  device: auto
+  gpu_min_free_memory_mb: 2048
