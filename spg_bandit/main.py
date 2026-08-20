@@ -30,6 +30,9 @@ class NumpyEncoder(JSONEncoder):
         return super().default(obj)
 
 load_dotenv()
+# Keep Hugging Face model/dataset caches in the configured user-level cache
+# location for both ALFWorld and WebShop runs.
+os.environ["HF_HOME"] = os.path.expanduser("~/huggingface")
 
 from spg_bandit.utils.config_loader import load_config, resolve_config_path
 from spg_bandit.utils.logger import setup_logger
