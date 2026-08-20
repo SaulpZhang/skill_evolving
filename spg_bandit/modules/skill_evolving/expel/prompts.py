@@ -75,10 +75,14 @@ class OfficialPromptAssets:
             source_dir = Path(__file__).resolve().parents[4] / "docs" / "ExpeL"
         source_path = Path(source_dir) / "prompts" / f"{benchmark}.py"
         if not source_path.is_file():
-            if explicitly_configured:
+            # The bundled fallback is an audited ALFWorld snapshot only.  Using it
+            # for WebShop silently changes the asset benchmark and later fails
+            # with a misleading missing-task-type error.
+            if explicitly_configured or benchmark != "alfworld":
                 raise FileNotFoundError(
-                    f"Configured ExpeL {benchmark} prompts were not found at "
-                    f"{source_path}."
+                    f"ExpeL {benchmark} prompts were not found at {source_path}. "
+                    f"Provide docs/ExpeL/prompts/{benchmark}.py or configure "
+                    "skill_evolving.official_source_dir to the ExpeL source tree."
                 )
             payload = json.loads(zlib.decompress(
                 base64.b85decode(_EMBEDDED_ASSETS_B85.encode("ascii"))
