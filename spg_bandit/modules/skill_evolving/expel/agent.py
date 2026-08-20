@@ -3,7 +3,8 @@
 This adapter follows the implementation in ``docs/ExpeL`` at the algorithmic
 boundaries that matter:
 
-* the actor uses ExpeL's ALFWorld ReAct protocol and official demonstrations;
+* the actor uses the project's ALFWorld-compatible action protocol while
+  consuming ExpeL memories;
 * failed trials produce task-local ``New plan`` reflections used on retries;
 * successful trials are retrieved as demonstrations by task similarity;
 * global insights are extracted from success/failure pairs and groups of
@@ -35,10 +36,10 @@ from spg_bandit.modules.dataset.base import BaseDataset
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving, SelectionContext
 from spg_bandit.modules.skill_evolving.expel.prompts import (
     OfficialPromptAssets,
-    build_actor_context,
     build_insight_prompt,
     build_reflection_prompt,
     format_alfworld_task,
+    format_task_memory,
     format_webshop_task,
 )
 from spg_bandit.modules.skill_evolving.expel.retrieval import retrieve_successes
@@ -97,6 +98,10 @@ class ExpelAgent(BaseSkillEvolving):
         self._top_k = int(self._config.get("top_k", 2))
         self._max_fewshot_tokens = int(self._config.get("max_fewshot_tokens", 1000))
         self._max_reflection_depth = int(self._config.get("max_reflection_depth", 3))
+        # Keep the actor-side context format compatible with the model used by
+        # the rest of this project (formerly SimpleAgent).  ExpeL controls the
+        # contents of the memory section, not the model's action protocol.
+        self._history_window = int(self._config.get("history_window", 5))
         self._success_critique_num = int(self._config.get("success_critique_num", 8))
         self._use_memory_during_evolve = bool(
             self._config.get("use_learned_memory_during_evolve", True)
@@ -109,6 +114,7 @@ class ExpelAgent(BaseSkillEvolving):
             self.max_turns < 1 or self._max_tokens < 1 or self._reflection_max_tokens < 1
             or self._top_k < 0
             or self._max_reflection_depth < 0 or self._success_critique_num < 1
+            or self._history_window < 1
             or self._max_fewshot_tokens < 1
         ):
             raise ValueError("Invalid ExpeL runtime configuration")
@@ -335,10 +341,8 @@ class ExpelAgent(BaseSkillEvolving):
         model = self._actor_model if kind == "actor" else self._reflection_model
         request: dict[str, Any] = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": ([{"role": "system", "content": system}] if system else [])
+            + [{"role": "user", "content": user}],
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
@@ -377,6 +381,41 @@ class ExpelAgent(BaseSkillEvolving):
         elif not text.endswith("]"):
             text += "]"
         return "action", text
+
+    @staticmethod
+    def _clean_action(action: str) -> str:
+        """Copy of the project's proven SimpleAgent action projection."""
+        value = action.strip()
+        # Do not strip a final ``]``: it is part of every native WebShop
+        # action (``search[...]`` / ``click[...]``).  The old ALFWorld-only
+        # cleanup rule treated it as a tag terminator and corrupted WebShop
+        # actions before they reached the environment.
+        value = re.sub(r"\s*[;,]?\s*(?:</action>|\[/action\])[\s\S]*$", "", value,
+                       flags=re.IGNORECASE)
+        return value.split(";", 1)[0].split(",", 1)[0].strip()
+
+    @classmethod
+    def _parse_simple_agent_action(cls, response: str) -> str:
+        """Extract one action from the actor format used by SimpleAgent.
+
+        This stays local to ExpelAgent deliberately: ExpeL must not import or
+        instantiate SimpleAgent, but it must use the same actor contract as
+        the Qwen ALFWorld policy that the project already validates.
+        """
+        for pattern in (
+            r"<action>(.*?)</action>",
+            r"\[action\](.*?)\[/action\]",
+            r"\[action>\s*(.*?)\s*\]",
+        ):
+            match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
+            if match:
+                return cls._clean_action(match.group(1))
+        match = re.search(r"(?:<action>|\[action>|\[action\])\s*(.*)", response, re.DOTALL | re.IGNORECASE)
+        if match:
+            return cls._clean_action(match.group(1))
+        clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean = re.sub(r"^\s*(?:action\s*\d*\s*:\s*|>\s*)", "", clean, flags=re.IGNORECASE)
+        return clean.split("\n", 1)[0].strip() if clean else response.strip()
 
     def _raw_task_type(self, task_id: int) -> str:
         return str(self._dataset.get_task_type(task_id))
@@ -435,6 +474,27 @@ class ExpelAgent(BaseSkillEvolving):
             max_fewshot_tokens=self._max_fewshot_tokens,
         )
 
+    def _execution_memory(
+        self, *, demonstrations: list[dict[str, Any]], rules: str,
+        reflections: list[str],
+    ) -> str:
+        """Render ExpeL state into SimpleAgent's experience slot."""
+        sections: list[str] = []
+        if rules:
+            sections.append("## ExpeL Rules\n" + rules)
+        if demonstrations:
+            examples = []
+            for item in demonstrations:
+                examples.append(
+                    "Successful task: " + str(item["task_goal"]) + "\n"
+                    + str(item["trajectory"]).strip()
+                )
+            sections.append("## Retrieved Successful Trajectories\n" + "\n\n".join(examples))
+        task_memory = format_task_memory(reflections)
+        if task_memory:
+            sections.append("## ExpeL Retry Memory\n" + task_memory)
+        return "\n\n".join(sections) or "(none)"
+
     @property
     def _actor_uses_learned_memory(self) -> bool:
         # The option controls training/evolving only. Evaluation constructs a
@@ -454,70 +514,65 @@ class ExpelAgent(BaseSkillEvolving):
         demonstrations = self._retrieved_demonstrations(task_id, goal, task_type)
         rules = self._rule_bank.render() if self._actor_uses_learned_memory else ""
 
+        memory = self._execution_memory(
+            demonstrations=demonstrations, rules=rules, reflections=reflections,
+        )
         env = self._dataset.create_env(task_id)
         started_calls = self._total_calls
         try:
             state = self._dataset.reset_env(env)
             initial_observation = str(state.observation)
-            system, base_context = build_actor_context(
-                assets=self._assets,
-                task_type=task_type,
-                task_goal=goal,
-                initial_observation=initial_observation,
-                max_steps=self.max_turns,
-                rules=rules,
-                retrieved_demonstrations=demonstrations,
-                reflections=reflections,
-            )
             transcript: list[str] = []
             steps: list[dict[str, Any]] = []
             actions: list[str] = []
             model_outputs: list[str] = []
+            recent: list[tuple[str, str]] = []
             success = bool(state.success)
             done = bool(state.done)
             current_observation = str(state.observation)
-            admissible = list(state.admissible_actions)
             for step_index in range(self.max_turns):
                 if done or success:
                     break
-                thought_count = 0
-                action = "N/A"
-                while True:
-                    prompt = base_context
-                    if transcript:
-                        prompt += "\n" + "\n".join(transcript)
-                    prompt += "\nAction:" if self._benchmark == "webshop" else "\n>"
-                    output = self._chat(
-                        kind="actor", system=system, user=prompt,
-                        max_tokens=self._max_tokens, temperature=self._temperature,
-                        stop=["\n"],
-                    )
-                    model_outputs.append(output)
-                    message_type, content = (
-                        self._parse_webshop_output(output)
-                        if self._benchmark == "webshop" else self._parse_react_output(output)
-                    )
-                    if message_type == "action":
-                        action = content
-                        break
-                    thought_count += 1
-                    transcript.append(
-                        f"Action: think[{content}]\nObservation: OK."
-                        if self._benchmark == "webshop" else f"> think: {content}\nOK."
-                    )
-                    if thought_count > 2:
-                        action = "N/A"
-                        break
+                admissible = list(state.admissible_actions)
+                prompt = self._dataset.build_action_prompt(
+                    task_goal=goal,
+                    skill_section=memory,
+                    observation=current_observation,
+                    admissible_actions=admissible,
+                    step=step_index,
+                    recent=recent,
+                    history_window=self._history_window,
+                )
+                output = self._chat(
+                    kind="actor", system="", user=prompt,
+                    max_tokens=self._max_tokens, temperature=self._temperature,
+                    stop=None,
+                )
+                action = self._parse_simple_agent_action(output)
+                model_outputs.append(output)
                 before = current_observation
-                step = self._dataset.step_env(env, action)
-                current_observation = (
-                    "You are thinking too many times without taking action."
-                    if action == "N/A" and thought_count > 2 else str(step.observation)
-                )
-                transcript.append(
-                    f"Action: {action}\nObservation: {current_observation}"
-                    if self._benchmark == "webshop" else f"> {action}\n{current_observation}"
-                )
+                try:
+                    step = self._dataset.step_env(env, action)
+                except Exception as exc:
+                    # Match SimpleAgent: malformed actions lose this turn but
+                    # do not abort a selected task or the outer experiment.
+                    transcript.append(f"Agent: {action}\nEnvironment error: {type(exc).__name__}: {exc}")
+                    actions.append(action)
+                    steps.append({
+                        "step": step_index + 1,
+                        "observation": before,
+                        "admissible_actions": admissible,
+                        "action": action,
+                        "next_observation": before,
+                        "success": False,
+                        "done": False,
+                        "model_output": output,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    print(f"    [{step_index}] {action} -> invalid action", flush=True)
+                    continue
+                current_observation = str(step.observation)
+                transcript.append(f"Agent: {action}\nObs: {current_observation}")
                 actions.append(action)
                 steps.append({
                     "step": step_index + 1,
@@ -527,10 +582,13 @@ class ExpelAgent(BaseSkillEvolving):
                     "next_observation": current_observation,
                     "success": bool(step.success),
                     "done": bool(step.done),
+                    "model_output": output,
                 })
-                admissible = list(step.admissible_actions)
+                print(f"    [{step_index}] {action}\n    -> {current_observation}", flush=True)
+                recent.append((before, action))
                 success = bool(step.success)
                 done = bool(step.done)
+                state = step
         finally:
             self._dataset.close_env(env)
 
