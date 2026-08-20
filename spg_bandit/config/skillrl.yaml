@@ -6,7 +6,7 @@ dataset:
   name: alfworld
 
 evolve:
-  split: train
+  split: valid_unseen
 
 evaluate:
   split: valid_unseen

@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from spg_bandit.modules.dataset.base import BaseDataset
-from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving
+from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving, SelectionContext
 from spg_bandit.modules.skill_evolving.expel.prompts import (
     OfficialPromptAssets,
     build_actor_context,
@@ -407,6 +407,20 @@ class ExpelAgent(BaseSkillEvolving):
             json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:16]
 
+    def _global_knowledge_hash(self) -> str:
+        """Hash reusable knowledge, excluding task-local retry reflections."""
+        first_successes = sorted(
+            str(item["task_key"])
+            for item in self._first_successes()
+        )
+        payload = {
+            "rules": self._rule_bank.hash(),
+            "successful_task_keys": first_successes,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+
     def _retrieved_demonstrations(self, task_id: int, goal: str, task_type: str):
         if not self._actor_uses_learned_memory or self._top_k == 0:
             return []
@@ -432,6 +446,7 @@ class ExpelAgent(BaseSkillEvolving):
         goal = self._dataset.get_task_goal(task_id)
         task_type = self._raw_task_type(task_id)
         task_key = self._task_key(goal, task_type)
+        global_knowledge_hash_before = self._global_knowledge_hash()
         stored_reflections = [
             str(item.get("text", "")) for item in self._task_reflections.get(task_key, [])
         ]
@@ -530,6 +545,7 @@ class ExpelAgent(BaseSkillEvolving):
             "task_goal": goal,
             "task_type": task_type,
             "task_key": task_key,
+            "global_knowledge_hash_before": global_knowledge_hash_before,
             "initial_observation": initial_observation,
             "retrieved_experience_ids": [item["experience_id"] for item in demonstrations],
             "rule_ids": [rule.rule_id for rule in self._rule_bank.rules],
@@ -695,14 +711,26 @@ class ExpelAgent(BaseSkillEvolving):
         self._append("reflection_memory", {"event": "reflection_stored", **item})
         return item
 
-    def _store_experience(self, task_id: int, rollout: dict[str, Any]) -> dict[str, Any]:
+    def _store_experience(
+        self, task_id: int, rollout: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        task_key = str(rollout["task_key"])
+        if rollout.get("success") and any(
+            item.get("success") for item in self._task_experiences(task_key)
+        ):
+            # One successful demonstration per task is sufficient for ExpeL
+            # retrieval and success/failure comparison. Re-storing identical
+            # solved-task evidence made policy hashes change forever and gave
+            # the selector a false signal that repeated successes add skills.
+            self._diagnostics["duplicate_successes_skipped"] += 1
+            return None
         self._experience_id += 1
         item = {
             "experience_id": f"experience_{self._experience_id:07d}",
             "decision_id": self._decision_id,
             "task_id": int(task_id),
-            "source_task_key": str(rollout["task_key"]),
-            "task_key": str(rollout["task_key"]),
+            "source_task_key": task_key,
+            "task_key": task_key,
             "task_goal": str(rollout["task_goal"]),
             "task_type": str(rollout["task_type"]),
             "task_embedding": self._dataset.task_pool.get_embedding(task_id).tolist(),
@@ -712,6 +740,9 @@ class ExpelAgent(BaseSkillEvolving):
             "trajectory_steps": list(rollout.get("trajectory_steps", [])),
             "actions": list(rollout.get("actions", [])),
             "api_calls": int(rollout.get("api_calls", 0)),
+            "global_knowledge_hash_before": str(
+                rollout.get("global_knowledge_hash_before", "")
+            ),
             "timestamp": time.time(),
         }
         self._experiences.append(item)
@@ -887,7 +918,9 @@ class ExpelAgent(BaseSkillEvolving):
         stored: list[dict[str, Any]] = []
         stored_reflections: list[dict[str, Any]] = []
         for rollout in result.get("rollout_results", [result]):
-            stored.append(self._store_experience(task_id, rollout))
+            item = self._store_experience(task_id, rollout)
+            if item is not None:
+                stored.append(item)
 
         for payload in result.get("staged_reflections", []):
             item = self._store_reflection(payload)
@@ -937,26 +970,63 @@ class ExpelAgent(BaseSkillEvolving):
     def selection_feature_dim(self) -> int:
         return 5
 
-    def get_selection_features(self, task_id: int):
+    def get_selection_context(self, task_id: int) -> SelectionContext:
         goal = self._dataset.get_task_goal(task_id)
         task_type = self._raw_task_type(task_id)
         task_key = self._task_key(goal, task_type)
         trials = self._task_experiences(task_key)
-        successes = sum(bool(item["success"]) for item in trials)
-        failures = len(trials) - successes
-        reflections = len(self._task_reflections.get(task_key, []))
-        unresolved_pairs = sum(
-            1 for success in (item for item in trials if item["success"])
-            for failure in (item for item in trials if not item["success"])
-            if f"{success['experience_id']}::{failure['experience_id']}" not in self._processed_pairs
+        reflections = self._task_reflections.get(task_key, [])
+        remaining_ratio = max(
+            0.0,
+            (self._max_reflection_depth - len(reflections))
+            / max(self._max_reflection_depth, 1),
         )
-        return np.asarray([
-            np.log1p(successes),
-            np.log1p(failures),
-            reflections / max(self._max_reflection_depth, 1),
-            float(successes > 0 and failures > 0),
-            np.log1p(unresolved_pairs),
-        ], dtype=float)
+        if not trials:
+            return SelectionContext(
+                features=np.asarray([0.0, 0.0, 0.0, remaining_ratio, 0.0]),
+                eligible=True,
+                reason="unseen",
+                policy_version=self._global_knowledge_hash(),
+            )
+
+        latest = trials[-1]
+        latest_decision = int(latest.get("decision_id", -1))
+        latest_succeeded = bool(latest.get("success"))
+        untested_reflection = any(
+            int(item.get("decision_id", -2)) == latest_decision
+            for item in reflections
+        )
+        current_policy = self._global_knowledge_hash()
+        previous_policy = str(latest.get("global_knowledge_hash_before", ""))
+        global_policy_changed = bool(previous_policy and previous_policy != current_policy)
+        features = np.asarray([
+            1.0,
+            float(latest_succeeded),
+            float(untested_reflection),
+            remaining_ratio,
+            float(global_policy_changed),
+        ])
+
+        if latest_succeeded:
+            eligible, reason = False, "solved"
+        elif untested_reflection:
+            eligible, reason = True, "new_reflection"
+        elif global_policy_changed:
+            eligible, reason = True, "global_policy_changed"
+        elif len(reflections) >= self._max_reflection_depth:
+            eligible, reason = False, "reflection_budget_exhausted"
+        else:
+            eligible, reason = False, "no_new_learning_signal"
+        return SelectionContext(
+            features=features,
+            eligible=eligible,
+            reason=reason,
+            policy_version=current_policy,
+        )
+
+    def get_selection_features(self, task_id: int):
+        """Compatibility view for callers predating SelectionContext."""
+        return self.get_selection_context(task_id).features
 
     def get_usage(self) -> dict:
         return {

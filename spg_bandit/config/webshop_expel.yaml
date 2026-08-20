@@ -1,14 +1,28 @@
 embedding_model: Qwen/Qwen3-Embedding-0.6B
 embedding_type: local
-max_turns: 15
+max_turns: 50
 
 dataset:
+  max_turns: 50
   name: webshop
   # Princeton WebShop must be started separately, e.g. on this host/port.
   server_url: http://127.0.0.1:3000
+  # The upstream ExpeL fixed-100 file is reserved as the held-out test set.
+  # Training uses disjoint deterministic WebShop sessions fixed_100..fixed_199.
+  fixed_session_ranges:
+    train:
+      start: 100
+      count: 100
   task_file: docs/ExpeL/data/webshop/webshop.fixed100.json
-  n_tasks: 100
   request_timeout: 30
+
+evolve:
+  split: train
+  n_tasks: 100
+
+evaluate:
+  split: test
+  n_tasks: 100
 
 selector: spg_bandit
 

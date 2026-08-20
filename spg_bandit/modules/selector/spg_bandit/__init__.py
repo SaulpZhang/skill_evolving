@@ -11,6 +11,7 @@ from scipy.optimize import minimize
 from sklearn.linear_model import Ridge
 
 from spg_bandit.modules.dataset.base import TaskPool
+from spg_bandit.modules.skill_evolving.base import SelectionContext
 from spg_bandit.utils.wandb import log_metrics
 from spg_bandit.modules.selector.base import BaseSelector
 
@@ -359,8 +360,10 @@ class SPGBanditSelector(BaseSelector):
         self._task_state_dim = int(task_state_dim)
         if self._task_state_dim < 0:
             raise ValueError("task_state_dim must be non-negative")
-        self._task_state_provider = None
+        self._selection_context_provider = None
         self._last_task_state = np.zeros(self._task_state_dim)
+        self._last_selection_diagnostics: dict = {}
+        self._legacy_state_in_mlp = False
         self._window_size = window_size
         if self._window_size <= 0:
             raise ValueError("window_size must be positive")
@@ -374,9 +377,10 @@ class SPGBanditSelector(BaseSelector):
         self._task_pool = task_pool
         self._warmup_ids = list(warmup_ids) if warmup_ids else list(range(task_pool.M))
         self._mlp: MLPFeaturizer | None = None
-        self._A = self._lambda * np.eye(d_f)
-        self._B = np.zeros((d_f, K))
-        self._W = np.zeros((d_f, K))
+        bandit_dim = d_f + self._task_state_dim
+        self._A = self._lambda * np.eye(bandit_dim)
+        self._B = np.zeros((bandit_dim, K))
+        self._W = np.zeros((bandit_dim, K))
         self._last_phi = None
         # Probe attribution is retained as an explicit ablation only.  The
         # proposal/default path supervises the MLP with the selected task's
@@ -416,29 +420,61 @@ class SPGBanditSelector(BaseSelector):
         """Return a copy of the current MIRT ability profile."""
         return self._profile.copy()
 
-    def set_task_state_provider(self, provider, feature_dim: int):
-        """Attach optional method state without making it part of the selector seam."""
+    def set_selection_context_provider(self, provider, feature_dim: int):
+        """Attach the evolving method's context adapter at the selector seam."""
         feature_dim = int(feature_dim)
         if feature_dim != self._task_state_dim:
             if self._mlp is not None:
                 raise ValueError("Cannot change task-state feature size after warmup")
             self._task_state_dim = feature_dim
             self._last_task_state = np.zeros(feature_dim)
-        self._task_state_provider = provider
+            bandit_dim = self._d_f + feature_dim
+            self._A = self._lambda * np.eye(bandit_dim)
+            self._B = np.zeros((bandit_dim, self._K))
+            self._W = np.zeros((bandit_dim, self._K))
+        self._selection_context_provider = provider
+
+    def set_task_state_provider(self, provider, feature_dim: int):
+        """Compatibility adapter for legacy providers that return arrays."""
+        def context_provider(task_id: int):
+            return SelectionContext(features=np.asarray(provider(task_id), dtype=float))
+
+        self.set_selection_context_provider(context_provider, feature_dim)
+
+    def _selection_context(self, task_id: int) -> SelectionContext:
+        if self._selection_context_provider is None:
+            context = SelectionContext(features=np.zeros(self._task_state_dim))
+        else:
+            context = self._selection_context_provider(int(task_id))
+            if not isinstance(context, SelectionContext):
+                context = SelectionContext(features=np.asarray(context, dtype=float))
+        if context.features.shape != (self._task_state_dim,):
+            raise ValueError(
+                "Selection context returned feature shape "
+                f"{context.features.shape}; expected ({self._task_state_dim},)"
+            )
+        return context
 
     def _task_state(self, task_id: int) -> np.ndarray:
-        if self._task_state_dim == 0 or self._task_state_provider is None:
-            return np.zeros(self._task_state_dim)
-        state = np.asarray(self._task_state_provider(int(task_id)), dtype=float)
-        if state.shape != (self._task_state_dim,):
-            raise ValueError(
-                f"Task-state provider returned {state.shape}; expected ({self._task_state_dim},)"
-            )
-        return state
+        return self._selection_context(task_id).features
 
     def _model_input(self, task_id: int, profile: np.ndarray, task_state: np.ndarray | None = None):
-        state = self._task_state(task_id) if task_state is None else task_state
-        return np.concatenate([self._task_pool.get_embedding(task_id), profile, state])
+        values = [self._task_pool.get_embedding(task_id), profile]
+        if self._legacy_state_in_mlp:
+            state = self._task_state(task_id) if task_state is None else task_state
+            values.append(state)
+        return np.concatenate(values)
+
+    def _bandit_features(
+        self, task_id: int, profile: np.ndarray, task_state: np.ndarray,
+    ) -> np.ndarray:
+        semantic = self._mlp.forward(self._model_input(task_id, profile, task_state))
+        if self._legacy_state_in_mlp or self._task_state_dim == 0:
+            return semantic
+        return np.concatenate([semantic, task_state])
+
+    def get_last_selection_diagnostics(self) -> dict:
+        return dict(self._last_selection_diagnostics)
 
     def save_warmup_data(self, path: str):
         """Save warmup data to JSON for future --warmup-data runs."""
@@ -490,7 +526,16 @@ class SPGBanditSelector(BaseSelector):
         if self._step < self._n_warm:
             tid = self._warmup_ids[self._step % len(self._warmup_ids)]
             self._last_phi = None
-            self._last_task_state = self._task_state(tid)
+            context = self._selection_context(tid)
+            self._last_task_state = context.features.copy()
+            self._last_selection_diagnostics = {
+                "phase": "warmup",
+                "task_id": int(tid),
+                "eligible": bool(context.eligible),
+                "eligibility_reason": context.reason,
+                "policy_version": context.policy_version,
+                "task_state": context.features.tolist(),
+            }
             self._step += 1
             return tid
 
@@ -505,18 +550,48 @@ class SPGBanditSelector(BaseSelector):
         log_metrics(wb)
 
         A_inv = np.linalg.inv(self._A)
+        contexts = [self._selection_context(tau) for tau in range(task_pool.M)]
+        eligible_count = sum(bool(context.eligible) for context in contexts)
+        fallback_all_ineligible = eligible_count == 0
         best_score, best_tid = -np.inf, 0
-        for tau in range(task_pool.M):
-            task_state = self._task_state(tau)
-            inp = self._model_input(tau, self._profile, task_state)
-            phi = self._mlp.forward(inp)
+        ranked: list[dict] = []
+        for tau, context in enumerate(contexts):
+            if not fallback_all_ineligible and not context.eligible:
+                continue
+            task_state = context.features
+            phi = self._bandit_features(tau, self._profile, task_state)
             delta_hat = self._W.T @ phi
             ucb = self._alpha * np.linalg.norm(g) * np.sqrt(max(phi @ A_inv @ phi, 1e-10))
-            score = g @ delta_hat + ucb
+            predicted_gain = float(g @ delta_hat)
+            score = predicted_gain + ucb
+            ranked.append({
+                "task_id": int(tau),
+                "score": float(score),
+                "predicted_gain": predicted_gain,
+                "ucb": float(ucb),
+                "predicted_delta": delta_hat.tolist(),
+                "eligible": bool(context.eligible),
+                "eligibility_reason": context.reason,
+                "policy_version": context.policy_version,
+                "task_state": task_state.tolist(),
+            })
             if score > best_score:
                 best_score, best_tid, self._last_phi = score, tau, phi
                 self._last_task_state = task_state.copy()
 
+        ranked.sort(key=lambda item: (-item["score"], item["task_id"]))
+        selected_context = contexts[best_tid]
+        self._last_selection_diagnostics = {
+            "phase": "bandit",
+            "task_id": int(best_tid),
+            "score": float(best_score),
+            "eligible_count": int(eligible_count),
+            "pool_size": int(task_pool.M),
+            "fallback_all_ineligible": fallback_all_ineligible,
+            "eligibility_reason": selected_context.reason,
+            "policy_version": selected_context.policy_version,
+            "top_candidates": ranked[:5],
+        }
         self._step += 1
         return best_tid
 
@@ -761,16 +836,19 @@ class SPGBanditSelector(BaseSelector):
                     measured_ids, measured_profiles, measured_deltas, measured_task_states,
                 )
                 self._metrics["warmup_causal_gain_labels"] = len(measured_ids)
-        # MLP training: X = [embedding | profile_before], y = skill gain.
+        # MLP training learns semantic task/profile features only. Method state
+        # is appended to the contextual ridge head below, because warmup sees
+        # almost exclusively fresh-task states and cannot calibrate cumulative
+        # retry features without extrapolating out of distribution.
         embeds = [self._task_pool.get_embedding(tid) for tid in train_ids]
         X = np.array([
-            np.concatenate([e, p, state])
-            for e, p, state in zip(embeds, train_profiles, train_task_states)
+            np.concatenate([e, p])
+            for e, p in zip(embeds, train_profiles)
         ])
         y = np.array(train_deltas)
         self._warmup_deltas = train_deltas
         self._mlp = MLPFeaturizer(
-            self._task_pool.d_c + self._K + self._task_state_dim,
+            self._task_pool.d_c + self._K,
             self._d_h, self._d_f, self._seed,
             device=self._device,
         )
@@ -781,12 +859,17 @@ class SPGBanditSelector(BaseSelector):
         # Algorithm 1 initializes the sliding-window ridge head with the final
         # window_size warmup tuples, rather than discarding calibration data.
         self._window.clear()
-        self._A = self._lambda * np.eye(self._d_f)
-        self._B = np.zeros((self._d_f, self._K))
+        bandit_dim = self._d_f + self._task_state_dim
+        self._A = self._lambda * np.eye(bandit_dim)
+        self._B = np.zeros((bandit_dim, self._K))
         for embedding, profile_before, task_state, delta in zip(
             embeds, train_profiles, train_task_states, train_deltas,
         ):
-            phi = self._mlp.forward(np.concatenate([embedding, profile_before, task_state]))
+            semantic = self._mlp.forward(np.concatenate([embedding, profile_before]))
+            phi = (
+                semantic if self._task_state_dim == 0
+                else np.concatenate([semantic, task_state])
+            )
             self._append_window_observation(phi, delta)
         self._W = np.linalg.solve(self._A, self._B)
         if last_measured_profile is not None:
@@ -808,10 +891,13 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_ready = False
         self._mlp = None
         self._profile = np.zeros(self._K)
-        self._A = self._lambda * np.eye(self._d_f)
-        self._B = np.zeros((self._d_f, self._K))
-        self._W = np.zeros((self._d_f, self._K))
+        bandit_dim = self._d_f + self._task_state_dim
+        self._A = self._lambda * np.eye(bandit_dim)
+        self._B = np.zeros((bandit_dim, self._K))
+        self._W = np.zeros((bandit_dim, self._K))
         self._last_phi = None
+        self._last_selection_diagnostics = {}
+        self._legacy_state_in_mlp = False
         self._pending_skill_observations.clear()
         self._window.clear()
         self._warmup_task_ids.clear()
@@ -826,6 +912,7 @@ class SPGBanditSelector(BaseSelector):
 
     def save_checkpoint(self) -> dict:
         return {
+            "feature_layout_version": 2,
             "step": self._step, "n_warm": self._n_warm,
             "warmup_ready": self._warmup_ready,
             "profile": self._profile.tolist() if hasattr(self._profile, 'tolist') else self._profile,
@@ -851,6 +938,7 @@ class SPGBanditSelector(BaseSelector):
             ],
             "window_size": self._window_size,
             "gain_measurement": self._gain_measurement,
+            "last_selection_diagnostics": self._last_selection_diagnostics,
             "mlp": self._mlp.get_state() if self._mlp is not None else None,
             "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed, "device": self._device} if self._mlp is not None else None,
         }
@@ -880,6 +968,10 @@ class SPGBanditSelector(BaseSelector):
         ))
         self._warmup_gain_measurements = list(data.get("gain_measurements", []))
         self._task_state_dim = int(data.get("task_state_dim", self._task_state_dim))
+        self._legacy_state_in_mlp = int(data.get("feature_layout_version", 1)) < 2
+        self._last_selection_diagnostics = dict(
+            data.get("last_selection_diagnostics", {})
+        )
         self._warmup_embeds = [
             np.asarray(item, dtype=float)
             for item in data.get("task_states", [np.zeros(self._task_state_dim)] * len(self._warmup_task_ids))

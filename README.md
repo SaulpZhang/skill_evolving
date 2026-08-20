@@ -147,7 +147,7 @@ python spg_bandit/main.py -c spg --no-wandb
 | 参数 | 说明 |
 |---|---|
 | `-c / --config` | 使用的配置文件名（不含 .yaml） |
-| `--run_id` | 自定义 run ID，默认格式：selector_agent_时间戳 |
+| `--run_id` | 自定义 run ID，默认格式：dataset_selector_agent_时间戳 |
 | `--no-wandb` | 不记录 W&B |
 | `--seed` | 覆盖 config 中的 seed |
 | `--log-file` | 同时写日志文件 |
