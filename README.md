@@ -348,10 +348,12 @@ selection. `insight_strategy: incremental` evolves rules online;
 
 ### WebShop
 
-The built-in `webshop` adapter uses ExpeL's vendored fixed-100 task file and
-the official WebShop HTTP text protocol (`search[...]`, `click[...]`). Start a
-Princeton WebShop server separately—this project does not launch or bundle the
-server—then set `dataset.server_url` if it is not `http://127.0.0.1:3000`.
+The built-in `webshop` adapter uses deterministic WebShop fixed sessions and
+the official WebShop HTTP text protocol (`search[...]`, `click[...]`). The
+provided ExpeL configurations evolve on all 1,000 official dev tasks and
+evaluate on all 500 official test tasks. Start a Princeton WebShop server
+separately—this project does not launch or bundle the server—then set
+`dataset.server_url` if it is not `http://127.0.0.1:3000`.
 
 ```bash
 pip install -r requirements.txt

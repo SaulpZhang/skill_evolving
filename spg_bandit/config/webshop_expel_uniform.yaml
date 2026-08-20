@@ -6,22 +6,26 @@ dataset:
   max_turns: 50
   name: webshop
   server_url: http://127.0.0.1:3000
-  # Keep the ExpeL fixed-100 set held out for evaluation.  The evolving
-  # pool uses the non-overlapping fixed_100..fixed_199 sessions.
+  # Official WebShop i.i.d. partitions are train/dev/test =
+  # 10,587/1,000/500. The server deterministically shuffles goals with seed
+  # 233, so the following fixed-session ranges address the complete dev and
+  # test partitions without overlap.
   fixed_session_ranges:
-    train:
-      start: 100
-      count: 100
-  task_file: docs/ExpeL/data/webshop/webshop.fixed100.json
+    dev:
+      start: 10587
+      count: 1000
+    test:
+      start: 11587
+      count: 500
   request_timeout: 30
 
 evolve:
-  split: train
-  n_tasks: 100
+  split: dev
+  n_tasks: 1000
 
 evaluate:
   split: test
-  n_tasks: 100
+  n_tasks: 500
 
 selector: uniform
 
