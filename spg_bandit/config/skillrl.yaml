@@ -38,9 +38,7 @@ skill_evolving:
 spg_bandit:
   warmup_ratio: 0.4
   window_size: 20
-  # Fixed, type-balanced probes run before/after every actual SkillRL update.
-  # Their MIRT-profile difference is the MLP's supervised Δprofile label.
-  probe_size: 12
+  gain_measurement: mirt_transition
   K: 4
   alpha: 0.1
   d_f: 16

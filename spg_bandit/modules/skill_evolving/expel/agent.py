@@ -1,9 +1,19 @@
-"""Online ExpeL-style skill evolution at the existing agent seam.
+"""Embedded ExpeL for the SPG-Bandit experiment runtime.
 
-The runner owns task selection and evaluation.  This adapter owns only the
-state ExpeL needs: successful/failed trajectories, retrieved demonstrations,
-reflection prompts, and an editable rule bank.  It intentionally does not
-instantiate a second ALFWorld loop.
+This adapter follows the implementation in ``docs/ExpeL`` at the algorithmic
+boundaries that matter:
+
+* the actor uses ExpeL's ALFWorld ReAct protocol and official demonstrations;
+* failed trials produce task-local ``New plan`` reflections used on retries;
+* successful trials are retrieved as demonstrations by task similarity;
+* global insights are extracted from success/failure pairs and groups of
+  successful tasks; and
+* AGREE/REMOVE/EDIT/ADD update rule strengths with ExpeL's original weights.
+
+The only intentional adaptation is scheduling.  ``spg_online`` lets the outer
+SPG selector choose one trial at a time and reuses a reflection when that task
+is selected again.  ``paper_faithful`` performs the original contiguous retry
+loop inside one selected task.
 """
 
 from __future__ import annotations
@@ -15,11 +25,26 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
+from dotenv import load_dotenv
+from openai import OpenAI
 
-from spg_bandit.modules.skill_evolving.simple_agent import SimpleAgent
+from spg_bandit.modules.dataset.base import BaseDataset
+from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving
+from spg_bandit.modules.skill_evolving.expel.prompts import (
+    OfficialPromptAssets,
+    build_actor_context,
+    build_insight_prompt,
+    build_reflection_prompt,
+    format_alfworld_task,
+)
+from spg_bandit.modules.skill_evolving.expel.retrieval import retrieve_successes
+from spg_bandit.modules.skill_evolving.expel.rules import RuleBank, parse_operations
+
+
+load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
 
 def _json_default(value: Any):
@@ -30,82 +55,148 @@ def _json_default(value: Any):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-class ExpelAgent(SimpleAgent):
-    """A single-task-update online adaptation of ExpeL.
+class ExpelAgent(BaseSkillEvolving):
+    """ExpeL memory, execution, reflection, retrieval, and insight extraction."""
 
-    A selected task may contain several independent rollouts.  Their evidence
-    is stored immediately; when sufficient task-local evidence exists, the
-    reflection model proposes JSON rule operations.  The returned event tells
-    the runner whether a causal post-update probe label is available.
-    """
+    _STATE_VERSION = 2
+    _ACTION_PATTERN = re.compile(
+        r"^(?:go to|open|take|put|use|heat|cool|look|clean|inventory)\b",
+        re.IGNORECASE,
+    )
 
-    _STATE_VERSION = 1
-
-    def __init__(self, dataset, max_turns: int = 30, records_dir: str | None = None,
-                 config: dict[str, Any] | None = None):
-        super().__init__(dataset, max_turns=max_turns, records_dir=records_dir)
+    def __init__(
+        self,
+        dataset: BaseDataset,
+        max_turns: int = 30,
+        records_dir: str | None = None,
+        config: dict[str, Any] | None = None,
+        *,
+        actor_chat: Callable[..., str] | None = None,
+        reflection_chat: Callable[..., str] | None = None,
+    ):
+        self._dataset = dataset
+        self.max_turns = int(max_turns)
+        self._records_dir = Path(records_dir) if records_dir else None
         self._config = dict(config or {})
-        self._dynamic_updates = bool(self._config.get("enable_dynamic_update", True))
-        self._generation_temperature = float(self._config.get("temperature", 0.3))
-        self._generation_max_tokens = int(self._config.get("max_tokens", 1024))
-        self._history_window = int(self._config.get("history_length", 5))
-        self._top_k = int(self._config.get("top_k", 2))
-        self._max_rules = int(self._config.get("max_rules", 10))
-        self._max_examples = int(self._config.get("max_examples_per_prompt", 2))
-        self._min_evidence = int(self._config.get("min_evidence", 2))
-        self._min_failures = int(self._config.get("min_failures_for_critique", 2))
-        self._max_task_history = int(self._config.get("max_task_history", 12))
-        self._reflection_max_tokens = int(self._config.get("reflection_max_tokens", 4096))
-        self._reflection_temperature = float(self._config.get("reflection_temperature", 0.0))
-        if self._top_k < 0 or self._max_rules < 1 or self._min_evidence < 1:
-            raise ValueError("Invalid ExpeL retrieval/rule/evidence configuration")
-        if not os.getenv("REFLECTION_MODEL") and self._dynamic_updates:
-            raise EnvironmentError("Expel requires REFLECTION_MODEL when dynamic updates are enabled")
+        self._mode = str(self._config.get("mode", "spg_online"))
+        if self._mode not in {"spg_online", "paper_faithful"}:
+            raise ValueError("skill_evolving.mode must be spg_online or paper_faithful")
+        self._insight_strategy = str(self._config.get("insight_strategy", "incremental"))
+        if self._insight_strategy not in {"incremental", "deferred"}:
+            raise ValueError("insight_strategy must be incremental or deferred")
 
+        self._dynamic_updates = bool(self._config.get("enable_dynamic_update", True))
+        self._temperature = float(self._config.get("temperature", 0.3))
+        self._max_tokens = int(self._config.get("max_tokens", 1024))
+        self._reflection_temperature = float(self._config.get("reflection_temperature", 0.0))
+        self._reflection_max_tokens = int(self._config.get("reflection_max_tokens", 4096))
+        self._insight_max_tokens = int(
+            self._config.get("insight_max_tokens", self._reflection_max_tokens)
+        )
+        self._top_k = int(self._config.get("top_k", 2))
+        self._max_fewshot_tokens = int(self._config.get("max_fewshot_tokens", 1000))
+        self._max_reflection_depth = int(self._config.get("max_reflection_depth", 3))
+        self._success_critique_num = int(self._config.get("success_critique_num", 8))
+        self._use_memory_during_evolve = bool(
+            self._config.get("use_learned_memory_during_evolve", True)
+        )
+        self._max_prompt_trajectory_chars = int(
+            self._config.get("max_prompt_trajectory_chars", 48000)
+        )
+        max_rules = int(self._config.get("max_num_rules", self._config.get("max_rules", 20)))
+        if (
+            self.max_turns < 1 or self._max_tokens < 1 or self._reflection_max_tokens < 1
+            or self._top_k < 0
+            or self._max_reflection_depth < 0 or self._success_critique_num < 1
+            or self._max_fewshot_tokens < 1
+        ):
+            raise ValueError("Invalid ExpeL runtime configuration")
+
+        self._assets = OfficialPromptAssets.load(self._config.get("official_source_dir"))
+        self._rule_bank = RuleBank(max_rules)
         self._skills_dir: Path | None = None
         self._expel_dir: Path | None = None
-        self._rules: list[dict[str, Any]] = []
-        self._experiences: list[dict[str, Any]] = []
-        self._by_task: dict[int, list[str]] = defaultdict(list)
-        self._experience_id = 0
-        self._update_step = 0
-        self._decision_id = 0
-        self._reflection_calls = 0
-        self._diagnostics = defaultdict(int)
 
-    # ── durable state and logs ────────────────────────────────────────
+        self._actor_chat_override = actor_chat
+        self._reflection_chat_override = reflection_chat
+        self._actor_client = None
+        self._reflection_client = None
+        self._actor_model = os.getenv("LLM_MODEL")
+        self._reflection_model = os.getenv("REFLECTION_MODEL", self._actor_model)
+        if actor_chat is None:
+            self._actor_client = OpenAI(
+                base_url=os.getenv("LLM_BASE_URL"),
+                api_key=os.getenv("LLM_API_KEY"),
+                timeout=300,
+            )
+            if not self._actor_model:
+                raise EnvironmentError("Expel requires LLM_MODEL")
+        if reflection_chat is None and self._dynamic_updates:
+            self._reflection_client = OpenAI(
+                base_url=os.getenv("REFLECTION_BASE_URL", os.getenv("LLM_BASE_URL")),
+                api_key=os.getenv("REFLECTION_API_KEY", os.getenv("LLM_API_KEY")),
+                timeout=300,
+            )
+            if not self._reflection_model:
+                raise EnvironmentError("Expel requires REFLECTION_MODEL for dynamic updates")
+
+        self._experiences: list[dict[str, Any]] = []
+        self._by_task: dict[str, list[str]] = defaultdict(list)
+        self._task_reflections: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._processed_pairs: set[str] = set()
+        self._processed_success_chunks: set[str] = set()
+        self._decision_id = 0
+        self._experience_id = 0
+        self._reflection_id = 0
+        self._update_step = 0
+        self._total_calls = 0
+        self._actor_calls = 0
+        self._reflection_calls = 0
+        self._insight_calls = 0
+        self._diagnostics: dict[str, int] = defaultdict(int)
+
+    # ------------------------------------------------------------------
+    # Durable state and event streams
 
     def load_skills(self, skills_dir: str):
         self._skills_dir = Path(skills_dir)
         self._skills_dir.mkdir(parents=True, exist_ok=True)
-        # ``records_dir`` is intentionally still reserved for per-action
-        # messages.  Keep ExpeL's event stream beside it, under one run.
         self._expel_dir = (
             self._records_dir.parent / "expel"
             if self._records_dir is not None else self._skills_dir / "expel_logs"
         )
-        for name in ("snapshots", "prompts"):
+        for name in ("prompts", "rule_snapshots"):
             (self._expel_dir / name).mkdir(parents=True, exist_ok=True)
-        self._load_persisted_state()
+        if self._state_path.is_file():
+            try:
+                self._restore_state(json.loads(self._state_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid ExpeL state file: {self._state_path}") from exc
+        self._append("lifecycle", {
+            "event": "load",
+            "state_version": self._STATE_VERSION,
+            "mode": self._mode,
+            "insight_strategy": self._insight_strategy,
+            "official_source": self._assets.source_path,
+            "official_source_sha256": self._assets.source_sha256,
+            "timestamp": time.time(),
+        })
 
     @property
     def _state_path(self) -> Path:
-        assert self._skills_dir is not None
+        if self._skills_dir is None:
+            raise RuntimeError("load_skills must be called before persisting ExpeL state")
         return self._skills_dir / "expel_state.json"
 
-    def _load_persisted_state(self):
-        if self._skills_dir is None or not self._state_path.is_file():
-            return
-        try:
-            payload = json.loads(self._state_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Invalid ExpeL state file: {self._state_path}") from exc
-        self._restore_state(payload)
-
-    def _persist_state(self):
-        if self._skills_dir is None:
-            return
-        self._atomic_json(self._state_path, self._state_payload())
+    @staticmethod
+    def _atomic_json(path: Path, payload: Any):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, default=_json_default)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
 
     def _append(self, stream: str, payload: dict[str, Any]):
         if self._expel_dir is None:
@@ -116,429 +207,736 @@ class ExpelAgent(SimpleAgent):
             handle.flush()
             os.fsync(handle.fileno())
 
-    @staticmethod
-    def _atomic_json(path: Path, payload: dict[str, Any] | list[Any]):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False, default=_json_default)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(path)
-
     def _state_payload(self) -> dict[str, Any]:
         return {
             "version": self._STATE_VERSION,
-            "rules": self._rules,
+            "mode": self._mode,
+            "official_source_sha256": self._assets.source_sha256,
+            "rule_bank": self._rule_bank.to_state(),
             "experiences": self._experiences,
-            "experience_id": self._experience_id,
-            "update_step": self._update_step,
+            "task_reflections": dict(self._task_reflections),
+            "processed_pairs": sorted(self._processed_pairs),
+            "processed_success_chunks": sorted(self._processed_success_chunks),
             "decision_id": self._decision_id,
+            "experience_id": self._experience_id,
+            "reflection_id": self._reflection_id,
+            "update_step": self._update_step,
             "diagnostics": dict(self._diagnostics),
         }
 
     def _restore_state(self, payload: dict[str, Any]):
-        self._rules = list(payload.get("rules", []))
+        # Version-one migration preserves prior rules/experiences, then starts
+        # the source-faithful reflection/insight bookkeeping from that point.
+        saved_source = payload.get("official_source_sha256")
+        if (
+            saved_source
+            and saved_source != self._assets.source_sha256
+            and not self._config.get("allow_official_source_mismatch", False)
+        ):
+            raise ValueError(
+                "Bundled ExpeL prompt source changed since this state was saved. "
+                "Set allow_official_source_mismatch=true only for an intentional migration."
+            )
+        self._rule_bank.load_state(payload.get("rule_bank", payload.get("rules", [])))
         self._experiences = list(payload.get("experiences", []))
-        self._experience_id = int(payload.get("experience_id", len(self._experiences)))
-        self._update_step = int(payload.get("update_step", 0))
+        legacy_state = int(payload.get("version", 1)) < self._STATE_VERSION
+        legacy_types = {
+            "pick_and_place": "pick_and_place_simple",
+            "clean": "pick_clean_then_place_in_recep",
+            "heat": "pick_heat_then_place_in_recep",
+            "cool": "pick_cool_then_place_in_recep",
+            "look_at_obj_in_light": "look_at_obj_in_light",
+            "pick_two_obj_and_place": "pick_two_obj_and_place",
+        }
+        for item in self._experiences:
+            if legacy_state:
+                item["task_type"] = legacy_types.get(
+                    str(item.get("task_type", "")), str(item.get("task_type", "default"))
+                )
+            elif "task_type" not in item and "task_id" in item:
+                item["task_type"] = self._raw_task_type(int(item["task_id"]))
+            if legacy_state or "task_key" not in item:
+                item["task_key"] = self._task_key(
+                    str(item.get("task_goal", "")), str(item.get("task_type", "default"))
+                )
+            if not item.get("task_embedding") and "task_id" in item:
+                task_id = int(item["task_id"])
+                if (
+                    0 <= task_id < self._dataset.task_pool.M
+                    and self._dataset.get_task_goal(task_id).strip().casefold()
+                    == str(item.get("task_goal", "")).strip().casefold()
+                ):
+                    item["task_embedding"] = self._dataset.task_pool.get_embedding(task_id).tolist()
+        self._task_reflections = defaultdict(list, {
+            str(key): list(value)
+            for key, value in payload.get("task_reflections", {}).items()
+        })
+        self._processed_pairs = set(payload.get("processed_pairs", []))
+        self._processed_success_chunks = set(payload.get("processed_success_chunks", []))
         self._decision_id = int(payload.get("decision_id", 0))
+        self._experience_id = int(payload.get("experience_id", len(self._experiences)))
+        self._reflection_id = int(payload.get("reflection_id", 0))
+        self._update_step = int(payload.get("update_step", 0))
         self._diagnostics = defaultdict(int, payload.get("diagnostics", {}))
         self._by_task = defaultdict(list)
         for item in self._experiences:
-            self._by_task[int(item["task_id"])].append(str(item["experience_id"]))
+            self._by_task[str(item["task_key"])].append(str(item["experience_id"]))
 
-    @staticmethod
-    def _hash_rules(rules: list[dict[str, Any]]) -> str:
-        data = json.dumps(rules, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha256(data).hexdigest()[:16]
+    def _persist(self):
+        if self._skills_dir is None:
+            return
+        self._atomic_json(self._state_path, self._state_payload())
 
-    # ── execution and retrieval ───────────────────────────────────────
-
-    def _get_skill_section(self, goal: str, task_type: str) -> str:
-        rules = self._relevant_rules(task_type)
-        examples = self._retrieve_successes(goal, task_type)
-        # Count actual prompt use only.  ``_relevant_rules`` is also queried
-        # by the selector for every candidate task, so mutating there would
-        # turn the learned context into an accidental selection-frequency
-        # feature.
-        for rule in rules:
-            rule["use_count"] = int(rule.get("use_count", 0)) + 1
-        self._loaded_skill = {
-            "rule_ids": [rule["rule_id"] for rule in rules],
-            "experience_ids": [item["experience_id"] for item in examples],
+    def _snapshot_rules(self):
+        if self._expel_dir is None:
+            return
+        payload = {
+            "update_step": self._update_step,
+            "rule_hash": self._rule_bank.hash(),
+            "rules": [vars(rule) for rule in self._rule_bank.rules],
         }
-        if self._expel_dir is not None:
-            self._append("retrievals", {
-                "event": "retrieval",
-                "decision_id": self._decision_id,
-                "task_goal": goal,
-                "task_type": task_type,
-                "rule_ids": self._loaded_skill["rule_ids"],
-                "experience_ids": self._loaded_skill["experience_ids"],
-                "timestamp": time.time(),
-            })
-        sections: list[str] = []
-        if rules:
-            sections.append("### ExpeL Insights\n" + "\n".join(
-                f"- **{rule['title']}**: {rule['principle']}"
-                + (f" _Apply when: {rule['when_to_apply']}_" if rule.get("when_to_apply") else "")
-                for rule in rules
-            ))
-        if examples:
-            lines = ["### Retrieved Successful Experiences"]
-            for item in examples:
-                text = str(item.get("trajectory", ""))[-1000:]
-                lines.append(f"- Task: {item['task_goal']}\n  Successful trace: {text}")
-            sections.append("\n".join(lines))
-        return "\n\n".join(sections) if sections else "(none)"
+        self._atomic_json(self._expel_dir / "current_rules.json", payload)
+        self._atomic_json(
+            self._expel_dir / "rule_snapshots" / f"rules_{self._update_step:06d}.json",
+            payload,
+        )
 
-    def _relevant_rules(self, task_type: str) -> list[dict[str, Any]]:
-        specific = [r for r in self._rules if r.get("task_type") in (task_type, "general")]
-        return sorted(specific, key=lambda r: (-int(r.get("use_count", 0)), r["rule_id"]))[:self._max_rules]
+    # ------------------------------------------------------------------
+    # LLM and actor protocol
 
-    @property
-    def selection_feature_dim(self) -> int:
-        # Counts, evidence completeness, and relevant-rule coverage.  These
-        # are learned context, not an externally imposed repeat penalty.
-        return 5
+    def _chat(
+        self, *, kind: str, system: str, user: str, max_tokens: int,
+        temperature: float, stop: list[str] | None = None,
+    ) -> str:
+        override = self._actor_chat_override if kind == "actor" else self._reflection_chat_override
+        self._total_calls += 1
+        if kind == "actor":
+            self._actor_calls += 1
+        elif kind == "reflection":
+            self._reflection_calls += 1
+        else:
+            self._insight_calls += 1
+        if override is not None:
+            value = override(
+                kind=kind, system=system, user=user, max_tokens=max_tokens,
+                temperature=temperature, stop=stop,
+            )
+            return str(value or "").strip()
+        client = self._actor_client if kind == "actor" else self._reflection_client
+        model = self._actor_model if kind == "actor" else self._reflection_model
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if stop:
+            request["stop"] = stop
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(**request)
+                return str(response.choices[0].message.content or "").strip()
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
+        raise AssertionError("unreachable")
 
-    @property
-    def immediate_gain_attribution(self) -> bool:
-        return True
+    @classmethod
+    def _parse_react_output(cls, output: str) -> tuple[str, str]:
+        text = (output or "").strip()
+        thought = re.match(r"^(?:>\s*)?think\s*:?[\s]*(.*)$", text, re.IGNORECASE | re.DOTALL)
+        if thought:
+            return "thought", thought.group(1).strip()
+        if text.startswith(">"):
+            return "action", re.sub(r"^>\s*", "", text).lower().strip()
+        if cls._ACTION_PATTERN.match(text):
+            return "action", re.sub(r"^>\s*", "", text).lower().strip()
+        # This fallback is exactly the source parser's behaviour: malformed
+        # output is treated as another thought, not silently executed.
+        return "thought", text
 
-    def get_selection_features(self, task_id: int):
-        task_id = int(task_id)
-        evidence = self._task_experiences(task_id)
-        successes = sum(bool(item.get("success")) for item in evidence)
-        failures = len(evidence) - successes
-        task_type = self._dataset.get_skill_task_type(task_id)
-        return np.asarray([
-            np.log1p(successes),
-            np.log1p(failures),
-            float(successes > 0 and failures > 0),
-            min(len(evidence), self._max_task_history) / self._max_task_history,
-            min(len(self._relevant_rules(task_type)), self._max_rules) / self._max_rules,
-        ], dtype=float)
-
-    def _retrieve_successes(self, goal: str, task_type: str) -> list[dict[str, Any]]:
-        candidates = [
-            item for item in self._experiences
-            if item.get("success") and item.get("task_type") == task_type
-        ]
-        if not candidates or self._top_k == 0:
-            return []
-        query = self._goal_vector(goal)
-        ranked = []
-        for item in candidates:
-            value = float(query @ self._goal_vector(item["task_goal"]))
-            ranked.append((value, item))
-        ranked.sort(key=lambda pair: pair[0], reverse=True)
-        return [item for _, item in ranked[:self._top_k]]
+    def _raw_task_type(self, task_id: int) -> str:
+        return str(self._dataset.get_task_type(task_id))
 
     @staticmethod
-    def _goal_vector(text: str) -> np.ndarray:
-        # Dependency-free lexical retrieval: stable across actor/reflection
-        # workers and easy to reconstruct after a checkpoint.  The framework's
-        # task embeddings remain the selector representation.
-        tokens = re.findall(r"[a-z0-9]+", text.lower())
-        vector = np.zeros(256, dtype=float)
-        for token in tokens:
-            index = int.from_bytes(hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest(), "little")
-            vector[index % len(vector)] += 1.0
-        norm = np.linalg.norm(vector)
-        return vector / norm if norm else vector
+    def _task_key(goal: str, task_type: str) -> str:
+        value = f"{task_type}\0{goal.strip().casefold()}".encode("utf-8")
+        return hashlib.sha256(value).hexdigest()[:20]
+
+    def _task_experiences(self, task_key: str) -> list[dict[str, Any]]:
+        wanted = set(self._by_task.get(task_key, []))
+        return [item for item in self._experiences if item.get("experience_id") in wanted]
+
+    def _policy_hash(self) -> str:
+        visible_successes = sorted(
+            item["experience_id"] for item in self._experiences if item.get("success")
+        )
+        reflections = {
+            key: [item.get("text", "") for item in values]
+            for key, values in sorted(self._task_reflections.items())
+        }
+        payload = {
+            "rules": self._rule_bank.hash(),
+            "successes": visible_successes,
+            "reflections": reflections,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _retrieved_demonstrations(self, task_id: int, goal: str, task_type: str):
+        if not self._actor_uses_learned_memory or self._top_k == 0:
+            return []
+        return retrieve_successes(
+            experiences=self._experiences,
+            query_embedding=self._dataset.task_pool.get_embedding(task_id),
+            task_type=task_type,
+            current_goal=goal,
+            # The bundled ALFWorld prompt and the reference configs use two
+            # fewshots. Retrieved trials replace, rather than extend, them.
+            top_k=min(self._top_k, 2),
+            max_fewshot_tokens=self._max_fewshot_tokens,
+        )
+
+    @property
+    def _actor_uses_learned_memory(self) -> bool:
+        # The option controls training/evolving only. Evaluation constructs a
+        # read-only agent (dynamic updates disabled) and must always consume
+        # the rules and successful demonstrations learned during training.
+        return not self._dynamic_updates or self._use_memory_during_evolve
+
+    def _run_trial(self, task_id: int, extra_reflections: list[str] | None = None) -> dict[str, Any]:
+        goal = self._dataset.get_task_goal(task_id)
+        task_type = self._raw_task_type(task_id)
+        task_key = self._task_key(goal, task_type)
+        stored_reflections = [
+            str(item.get("text", "")) for item in self._task_reflections.get(task_key, [])
+        ]
+        reflections = stored_reflections + list(extra_reflections or [])
+        demonstrations = self._retrieved_demonstrations(task_id, goal, task_type)
+        rules = self._rule_bank.render() if self._actor_uses_learned_memory else ""
+
+        env = self._dataset.create_env(task_id)
+        started_calls = self._total_calls
+        try:
+            state = self._dataset.reset_env(env)
+            initial_observation = str(state.observation)
+            system, base_context = build_actor_context(
+                assets=self._assets,
+                task_type=task_type,
+                task_goal=goal,
+                initial_observation=initial_observation,
+                max_steps=self.max_turns,
+                rules=rules,
+                retrieved_demonstrations=demonstrations,
+                reflections=reflections,
+            )
+            transcript: list[str] = []
+            steps: list[dict[str, Any]] = []
+            actions: list[str] = []
+            model_outputs: list[str] = []
+            success = bool(state.success)
+            done = bool(state.done)
+            current_observation = str(state.observation)
+            admissible = list(state.admissible_actions)
+            for step_index in range(self.max_turns):
+                if done or success:
+                    break
+                thought_count = 0
+                action = "N/A"
+                while True:
+                    prompt = base_context
+                    if transcript:
+                        prompt += "\n" + "\n".join(transcript)
+                    prompt += "\n>"
+                    output = self._chat(
+                        kind="actor", system=system, user=prompt,
+                        max_tokens=self._max_tokens, temperature=self._temperature,
+                        stop=["\n"],
+                    )
+                    model_outputs.append(output)
+                    message_type, content = self._parse_react_output(output)
+                    if message_type == "action":
+                        action = content
+                        break
+                    thought_count += 1
+                    transcript.append(f"> think: {content}\nOK.")
+                    if thought_count > 2:
+                        action = "N/A"
+                        break
+                before = current_observation
+                step = self._dataset.step_env(env, action)
+                current_observation = (
+                    "You are thinking too many times without taking action."
+                    if action == "N/A" and thought_count > 2 else str(step.observation)
+                )
+                transcript.append(f"> {action}\n{current_observation}")
+                actions.append(action)
+                steps.append({
+                    "step": step_index + 1,
+                    "observation": before,
+                    "admissible_actions": admissible,
+                    "action": action,
+                    "next_observation": current_observation,
+                    "success": bool(step.success),
+                    "done": bool(step.done),
+                })
+                admissible = list(step.admissible_actions)
+                success = bool(step.success)
+                done = bool(step.done)
+        finally:
+            self._dataset.close_env(env)
+
+        trajectory = "\n".join(transcript)
+        result = {
+            "success": success,
+            "trajectory": trajectory,
+            "trajectory_steps": steps,
+            "actions": actions,
+            "api_calls": self._total_calls - started_calls,
+            "model_outputs": model_outputs,
+            "task_goal": goal,
+            "task_type": task_type,
+            "task_key": task_key,
+            "initial_observation": initial_observation,
+            "retrieved_experience_ids": [item["experience_id"] for item in demonstrations],
+            "rule_ids": [rule.rule_id for rule in self._rule_bank.rules],
+            "reflection_ids": [item.get("reflection_id") for item in self._task_reflections.get(task_key, [])],
+            "prompt_manifest": {
+                "official_source_sha256": self._assets.source_sha256,
+                "rules": [vars(rule) for rule in self._rule_bank.rules],
+                "retrieved_experience_ids": [item["experience_id"] for item in demonstrations],
+                "task_reflections": reflections,
+            },
+        }
+        self._append("retrievals", {
+            "event": "retrieval",
+            "decision_id": self._decision_id,
+            "task_id": int(task_id),
+            "task_key": task_key,
+            "experience_ids": result["retrieved_experience_ids"],
+            "rule_ids": result["rule_ids"],
+            "reflection_ids": result["reflection_ids"],
+            "timestamp": time.time(),
+        })
+        self._append("trials", {
+            "event": "trial",
+            "decision_id": self._decision_id,
+            "task_id": int(task_id),
+            **result,
+            "timestamp": time.time(),
+        })
+        return result
 
     def execute(self, task_id: int, num_rollouts: int = 1) -> dict:
         if num_rollouts < 1:
             raise ValueError("num_rollouts must be at least 1")
         self._decision_id += 1
-        rollouts = [SimpleAgent.execute(self, task_id) for _ in range(num_rollouts)]
-        outcomes = [bool(item["success"]) for item in rollouts]
-        representative = rollouts[0]
+        started_calls = self._total_calls
+        rollouts: list[dict[str, Any]] = []
+        logical_outcomes: list[bool] = []
+        representative_rollouts: list[dict[str, Any]] = []
+        attempt_counts: list[int] = []
+        staged_reflections: list[dict[str, Any]] = []
+        for _ in range(num_rollouts):
+            local_reflections: list[str] = []
+            if self._mode == "paper_faithful":
+                goal = self._dataset.get_task_goal(task_id)
+                task_key = self._task_key(goal, self._raw_task_type(task_id))
+                remaining_reflections = max(
+                    0,
+                    self._max_reflection_depth
+                    - len(self._task_reflections.get(task_key, [])),
+                )
+                attempts = 1 + remaining_reflections
+            else:
+                attempts = 1
+            attempt_count = 0
+            for attempt in range(attempts):
+                rollout = self._run_trial(task_id, local_reflections)
+                rollouts.append(rollout)
+                attempt_count += 1
+                if rollout["success"] or self._mode != "paper_faithful" or attempt + 1 >= attempts:
+                    break
+                reflection = self._generate_task_reflection(task_id, rollout, staged=True)
+                if reflection is None:
+                    break
+                staged_reflections.append(reflection)
+                local_reflections.append(reflection["text"])
+            logical_outcomes.append(bool(rollout["success"]))
+            representative_rollouts.append(rollout)
+            attempt_counts.append(attempt_count)
+
+        representative = representative_rollouts[0]
         return {
-            "success": sum(outcomes) * 2 >= num_rollouts,
-            "successes": sum(outcomes),
-            "num_rollouts": num_rollouts,
-            "success_rate": sum(outcomes) / num_rollouts,
-            "rollout_successes": outcomes,
+            "success": sum(logical_outcomes) * 2 >= len(logical_outcomes),
+            "successes": sum(logical_outcomes),
+            "num_rollouts": len(logical_outcomes),
+            "success_rate": sum(logical_outcomes) / len(logical_outcomes),
+            "rollout_successes": logical_outcomes,
             "rollout_results": rollouts,
-            "trajectory": representative.get("trajectory", ""),
-            "trajectories": [item.get("trajectory", "") for item in rollouts],
-            "trajectory_steps": representative.get("trajectory_steps", []),
-            "actions": representative.get("actions", []),
-            "api_calls": sum(int(item.get("api_calls", 0)) for item in rollouts),
-            "loaded_skill": representative.get("loaded_skill"),
+            "trajectory": representative["trajectory"],
+            "trajectories": [item["trajectory"] for item in rollouts],
+            "trajectory_steps": representative["trajectory_steps"],
+            "actions": representative["actions"],
+            "api_calls": self._total_calls - started_calls,
             "expel_decision_id": self._decision_id,
+            "staged_reflections": staged_reflections,
+            "trial_attempt_counts": attempt_counts,
         }
 
-    # ── online insight extraction ─────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Task reflection and experience memory
 
-    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+    def _generate_task_reflection(
+        self, task_id: int, rollout: dict[str, Any], *, staged: bool,
+    ) -> dict[str, Any] | None:
         if not self._dynamic_updates:
-            return False
-        incoming = len(result.get("rollout_results", [result]))
-        return len(self._by_task[int(task_id)]) + incoming >= self._min_evidence
-
-    def reflect(self, task_id: int, result: dict):
-        goal = self._dataset.get_task_goal(task_id)
-        task_type = self._dataset.get_skill_task_type(task_id)
-        decision_id = int(result.get("expel_decision_id", self._decision_id))
-        new_items = self._store_experiences(task_id, goal, task_type, decision_id, result)
-        if not self._dynamic_updates:
-            return []
-        evidence = self._task_experiences(task_id)
-        if len(evidence) < self._min_evidence:
-            self._append("rule_updates", {
-                "event": "pending_evidence", "decision_id": decision_id,
-                "task_id": task_id, "experience_ids": [x["experience_id"] for x in new_items],
-                "evidence_count": len(evidence), "min_evidence": self._min_evidence,
-                "bandit_label_ready": False, "timestamp": time.time(),
-            })
-            self._persist_state()
-            return []
-        return [self._attempt_update(task_id, goal, task_type, decision_id, evidence)]
-
-    def _store_experiences(self, task_id, goal, task_type, decision_id, result):
-        items = result.get("rollout_results", [result])
-        stored = []
-        for rollout in items:
-            self._experience_id += 1
-            item = {
-                "experience_id": f"exp_{self._experience_id:06d}",
-                "decision_id": decision_id,
-                "task_id": int(task_id),
-                "task_goal": goal,
-                "task_type": task_type,
-                "success": bool(rollout.get("success", False)),
-                "trajectory": rollout.get("trajectory", ""),
-                "actions": list(rollout.get("actions", [])),
-                "api_calls": int(rollout.get("api_calls", 0)),
-                "timestamp": time.time(),
-            }
-            self._experiences.append(item)
-            self._by_task[int(task_id)].append(item["experience_id"])
-            stored.append(item)
-            self._append("experiences", item)
-        # Bounded in-memory context while retaining full JSONL provenance.
-        ids = self._by_task[int(task_id)]
-        if len(ids) > self._max_task_history:
-            self._by_task[int(task_id)] = ids[-self._max_task_history:]
-        return stored
-
-    def _task_experiences(self, task_id: int) -> list[dict[str, Any]]:
-        wanted = set(self._by_task[int(task_id)])
-        return [item for item in self._experiences if item["experience_id"] in wanted]
-
-    def _attempt_update(self, task_id, goal, task_type, decision_id, evidence):
-        self._update_step += 1
-        before_hash = self._hash_rules(self._rules)
-        successes = sum(bool(item["success"]) for item in evidence)
-        failures = len(evidence) - successes
-        # A small amount of mixed evidence is informative; a failure-only
-        # trace needs repeated failures before we turn it into a general rule.
-        # This makes ``min_failures_for_critique`` a real data-quality gate
-        # rather than an inert config field.
-        if failures and not successes and failures < self._min_failures:
-            event = {
-                "event": "rule_update", "status": "insufficient_failure_evidence",
-                "skill_update_completed": False, "skill_updated": False,
-                "bandit_label_ready": False, "update_step": self._update_step,
-                "decision_id": decision_id, "task_id": task_id, "task_ids": [task_id],
-                "experience_ids": [x["experience_id"] for x in evidence],
-                "reason": "insufficient_failure_evidence", "timestamp": time.time(),
-            }
-            self._append("rule_updates", event)
-            self._diagnostics["insufficient_failure_evidence"] += 1
-            self._persist_state()
-            return event
-        reflection_mode = (
-            "contrast_success_and_failure" if successes and failures
-            else "repeated_failure_critique" if failures
-            else "successful_pattern_extraction"
+            return None
+        task_key = str(rollout["task_key"])
+        existing_count = len(self._task_reflections.get(task_key, []))
+        if existing_count >= self._max_reflection_depth and not staged:
+            return None
+        system, user = build_reflection_prompt(
+            assets=self._assets,
+            initial_observation=str(rollout.get("initial_observation", "")),
+            task_goal=str(rollout["task_goal"]),
+            trajectory=str(rollout["trajectory"])[-self._max_prompt_trajectory_chars:],
         )
-        prompt = self._build_reflection_prompt(goal, task_type, evidence, reflection_mode)
-        prompt_path = ""
+        started = time.time()
+        response = ""
+        error = None
+        try:
+            response = self._chat(
+                kind="reflection", system=system, user=user,
+                max_tokens=self._reflection_max_tokens,
+                temperature=self._reflection_temperature,
+                stop=["\n"],
+            )
+            reflection_text = re.sub(
+                r"^\s*(?:STATUS:\s*FAIL\s*)?(?:New\s+plan\s*:\s*)?",
+                "", response, flags=re.IGNORECASE,
+            ).strip()
+            if not reflection_text:
+                raise ValueError("reflection model returned an empty New plan")
+        except Exception as exc:
+            reflection_text = ""
+            error = f"{type(exc).__name__}: {exc}"
+        payload = {
+            "event": "task_reflection",
+            "decision_id": self._decision_id,
+            "task_id": int(task_id),
+            "task_key": task_key,
+            "task_goal": rollout["task_goal"],
+            "prompt": {"system": system, "user": user},
+            "response": response,
+            "text": reflection_text,
+            "status": "ok" if error is None else "error",
+            "error": error,
+            "staged": bool(staged),
+            "latency_s": round(time.time() - started, 4),
+            "model": self._reflection_model,
+            "timestamp": time.time(),
+        }
+        self._append("task_reflections", payload)
+        if error is not None:
+            self._append("errors", payload)
+            self._diagnostics["task_reflection_errors"] += 1
+            return None
+        return payload
+
+    def _store_reflection(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        task_key = str(payload["task_key"])
+        if len(self._task_reflections[task_key]) >= self._max_reflection_depth:
+            return None
+        self._reflection_id += 1
+        item = {
+            "reflection_id": f"reflection_{self._reflection_id:06d}",
+            "decision_id": int(payload.get("decision_id", self._decision_id)),
+            "task_id": int(payload["task_id"]),
+            "task_key": task_key,
+            "task_goal": payload["task_goal"],
+            "text": str(payload["text"]),
+            "timestamp": time.time(),
+        }
+        self._task_reflections[task_key].append(item)
+        self._append("reflection_memory", {"event": "reflection_stored", **item})
+        return item
+
+    def _store_experience(self, task_id: int, rollout: dict[str, Any]) -> dict[str, Any]:
+        self._experience_id += 1
+        item = {
+            "experience_id": f"experience_{self._experience_id:07d}",
+            "decision_id": self._decision_id,
+            "task_id": int(task_id),
+            "source_task_key": str(rollout["task_key"]),
+            "task_key": str(rollout["task_key"]),
+            "task_goal": str(rollout["task_goal"]),
+            "task_type": str(rollout["task_type"]),
+            "task_embedding": self._dataset.task_pool.get_embedding(task_id).tolist(),
+            "initial_observation": str(rollout.get("initial_observation", "")),
+            "success": bool(rollout["success"]),
+            "trajectory": str(rollout.get("trajectory", "")),
+            "trajectory_steps": list(rollout.get("trajectory_steps", [])),
+            "actions": list(rollout.get("actions", [])),
+            "api_calls": int(rollout.get("api_calls", 0)),
+            "timestamp": time.time(),
+        }
+        self._experiences.append(item)
+        self._by_task[item["task_key"]].append(item["experience_id"])
+        self._append("experiences", {"event": "experience_stored", **item})
+        return item
+
+    # ------------------------------------------------------------------
+    # Global ExpeL insight extraction
+
+    def _run_insight_job(
+        self,
+        *,
+        kind: str,
+        experience_ids: list[str],
+        success_history: str,
+        failure_history: str | None = None,
+        task_goal: str | None = None,
+    ) -> dict[str, Any]:
+        self._update_step += 1
+        system, user = build_insight_prompt(
+            kind=kind,
+            rules=self._rule_bank.render(),
+            success_history=success_history[-self._max_prompt_trajectory_chars:],
+            failure_history=(failure_history or "")[-self._max_prompt_trajectory_chars:],
+            task_goal=task_goal,
+            list_full=self._rule_bank.is_full,
+        )
+        prompt_payload = {
+            "event": "insight_prompt",
+            "update_step": self._update_step,
+            "kind": kind,
+            "experience_ids": experience_ids,
+            "system": system,
+            "user": user,
+            "timestamp": time.time(),
+        }
+        self._append("insight_prompts", prompt_payload)
         if self._expel_dir is not None:
-            path = self._expel_dir / "prompts" / f"reflect_{self._update_step:06d}.json"
-            self._atomic_json(path, {"prompt": prompt, "experience_ids": [x["experience_id"] for x in evidence]})
-            prompt_path = str(path)
-        raw_response = ""
+            self._atomic_json(
+                self._expel_dir / "prompts" / f"insight_{self._update_step:06d}.json",
+                prompt_payload,
+            )
+
+        before_hash = self._rule_bank.hash()
+        response = ""
         error = None
         started = time.time()
         try:
-            self._reflection_calls += 1
-            raw_response = self._chat(
-                [{"role": "user", "content": prompt}],
-                max_tokens=self._reflection_max_tokens,
-                client=self._reflect_client,
-                model=self._reflect_model,
+            response = self._chat(
+                kind="insight", system=system, user=user,
+                max_tokens=self._insight_max_tokens,
                 temperature=self._reflection_temperature,
             )
-            operations = self._parse_operations(raw_response)
-        except Exception as exc:  # Persist failure; never turn it into zero gain.
-            operations = None
+            if not response.strip():
+                raise ValueError("insight model returned an empty response")
+            operations = parse_operations(response)
+            changed, applied = self._rule_bank.apply(operations, self._update_step)
+            status = "updated" if changed else "no_change"
+        except Exception as exc:
+            operations = []
+            changed = False
+            applied = []
+            status = "error"
             error = f"{type(exc).__name__}: {exc}"
-
-        reflection = {
-            "event": "reflection", "update_step": self._update_step,
-            "decision_id": decision_id, "task_id": task_id,
-            "experience_ids": [x["experience_id"] for x in evidence],
-            "prompt_path": prompt_path, "response": raw_response,
-            "error": error, "latency_s": round(time.time() - started, 4),
-            "reflection_model": self._reflect_model, "timestamp": time.time(),
-            "reflection_mode": reflection_mode,
-        }
-        if error:
-            reflection["status"] = "api_error"
-            self._append("reflections", reflection)
-            self._append("rule_updates", {**reflection, "skill_update_completed": False,
-                                           "bandit_label_ready": False})
-            self._diagnostics["reflection_errors"] += 1
-            self._persist_state()
-            return {"skill_update_completed": False, "skill_updated": False,
-                    "bandit_label_ready": False, "reason": "reflection_api_error",
-                    "task_ids": [task_id], "decision_id": decision_id}
-        if operations is None:
-            reflection["status"] = "parse_error"
-            self._append("reflections", reflection)
-            self._append("rule_updates", {**reflection, "skill_update_completed": False,
-                                           "bandit_label_ready": False})
-            self._diagnostics["parse_errors"] += 1
-            self._persist_state()
-            return {"skill_update_completed": False, "skill_updated": False,
-                    "bandit_label_ready": False, "reason": "reflection_parse_error",
-                    "task_ids": [task_id], "decision_id": decision_id}
-
-        changed, applied = self._apply_operations(operations, task_type)
-        after_hash = self._hash_rules(self._rules)
-        status = "updated" if changed else "attempted_no_change"
-        reflection["status"] = status
-        reflection["operations"] = operations
-        self._append("reflections", reflection)
+            self._diagnostics["insight_errors"] += 1
         event = {
-            "event": "rule_update", "status": status,
-            "skill_update_completed": True, "skill_updated": changed,
-            "bandit_label_ready": True, "update_step": self._update_step,
-            "decision_id": decision_id, "task_id": task_id, "task_ids": [task_id],
-            "experience_ids": [x["experience_id"] for x in evidence],
-            "operations": operations, "applied_operations": applied,
-            "before_rule_hash": before_hash, "after_rule_hash": after_hash,
-            "reason": status, "timestamp": time.time(),
+            "event": "insight_update",
+            "update_step": self._update_step,
+            "kind": kind,
+            "status": status,
+            "experience_ids": experience_ids,
+            "response": response,
+            "operations": [vars(operation) for operation in operations],
+            "applied_operations": applied,
+            "skill_updated": changed,
+            "before_rule_hash": before_hash,
+            "after_rule_hash": self._rule_bank.hash(),
+            "error": error,
+            "latency_s": round(time.time() - started, 4),
+            "model": self._reflection_model,
+            "timestamp": time.time(),
         }
-        self._append("rule_updates", event)
+        self._append("insight_updates", event)
+        if error:
+            self._append("errors", event)
         if changed:
-            self._snapshot_rules()
             self._diagnostics["rule_updates"] += 1
+            self._snapshot_rules()
         else:
-            self._diagnostics["no_change"] += 1
-        self._persist_state()
+            self._diagnostics["rule_no_change"] += 1
         return event
 
-    def _build_reflection_prompt(self, goal, task_type, evidence, reflection_mode):
-        existing = [{"rule_id": r["rule_id"], "title": r["title"], "principle": r["principle"]}
-                    for r in self._rules]
-        traces = []
-        for item in evidence[-self._max_task_history:]:
-            traces.append({
-                "experience_id": item["experience_id"], "outcome": "success" if item["success"] else "failure",
-                "trajectory": item["trajectory"][-3000:],
-            })
-        return (
-            "You are improving a reusable embodied-agent rule bank. Analyze the "
-            "successful and failed trajectories for one task. Extract only rules that "
-            "generalize beyond concrete object names. Avoid duplicating existing rules.\n\n"
-            f"TASK: {goal}\nTASK TYPE: {task_type}\n"
-            f"REFLECTION MODE: {reflection_mode}\n"
-            f"EXISTING RULES: {json.dumps(existing, ensure_ascii=False)}\n"
-            f"EVIDENCE: {json.dumps(traces, ensure_ascii=False)}\n\n"
-            "Return ONLY a JSON array. Each element must be one operation: "
-            "{\"op\": \"ADD\", \"title\": \"3-5 words\", \"principle\": \"1-2 sentences\", "
-            "\"when_to_apply\": \"condition\", \"task_type\": \"general or current type\"}, "
-            "or {\"op\": \"EDIT\", \"rule_id\": \"...\", \"title\": \"...\", "
-            "\"principle\": \"...\", \"when_to_apply\": \"...\"}, "
-            "or {\"op\": \"REMOVE\", \"rule_id\": \"...\"}. Return [] when no change is justified."
+    def _pair_jobs(self) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+        jobs = []
+        for task_key in sorted(self._by_task):
+            trials = self._task_experiences(task_key)
+            successes = [item for item in trials if item["success"]]
+            failures = [item for item in trials if not item["success"]]
+            for success in successes:
+                for failure in failures:
+                    pair_id = f"{success['experience_id']}::{failure['experience_id']}"
+                    if pair_id not in self._processed_pairs:
+                        jobs.append((pair_id, success, failure))
+        return jobs
+
+    def _first_successes(self) -> list[dict[str, Any]]:
+        first = []
+        for task_key in sorted(self._by_task):
+            successes = [item for item in self._task_experiences(task_key) if item["success"]]
+            if successes:
+                first.append(min(successes, key=lambda item: item["experience_id"]))
+        first.sort(key=lambda item: item["experience_id"])
+        return first
+
+    def _success_chunks(self, *, include_partial: bool) -> list[tuple[str, list[dict[str, Any]]]]:
+        successes = self._first_successes()
+        chunks = []
+        for start in range(0, len(successes), self._success_critique_num):
+            chunk = successes[start:start + self._success_critique_num]
+            if len(chunk) < self._success_critique_num and not include_partial:
+                continue
+            chunk_id = "::".join(item["experience_id"] for item in chunk)
+            if chunk and chunk_id not in self._processed_success_chunks:
+                chunks.append((chunk_id, chunk))
+        return chunks
+
+    def _extract_available_insights(self, *, include_partial_success: bool) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for pair_id, success, failure in self._pair_jobs():
+            event = self._run_insight_job(
+                kind="compare",
+                experience_ids=[success["experience_id"], failure["experience_id"]],
+                success_history=success["trajectory"],
+                failure_history=failure["trajectory"],
+                task_goal=format_alfworld_task(
+                    str(success.get("initial_observation", "")),
+                    str(success["task_goal"]),
+                ),
+            )
+            if event["status"] != "error":
+                self._processed_pairs.add(pair_id)
+            events.append(event)
+        for chunk_id, chunk in self._success_chunks(include_partial=include_partial_success):
+            success_history = "\n\n".join(
+                f"{format_alfworld_task(str(item.get('initial_observation', '')), str(item['task_goal']))}"
+                f"\n{item['trajectory']}"
+                for item in chunk
+            )
+            event = self._run_insight_job(
+                kind="all_success",
+                experience_ids=[item["experience_id"] for item in chunk],
+                success_history=success_history,
+            )
+            if event["status"] != "error":
+                self._processed_success_chunks.add(chunk_id)
+            events.append(event)
+        return events
+
+    def will_update_after_reflect(self, task_id: int, result: dict) -> bool:
+        del task_id, result
+        # Used only by the optional probe ablation.  Every stored success or
+        # task reflection can alter ExpeL's future policy, even without a rule
+        # operation.
+        return self._dynamic_updates
+
+    def reflect(self, task_id: int, result: dict):
+        before_hash = self._policy_hash()
+        stored: list[dict[str, Any]] = []
+        stored_reflections: list[dict[str, Any]] = []
+        for rollout in result.get("rollout_results", [result]):
+            stored.append(self._store_experience(task_id, rollout))
+
+        for payload in result.get("staged_reflections", []):
+            item = self._store_reflection(payload)
+            if item:
+                stored_reflections.append(item)
+
+        if self._dynamic_updates and self._mode == "spg_online":
+            for rollout in result.get("rollout_results", [result]):
+                if rollout.get("success"):
+                    continue
+                task_key = str(rollout["task_key"])
+                if len(self._task_reflections[task_key]) >= self._max_reflection_depth:
+                    continue
+                payload = self._generate_task_reflection(task_id, rollout, staged=False)
+                if payload:
+                    item = self._store_reflection(payload)
+                    if item:
+                        stored_reflections.append(item)
+
+        insight_events: list[dict[str, Any]] = []
+        if self._dynamic_updates and self._insight_strategy == "incremental":
+            insight_events = self._extract_available_insights(include_partial_success=False)
+        after_hash = self._policy_hash()
+        event = {
+            "event": "expel_learning_step",
+            "decision_id": int(result.get("expel_decision_id", self._decision_id)),
+            "task_id": int(task_id),
+            "task_ids": [int(task_id)],
+            "experience_ids": [item["experience_id"] for item in stored],
+            "reflection_ids": [item["reflection_id"] for item in stored_reflections],
+            "insight_update_steps": [item["update_step"] for item in insight_events],
+            "skill_update_completed": True,
+            "skill_updated": before_hash != after_hash,
+            "bandit_label_ready": True,
+            "before_policy_hash": before_hash,
+            "after_policy_hash": after_hash,
+            "timestamp": time.time(),
+        }
+        self._append("learning_steps", event)
+        self._persist()
+        return [event]
+
+    # ------------------------------------------------------------------
+    # Selector features and lifecycle
+
+    @property
+    def selection_feature_dim(self) -> int:
+        return 5
+
+    def get_selection_features(self, task_id: int):
+        goal = self._dataset.get_task_goal(task_id)
+        task_type = self._raw_task_type(task_id)
+        task_key = self._task_key(goal, task_type)
+        trials = self._task_experiences(task_key)
+        successes = sum(bool(item["success"]) for item in trials)
+        failures = len(trials) - successes
+        reflections = len(self._task_reflections.get(task_key, []))
+        unresolved_pairs = sum(
+            1 for success in (item for item in trials if item["success"])
+            for failure in (item for item in trials if not item["success"])
+            if f"{success['experience_id']}::{failure['experience_id']}" not in self._processed_pairs
         )
-
-    @staticmethod
-    def _parse_operations(response: str) -> list[dict[str, Any]] | None:
-        text = response.strip()
-        fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-        if fenced:
-            text = fenced.group(1)
-        if not text.startswith("["):
-            start, end = text.find("["), text.rfind("]")
-            if start >= 0 and end > start:
-                text = text[start:end + 1]
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
-            return None
-        return parsed
-
-    def _apply_operations(self, operations, default_task_type):
-        changed = False
-        applied = []
-        rules_by_id = {str(rule["rule_id"]): rule for rule in self._rules}
-        for operation in operations:
-            op = str(operation.get("op", "")).upper()
-            if op == "ADD":
-                title = str(operation.get("title", "")).strip()
-                principle = str(operation.get("principle", "")).strip()
-                if not title or not principle or any(r["title"].lower() == title.lower() for r in self._rules):
-                    continue
-                if len(self._rules) >= self._max_rules:
-                    continue
-                rule_id = f"rule_{self._update_step:05d}_{len(self._rules):03d}"
-                rule = {"rule_id": rule_id, "title": title, "principle": principle,
-                        "when_to_apply": str(operation.get("when_to_apply", "")).strip(),
-                        "task_type": str(operation.get("task_type") or default_task_type),
-                        "use_count": 0, "created_update_step": self._update_step}
-                self._rules.append(rule)
-                rules_by_id[rule_id] = rule
-                changed = True
-                applied.append({"op": "ADD", "rule_id": rule_id})
-            elif op == "EDIT":
-                rule = rules_by_id.get(str(operation.get("rule_id", "")))
-                if rule is None:
-                    continue
-                dirty = False
-                for key in ("title", "principle", "when_to_apply"):
-                    if operation.get(key) and str(operation[key]).strip() != rule.get(key, ""):
-                        rule[key] = str(operation[key]).strip()
-                        dirty = True
-                if dirty:
-                    changed = True
-                    applied.append({"op": "EDIT", "rule_id": rule["rule_id"]})
-            elif op == "REMOVE":
-                rule_id = str(operation.get("rule_id", ""))
-                rule = rules_by_id.get(rule_id)
-                if rule is not None:
-                    self._rules.remove(rule)
-                    rules_by_id.pop(rule_id, None)
-                    changed = True
-                    applied.append({"op": "REMOVE", "rule_id": rule_id})
-        return changed, applied
-
-    def _snapshot_rules(self):
-        if self._expel_dir is None:
-            return
-        payload = {"update_step": self._update_step, "rules": self._rules,
-                   "rule_hash": self._hash_rules(self._rules)}
-        self._atomic_json(self._expel_dir / "current_rules.json", payload)
-        self._atomic_json(self._expel_dir / "snapshots" / f"rules_{self._update_step:06d}.json", payload)
-
-    def record_gain_measurement(self, payload: dict[str, Any]):
-        """Receive runner-owned probe/MIRT evidence into the ExpeL log stream."""
-        self._append("gain_measurements", {**payload, "timestamp": time.time()})
-
-    # ── lifecycle ─────────────────────────────────────────────────────
+        return np.asarray([
+            np.log1p(successes),
+            np.log1p(failures),
+            reflections / max(self._max_reflection_depth, 1),
+            float(successes > 0 and failures > 0),
+            np.log1p(unresolved_pairs),
+        ], dtype=float)
 
     def get_usage(self) -> dict:
-        return {"api_calls": self._total_calls, "reflection_calls": self._reflection_calls,
-                "rule_count": len(self._rules), "experience_count": len(self._experiences)}
+        return {
+            "api_calls": self._total_calls,
+            "actor_calls": self._actor_calls,
+            "reflection_calls": self._reflection_calls,
+            "insight_calls": self._insight_calls,
+            "rule_count": len(self._rule_bank.rules),
+            "experience_count": len(self._experiences),
+            "task_reflection_count": sum(len(value) for value in self._task_reflections.values()),
+            "buffered_rollouts": 0,
+        }
 
     def save_checkpoint(self) -> dict:
         return self._state_payload()
@@ -546,14 +944,38 @@ class ExpelAgent(SimpleAgent):
     def load_checkpoint(self, state: dict):
         if state:
             self._restore_state(state)
-            self._persist_state()
+            self._persist()
 
     def finalize(self):
-        self._persist_state()
-        return []
+        events: list[dict[str, Any]] = []
+        if self._dynamic_updates:
+            # Official ExpeL also analyses the final (possibly short) group of
+            # successful tasks.  Deferred mode performs all pair jobs here;
+            # incremental mode only has the last success chunk left.
+            insight_events = self._extract_available_insights(include_partial_success=True)
+            if insight_events:
+                events.append({
+                    "event": "expel_finalize",
+                    "skill_update_completed": True,
+                    "skill_updated": any(item["skill_updated"] for item in insight_events),
+                    "bandit_label_ready": True,
+                    "task_ids": [],
+                    "insight_update_steps": [item["update_step"] for item in insight_events],
+                    "timestamp": time.time(),
+                })
+        self._persist()
+        self._append("lifecycle", {
+            "event": "finalize", "usage": self.get_usage(), "timestamp": time.time(),
+        })
+        return events
 
     def reset(self):
-        # Evaluation creates a new adapter then loads this persisted skill
-        # state.  Do not clear learned rules or demonstrations here.
-        super().reset()
+        # Learned memory persists; only per-process usage counters reset.
+        self._total_calls = 0
+        self._actor_calls = 0
         self._reflection_calls = 0
+        self._insight_calls = 0
+
+    def record_gain_measurement(self, payload: dict[str, Any]):
+        """Keep optional probe-ablation measurements in ExpeL's audit log."""
+        self._append("gain_measurements", {**payload, "timestamp": time.time()})

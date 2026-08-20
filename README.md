@@ -277,12 +277,22 @@ logs/<run_id>/
     evaluating_steps.jsonl       # evaluation 每步记录
     comparison.json              # 汇总结果
   <selector>/
-    messages/                    # 每步 API 请求/响应 和 reflection 记录
+    messages/                    # SkillRL/SimpleAgent 的逐步消息
     expel/
-      experiences.jsonl          # ExpeL experience event stream
-      reflections.jsonl          # 完整 reflection 请求/响应/错误
-      rule_updates.jsonl         # 规则更新和 provenance
-      gain_measurements.jsonl    # probe + MIRT skill-gain 标签
+      lifecycle.jsonl            # load/finalize 与源码 revision
+      trials.jsonl               # 完整 ReAct trial、模型输出和轨迹
+      retrievals.jsonl           # rules/reflections/success demos 检索结果
+      experiences.jsonl          # 成功/失败 experience event stream
+      task_reflections.jsonl     # New Plan 的 prompt/response/error
+      reflection_memory.jsonl    # 实际写入任务记忆的 reflection
+      insight_prompts.jsonl      # success/failure 与 all-success insight prompt
+      insight_updates.jsonl      # 原始响应、规则操作和强度变化
+      learning_steps.jsonl       # 每个外层 task 的学习事务
+      errors.jsonl               # reflection/insight API 与解析错误（发生时）
+      current_rules.json         # 当前带 strength 的规则列表
+      prompts/                   # 每次 insight 的完整可复现 prompt
+      rule_snapshots/            # 每次有效规则更新的快照
+    evaluation/expel/            # 同一次运行内只读评估的独立 ExpeL 日志
 
 skills/<run_id>/skills.json      # SkillRL SkillBank（SkillRL 配置）
 skills/<run_id>/expel_state.json # ExpeL rule bank 与 experience store
@@ -314,20 +324,32 @@ changing the agent implementation.
 
 ## ExpeL adapter
 
-`-c expel` runs the online ExpeL adapter with SPG-Bandit; `-c expel_uniform`
-is the matching Uniform control. A selected task produces multiple rollouts,
-then an ExpeL reflection attempt can add, edit, or remove reusable rules.
-Successful experiences are retrieved into later prompts. Reflection always
-uses `REFLECTION_*`; action generation uses `LLM_*`.
+`-c expel` runs the embedded ExpeL method with SPG-Bandit; `-c expel_uniform`
+is the matching Uniform control. The runtime audits the exact ALFWorld ReAct
+and reflection examples against the bundled source at `docs/ExpeL` and also
+contains a compressed snapshot of the same upstream revision for server
+deployments that omit `docs/`; it does not import the legacy LangChain stack.
+Failed trials create task-local `New plan` reflections; successful trials are
+retrieved by task similarity; global
+insights are extracted from success/failure pairs and groups of successful
+tasks. Rules use ExpeL's original `AGREE`/`REMOVE`/`EDIT`/`ADD` operations and
+strength changes (+1, -1/-3, +1, +2).
 
 ```bash
 python spg_bandit/main.py -c expel --evaluating --no-wandb
 python spg_bandit/main.py -c expel_uniform --evaluating --no-wandb
 ```
 
-For SPG, the fixed internal probe set supplies pre/post-rule-update outcomes.
-At warmup end, MIRT fits one latent scale and reconstructs those observations
-into causal profile-delta labels before training the MLP. Set
+`skill_evolving.mode: spg_online` lets SPG select one trial at a time and
+injects a saved reflection when that task is selected again. Set it to
+`paper_faithful` to execute ExpeL's contiguous reflection retries within one
+selection. `insight_strategy: incremental` evolves rules online;
+`deferred` performs insight extraction in `finalize` after gathering trials.
+
+For SPG, `gain_measurement: mirt_transition` is the default/proposal path: the
+MLP target is the selected task's immediate MIRT profile change. The old fixed
+pre/post probe procedure is retained only as an explicit
+`gain_measurement: probe` ablation and requires `probe_size`. Set
 `spg_bandit.device: auto` (default) or `cuda` to run warmup MLP training and
 the embedding-to-`a,d` ridge regression on a visible GPU. MIRT-EM itself
 currently uses SciPy on CPU.

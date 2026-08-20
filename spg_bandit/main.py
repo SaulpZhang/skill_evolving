@@ -79,6 +79,7 @@ def create_selector(name, task_pool, config, warmup_ids=None, n_warm=0,
             device=params.get("device", "auto"),
             gpu_min_free_memory_mb=params.get("gpu_min_free_memory_mb", 2048),
             task_state_dim=task_state_dim,
+            gain_measurement=params.get("gain_measurement", "mirt_transition"),
         )
     raise ValueError(f"Unknown selector: {name}")
 
@@ -265,17 +266,27 @@ def main():
     if selector.needs_warmup:
         n_bandit = evo_pool.M - n_warm
 
-    # A fixed, type-balanced probe subset measures the ability-profile change
-    # caused by a skill-bank update.  It is never reflected on and is
-    # therefore evaluation evidence rather than additional training data.
+    # Probe measurement is an optional ablation.  The default/proposal path
+    # learns from each selected task's immediate MIRT profile transition and
+    # therefore executes no hidden extra tasks.
     probe_ids = []
     if sel_name == "spg_bandit":
+        gain_measurement = str(spg_cfg.get("gain_measurement", "mirt_transition"))
         probe_size = int(spg_cfg.get("probe_size", 0))
-        if probe_size:
+        if gain_measurement == "probe":
+            if probe_size < 1:
+                raise ValueError(
+                    "spg_bandit.probe_size must be positive when gain_measurement=probe"
+                )
             if probe_size < 1 or probe_size > evo_pool.M:
                 raise ValueError("spg_bandit.probe_size must be in [1, evolve pool size]")
             probe_ids = sample_type_balanced_task_ids(evo_pool, probe_size, random)
             logger.info("SPG skill-gain probes: %s fixed type-balanced tasks", len(probe_ids))
+        elif probe_size:
+            logger.warning(
+                "Ignoring spg_bandit.probe_size=%s because gain_measurement=%s",
+                probe_size, gain_measurement,
+            )
 
     logger.info(f"Warmup pool: evolve pool ({evo_pool.M} tasks), {n_warm} steps")
     logger.info(f"Evolve pool: {evo_pool.M} tasks, {n_bandit} steps")
@@ -313,9 +324,9 @@ def main():
     def _record_execution_progress(kind: str, task_id: int, result: dict, *, outer_step: int):
         """Persist a heartbeat as soon as any environment execution finishes.
 
-        A selected ExpeL task can be followed by reflection and two probe
-        passes.  Keeping this independent stream avoids an apparently silent
-        run while that longer causal-measurement unit is still in progress.
+        A selected task can be followed by reflection and, in the explicit
+        probe ablation, two probe passes. Keeping this stream independent
+        avoids an apparently silent run during a longer learning unit.
         """
         nonlocal execution_count
         execution_count += 1
@@ -457,10 +468,9 @@ def main():
                 "_step_evolving": step + 1,
             })
             selector.update(task_id, result)
-            # The selected-task outcome updates the current MIRT state.  If a
-            # skill update is due, probe that same state before reflection;
-            # probe again after reflection and use the profile difference as
-            # the MLP supervision signal.
+            # The default selector has already assigned the selected task's
+            # MIRT transition as its delta label. The block below runs only
+            # for the explicit pre/post probe attribution ablation.
             anchor_profile = None
             before_profile = None
             warmup_before_results = None
@@ -593,7 +603,10 @@ def main():
             agent_name,
             eva_dataset,
             max_turns,
-            records_dir=str(log_base / sel_name / "evaluating_messages"),
+            # Keep read-only evaluation trials separate from the training
+            # ExpeL event streams.  Otherwise both phases append to the same
+            # ``<selector>/expel/*.jsonl`` files and provenance is ambiguous.
+            records_dir=str(log_base / sel_name / "evaluation" / "messages"),
             skill_config=eval_skill_config,
         )
         eval_method.load_skills(skills_dir)

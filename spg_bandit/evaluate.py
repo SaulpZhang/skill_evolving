@@ -42,7 +42,7 @@ class RunPaths:
 
 
 def resolve_run_paths(run_id: str, project_root: Path = PROJECT_ROOT) -> RunPaths:
-    """Resolve the saved config and evolved SkillBank for ``run_id``."""
+    """Resolve the saved config and method-specific state for ``run_id``."""
     if not run_id or Path(run_id).name != run_id:
         raise ValueError("run_id must not be empty")
 
@@ -50,11 +50,19 @@ def resolve_run_paths(run_id: str, project_root: Path = PROJECT_ROOT) -> RunPath
     run_dir = project_root / "logs" / run_id
     config_path = run_dir / "records" / "config.yaml"
     skills_dir = project_root / "skills" / run_id
-    skill_path = skills_dir / "skills.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"Saved run config not found: {config_path}")
-    if not skill_path.is_file():
-        raise FileNotFoundError(f"Evolved SkillBank not found: {skill_path}")
+    config = load_config(str(config_path))
+    method_name = str((config.get("skill_evolving", {}) or {}).get("name", "simple_agent"))
+    expected_state = (
+        skills_dir / "expel_state.json"
+        if method_name == "expel"
+        else skills_dir / "skills.json"
+    )
+    if not expected_state.is_file():
+        raise FileNotFoundError(
+            f"Evolved state for method {method_name!r} not found: {expected_state}"
+        )
     return RunPaths(run_id, run_dir, config_path, skills_dir)
 
 
@@ -125,7 +133,7 @@ def run_evaluation(
 
     The experiment's saved config controls the dataset, model endpoint, prompt
     settings, and default evaluation split. Dynamic skill updates are always
-    disabled so this command never mutates the saved ``skills.json``.
+    disabled so this command never mutates the saved method state.
     """
     paths = resolve_run_paths(run_id, project_root=project_root)
     config = load_config(str(paths.config_path))
@@ -168,7 +176,7 @@ def run_evaluation(
     init_wandb(config, wandb_id, wandb_id, enabled=not no_wandb)
     try:
         logger.info("Evaluating saved run %s", run_id)
-        logger.info("SkillBank: %s", paths.skills_dir / "skills.json")
+        logger.info("Method state: %s", paths.skills_dir)
         logger.info("Evaluation split: %s", dataset_overrides["split"])
 
         dataset = create_dataset(

@@ -342,7 +342,8 @@ class SPGBanditSelector(BaseSelector):
                  lambda_reg: float = 1.0, seed: int = 42,
                  K: int = 6, warmup_ids: list[int] | None = None,
                  window_size: int = 20, device: str = "auto",
-                 task_state_dim: int = 0, gpu_min_free_memory_mb: int = 2048):
+                 task_state_dim: int = 0, gpu_min_free_memory_mb: int = 2048,
+                 gain_measurement: str = "mirt_transition"):
         self._K = K
         self._n_warm = n_warm
         self._alpha = alpha
@@ -363,6 +364,11 @@ class SPGBanditSelector(BaseSelector):
         self._window_size = window_size
         if self._window_size <= 0:
             raise ValueError("window_size must be positive")
+        self._gain_measurement = str(gain_measurement)
+        if self._gain_measurement not in {"mirt_transition", "probe"}:
+            raise ValueError(
+                "spg_bandit.gain_measurement must be mirt_transition or probe"
+            )
         self._step = 0
         self._warmup_ready = False
         self._task_pool = task_pool
@@ -372,9 +378,9 @@ class SPGBanditSelector(BaseSelector):
         self._B = np.zeros((d_f, K))
         self._W = np.zeros((d_f, K))
         self._last_phi = None
-        # A selected task is observed immediately for MIRT state estimation,
-        # but its bandit label is deferred until the skill update it helped
-        # trigger has been evaluated on a fixed probe set.
+        # Probe attribution is retained as an explicit ablation only.  The
+        # proposal/default path supervises the MLP with the selected task's
+        # immediate MIRT profile transition.
         self._pending_skill_observations = deque()
         self._window = deque()
 
@@ -391,8 +397,8 @@ class SPGBanditSelector(BaseSelector):
         self._warmup_outcomes = []
         self._warmup_deltas = []
         self._warmup_embeds = []
-        # Raw before/after probe observations for ExpeL-style online skill
-        # updates. They are replayed after warmup once MIRT is identifiable.
+        # Raw before/after probe observations exist only in probe-ablation
+        # mode and are replayed once MIRT is identifiable.
         self._warmup_gain_measurements = []
 
         # MIRT fitted params for online update
@@ -437,6 +443,7 @@ class SPGBanditSelector(BaseSelector):
     def save_warmup_data(self, path: str):
         """Save warmup data to JSON for future --warmup-data runs."""
         data = {
+            "gain_measurement": self._gain_measurement,
             "task_ids": self._warmup_task_ids,
             "successes": self._warmup_successes,
             "trials": self._warmup_trials,
@@ -452,6 +459,16 @@ class SPGBanditSelector(BaseSelector):
         """Load warmup data, skip task execution, run MIRT EM + MLP."""
         with open(path) as f:
             data = json.load(f)
+        data_measurement = data.get("gain_measurement")
+        if data_measurement is None:
+            data_measurement = (
+                "probe" if data.get("gain_measurements") else "mirt_transition"
+            )
+        if data_measurement != self._gain_measurement:
+            raise ValueError(
+                "Warmup data gain_measurement does not match current SPG config "
+                f"({data_measurement!r} != {self._gain_measurement!r})"
+            )
         self._warmup_task_ids = data["task_ids"]
         self._warmup_successes = data["successes"]
         self._warmup_trials = data.get("trials", [1] * len(self._warmup_task_ids))
@@ -522,11 +539,17 @@ class SPGBanditSelector(BaseSelector):
         elif self._warmup_ready:
             a_tau = self._A_fit[task_id]
             d_tau = self._d_fit[task_id]
+            profile_before = self._profile.copy()
             self._profile = online_profile_update(
                 self._profile, a_tau, d_tau, successes, trials,
             )
             if self._last_phi is not None:
-                self._pending_skill_observations.append((task_id, self._last_phi.copy()))
+                if self._gain_measurement == "probe":
+                    self._pending_skill_observations.append((task_id, self._last_phi.copy()))
+                else:
+                    delta = self._profile - profile_before
+                    self._append_window_observation(self._last_phi, delta)
+                    self._W = np.linalg.solve(self._A, self._B)
 
     @staticmethod
     def _compact_probe_results(results: list[dict]) -> list[dict]:
@@ -550,7 +573,11 @@ class SPGBanditSelector(BaseSelector):
         warmup end the final item parameters are used to reconstruct these
         causal labels on one consistent latent scale.
         """
-        if self._warmup_ready or not self._warmup_task_ids:
+        if (
+            self._gain_measurement != "probe"
+            or self._warmup_ready
+            or not self._warmup_task_ids
+        ):
             return
         self._warmup_gain_measurements.append({
             "task_id": int(task_id),
@@ -607,7 +634,7 @@ class SPGBanditSelector(BaseSelector):
         has actually changed, so it estimates the selected batch's effect on
         skill-mediated competence.
         """
-        if not self._warmup_ready:
+        if self._gain_measurement != "probe" or not self._warmup_ready:
             return {"committed": 0, "delta": [0.0] * self._K}
         delta = np.asarray(profile_after, dtype=float) - np.asarray(profile_before, dtype=float)
         if not updated:
@@ -702,9 +729,8 @@ class SPGBanditSelector(BaseSelector):
         for i, ll_val in enumerate(ll_history):
             log_metrics({"mirt/ll": ll_val, "_step_mirt": i + 1})
 
-        # ExpeL labels are measured after reflection on a fixed probe set.  A
-        # legacy run without these records retains the historical sequential
-        # MIRT target, keeping old warmup JSON files usable.
+        # Default/proposal labels are the sequential selected-task MIRT
+        # transitions above. Probe replay remains an explicit ablation.
         train_ids = list(self._warmup_task_ids)
         train_profiles = list(profiles_before)
         train_deltas = list(deltas)
@@ -712,7 +738,7 @@ class SPGBanditSelector(BaseSelector):
         if len(train_task_states) != len(train_ids):
             train_task_states = [np.zeros(self._task_state_dim) for _ in train_ids]
         last_measured_profile = None
-        if self._warmup_gain_measurements:
+        if self._gain_measurement == "probe" and self._warmup_gain_measurements:
             measured_ids, measured_profiles, measured_deltas, measured_task_states = [], [], [], []
             for measurement in self._warmup_gain_measurements:
                 index = int(measurement.get("warmup_index", -1))
@@ -824,6 +850,7 @@ class SPGBanditSelector(BaseSelector):
                 for task_id, phi in self._pending_skill_observations
             ],
             "window_size": self._window_size,
+            "gain_measurement": self._gain_measurement,
             "mlp": self._mlp.get_state() if self._mlp is not None else None,
             "mlp_cfg": {"d_c": self._mlp.d_c, "d_h": self._d_h, "d_f": self._d_f, "seed": self._seed, "device": self._device} if self._mlp is not None else None,
         }
@@ -858,6 +885,18 @@ class SPGBanditSelector(BaseSelector):
             for item in data.get("task_states", [np.zeros(self._task_state_dim)] * len(self._warmup_task_ids))
         ]
         self._window_size = data.get("window_size", self._window_size)
+        checkpoint_measurement = data.get("gain_measurement")
+        if checkpoint_measurement is None:
+            checkpoint_measurement = (
+                "probe"
+                if data.get("gain_measurements") or data.get("pending_skill_observations")
+                else "mirt_transition"
+            )
+        if checkpoint_measurement != self._gain_measurement:
+            raise ValueError(
+                "Checkpoint gain_measurement does not match current SPG config "
+                f"({checkpoint_measurement!r} != {self._gain_measurement!r})"
+            )
         self._window = deque(
             (np.array(item["phi"]), np.array(item["delta"]))
             for item in data.get("window", [])
