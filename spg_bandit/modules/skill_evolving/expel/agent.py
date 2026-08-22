@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from spg_bandit.modules.dataset.base import BaseDataset
+from spg_bandit.modules.dataset.webshop import extract_webshop_action
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving, SelectionContext
 from spg_bandit.modules.skill_evolving.expel.prompts import (
     OfficialPromptAssets,
@@ -375,29 +376,8 @@ class ExpelAgent(BaseSkillEvolving):
 
     @staticmethod
     def _parse_webshop_output(output: str) -> tuple[str, str]:
-        """Project model output onto one native WebShop command.
-
-        Qwen often emits ``[action>search[query]]`` even when asked for the
-        source ExpeL syntax.  Parsing the outer tag with a non-greedy ``]``
-        pattern truncates the inner WebShop command at ``search[query``.  Find
-        the native command itself instead, so wrapped and plain responses are
-        both safe to execute.
-        """
-        text = (output or "").strip()
-        wrapped = re.search(
-            r"(?:<action>|\[action\]|\[action>)\s*([\s\S]*?)(?:</action>|\[/action\])",
-            text,
-            re.IGNORECASE,
-        )
-        if wrapped:
-            text = wrapped.group(1).strip()
-        else:
-            text = re.sub(r"(?i)^\s*action\s*\d*\s*:\s*", "", text)
-
-        command = re.search(r"\b(search|click|think)\[([^\[\]]*)\]", text, re.IGNORECASE | re.DOTALL)
-        if command:
-            return "action", f"{command.group(1).lower()}[{command.group(2).strip()}]"
-        return "action", f"think[{text.removeprefix('Observation:').strip()}]"
+        """Project model output with the shared native WebShop extractor."""
+        return "action", extract_webshop_action(output)
 
     @staticmethod
     def _clean_action(action: str) -> str:

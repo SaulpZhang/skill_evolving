@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from spg_bandit.modules.dataset.base import BaseDataset
+from spg_bandit.modules.dataset.webshop import extract_webshop_action
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving
 from spg_bandit.modules.skill_evolving.simple_agent.skill_manager import SkillManager
 
@@ -205,13 +206,7 @@ class SimpleAgent(BaseSkillEvolving):
     def _project_action(self, response: str) -> str:
         """Project a model response to an environment action."""
         if str(getattr(self._dataset, "name", "")).lower() == "webshop":
-            command = re.search(
-                r"\b(search|click|think)\[([^\[\]]*)\]",
-                response or "",
-                re.IGNORECASE | re.DOTALL,
-            )
-            if command:
-                return f"{command.group(1).lower()}[{command.group(2).strip()}]"
+            return extract_webshop_action(response)
         return self._parse_action(response)
 
     def _format_history(self, recent: list) -> str:

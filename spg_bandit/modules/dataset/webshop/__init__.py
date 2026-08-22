@@ -23,6 +23,70 @@ from spg_bandit.modules.dataset.embedding_cache import EmbeddingCache
 
 _SUBPAGES = {"Description", "Features", "Reviews", "Attributes"}
 _BRACKETED = re.compile(r"\[([^\[\]]+)\]")
+_WEBSHOP_ACTION = re.compile(r"\b(search|click|think)\s*\[", re.IGNORECASE)
+_ACTION_WRAPPER = re.compile(r"(?:<action>|\[action\]|\[action>)", re.IGNORECASE)
+_ACTION_LABEL = re.compile(r"\baction\s*\d*\s*:\s*", re.IGNORECASE)
+
+
+def _balanced_webshop_action(text: str) -> str | None:
+    """Return the first complete native action in *text*.
+
+    WebShop action arguments can themselves contain brackets.  A regex such as
+    ``think\\[([^]]*)\\]`` therefore corrupts otherwise valid outputs like
+    ``think[inform[item unavailable]]``.  This scanner closes only after the
+    matching bracket depth returns to zero.
+    """
+    match = _WEBSHOP_ACTION.search(text)
+    if match is None:
+        return None
+    kind = match.group(1).lower()
+    opening = text.find("[", match.start())
+    depth = 0
+    for index in range(opening, len(text)):
+        char = text[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return f"{kind}[{text[opening + 1:index].strip()}]"
+    # A missing terminal bracket is a common single-token formatting error.
+    # Recover only when a native action prefix was unambiguously identified.
+    return f"{kind}[{text[opening + 1:].strip()}]"
+
+
+def extract_webshop_action(output: str) -> str:
+    """Project unstable LLM output to exactly one WebShop native action.
+
+    Preference order is intentional: explicit action wrappers, then an
+    ``Action:`` label, then a bare native command.  It prevents an action name
+    mentioned in reasoning from winning over the model's final answer while
+    accepting the common ALFWorld-style wrappers emitted by instruction-tuned
+    models.
+    """
+    text = str(output or "").strip()
+    if not text:
+        return "think[]"
+
+    candidates: list[str] = []
+    wrappers = list(_ACTION_WRAPPER.finditer(text))
+    if wrappers:
+        candidates.extend(text[match.end():] for match in wrappers)
+    labels = list(_ACTION_LABEL.finditer(text))
+    if labels:
+        candidates.extend(text[match.end():] for match in labels)
+    candidates.append(text)
+
+    for candidate in candidates:
+        action = _balanced_webshop_action(candidate)
+        if action is not None:
+            return action
+
+    # Keep a malformed completion non-executable instead of fabricating a
+    # search/click command.  ``think`` is the only safe no-op in WebShop.
+    clean = re.sub(r"</?(?:think|action)>|\[/?action\]?", "", text, flags=re.IGNORECASE)
+    clean = clean.strip().strip("`")
+    return f"think[{clean}]"
 
 
 def _embedding(text: str, model: str, api_url: str, api_type: str) -> list[float]:
