@@ -3,8 +3,8 @@
 This adapter follows the implementation in ``docs/ExpeL`` at the algorithmic
 boundaries that matter:
 
-* the actor uses the project's ALFWorld-compatible action protocol while
-  consuming ExpeL memories;
+* the actor uses the benchmark's native action protocol while consuming ExpeL
+  memories (ALFWorld XML-style tags; WebShop bracket actions);
 * failed trials produce task-local ``New plan`` reflections used on retries;
 * successful trials are retrieved as demonstrations by task similarity;
 * global insights are extracted from success/failure pairs and groups of
@@ -36,6 +36,7 @@ from spg_bandit.modules.dataset.base import BaseDataset
 from spg_bandit.modules.skill_evolving.base import BaseSkillEvolving, SelectionContext
 from spg_bandit.modules.skill_evolving.expel.prompts import (
     OfficialPromptAssets,
+    build_actor_context,
     build_insight_prompt,
     build_reflection_prompt,
     format_alfworld_task,
@@ -98,9 +99,9 @@ class ExpelAgent(BaseSkillEvolving):
         self._top_k = int(self._config.get("top_k", 2))
         self._max_fewshot_tokens = int(self._config.get("max_fewshot_tokens", 1000))
         self._max_reflection_depth = int(self._config.get("max_reflection_depth", 3))
-        # Keep the actor-side context format compatible with the model used by
-        # the rest of this project (formerly SimpleAgent).  ExpeL controls the
-        # contents of the memory section, not the model's action protocol.
+        # ALFWorld retains the project's validated SimpleAgent action contract.
+        # WebShop must instead retain ExpeL's native ``search[...]`` / ``click[...]``
+        # contract: its environment does not understand ALFWorld XML actions.
         self._history_window = int(self._config.get("history_window", 5))
         self._success_critique_num = int(self._config.get("success_critique_num", 8))
         self._use_memory_during_evolve = bool(
@@ -374,13 +375,29 @@ class ExpelAgent(BaseSkillEvolving):
 
     @staticmethod
     def _parse_webshop_output(output: str) -> tuple[str, str]:
-        """Match ExpeL's WebShop parser: every response is one environment action."""
-        text = re.sub(r"(?i)^\s*action\s*\d*\s*:\s*", "", (output or "").strip())
-        if "[" not in text:
-            text = f"think[{text.removeprefix('Observation:').strip()}]"
-        elif not text.endswith("]"):
-            text += "]"
-        return "action", text
+        """Project model output onto one native WebShop command.
+
+        Qwen often emits ``[action>search[query]]`` even when asked for the
+        source ExpeL syntax.  Parsing the outer tag with a non-greedy ``]``
+        pattern truncates the inner WebShop command at ``search[query``.  Find
+        the native command itself instead, so wrapped and plain responses are
+        both safe to execute.
+        """
+        text = (output or "").strip()
+        wrapped = re.search(
+            r"(?:<action>|\[action\]|\[action>)\s*([\s\S]*?)(?:</action>|\[/action\])",
+            text,
+            re.IGNORECASE,
+        )
+        if wrapped:
+            text = wrapped.group(1).strip()
+        else:
+            text = re.sub(r"(?i)^\s*action\s*\d*\s*:\s*", "", text)
+
+        command = re.search(r"\b(search|click|think)\[([^\[\]]*)\]", text, re.IGNORECASE | re.DOTALL)
+        if command:
+            return "action", f"{command.group(1).lower()}[{command.group(2).strip()}]"
+        return "action", f"think[{text.removeprefix('Observation:').strip()}]"
 
     @staticmethod
     def _clean_action(action: str) -> str:
@@ -527,6 +544,19 @@ class ExpelAgent(BaseSkillEvolving):
             actions: list[str] = []
             model_outputs: list[str] = []
             recent: list[tuple[str, str]] = []
+            webshop_history: list[str] = []
+            webshop_context = ""
+            if self._benchmark == "webshop":
+                _, webshop_context = build_actor_context(
+                    assets=self._assets,
+                    task_goal=goal,
+                    task_type=task_type,
+                    initial_observation=initial_observation,
+                    max_steps=self.max_turns,
+                    rules=rules,
+                    retrieved_demonstrations=demonstrations,
+                    reflections=reflections,
+                )
             success = bool(state.success)
             done = bool(state.done)
             current_observation = str(state.observation)
@@ -534,21 +564,39 @@ class ExpelAgent(BaseSkillEvolving):
                 if done or success:
                     break
                 admissible = list(state.admissible_actions)
-                prompt = self._dataset.build_action_prompt(
-                    task_goal=goal,
-                    skill_section=memory,
-                    observation=current_observation,
-                    admissible_actions=admissible,
-                    step=step_index,
-                    recent=recent,
-                    history_window=self._history_window,
-                )
+                if self._benchmark == "webshop":
+                    # The original ExpeL WebShop prompt is action-completion
+                    # style.  Keep an explicit Action/Observation history so
+                    # later turns retain the search result and navigation path.
+                    if webshop_history:
+                        prompt = webshop_context.rsplit("Action:", 1)[0].rstrip()
+                        prompt += "\n" + "\n".join(webshop_history) + "\n\nAction:"
+                    else:
+                        prompt = webshop_context
+                    actor_system = self._assets.system_instruction
+                    actor_stop = ["\n", "\n\n"]
+                else:
+                    prompt = self._dataset.build_action_prompt(
+                        task_goal=goal,
+                        skill_section=memory,
+                        observation=current_observation,
+                        admissible_actions=admissible,
+                        step=step_index,
+                        recent=recent,
+                        history_window=self._history_window,
+                    )
+                    actor_system = ""
+                    actor_stop = None
                 output = self._chat(
-                    kind="actor", system="", user=prompt,
+                    kind="actor", system=actor_system, user=prompt,
                     max_tokens=self._max_tokens, temperature=self._temperature,
-                    stop=None,
+                    stop=actor_stop,
                 )
-                action = self._parse_simple_agent_action(output)
+                action = (
+                    self._parse_webshop_output(output)[1]
+                    if self._benchmark == "webshop"
+                    else self._parse_simple_agent_action(output)
+                )
                 model_outputs.append(output)
                 before = current_observation
                 try:
@@ -586,6 +634,8 @@ class ExpelAgent(BaseSkillEvolving):
                 })
                 print(f"    [{step_index}] {action}\n    -> {current_observation}", flush=True)
                 recent.append((before, action))
+                if self._benchmark == "webshop":
+                    webshop_history.append(f"Action: {action}\nObservation: {current_observation}")
                 success = bool(step.success)
                 done = bool(step.done)
                 state = step

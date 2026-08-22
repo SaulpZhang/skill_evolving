@@ -172,7 +172,10 @@ class SimpleAgent(BaseSkillEvolving):
     def _clean_action(action: str) -> str:
         """Strip tag remnants, take only the first command if multi-action."""
         a = action.strip()
-        a = re.sub(r"\s*[;,]?\s*(</action>|\[/action\]|\])[\s\S]*$", "", a)
+        # A closing square bracket belongs to native WebShop actions and must
+        # never be treated as a wrapper terminator.
+        a = re.sub(r"\s*[;,]?\s*(</action>|\[/action\])[\s\S]*$", "", a,
+                   flags=re.IGNORECASE)
         # Take only the first command (before any ; or ,)
         a = a.split(";")[0].split(",")[0].strip()
         return a
@@ -201,6 +204,14 @@ class SimpleAgent(BaseSkillEvolving):
 
     def _project_action(self, response: str) -> str:
         """Project a model response to an environment action."""
+        if str(getattr(self._dataset, "name", "")).lower() == "webshop":
+            command = re.search(
+                r"\b(search|click|think)\[([^\[\]]*)\]",
+                response or "",
+                re.IGNORECASE | re.DOTALL,
+            )
+            if command:
+                return f"{command.group(1).lower()}[{command.group(2).strip()}]"
         return self._parse_action(response)
 
     def _format_history(self, recent: list) -> str:

@@ -184,6 +184,42 @@ class WebShopDataset(BaseDataset):
     def create_env(self, task_id: int):
         return _Session(session=str(self._tasks[task_id]["session_idx"]))
 
+    def build_action_prompt(
+        self,
+        *,
+        task_goal: str,
+        skill_section: str,
+        observation: str,
+        admissible_actions: list[str],
+        step: int,
+        recent: list[tuple[str, str]],
+        history_window: int,
+    ) -> str:
+        """Use WebShop's native bracket-action protocol for generic agents.
+
+        ``BaseDataset`` deliberately targets ALFWorld and asks for XML action
+        tags.  WebShop accepts only ``search[...]``, ``click[...]`` and
+        ``think[...]``; keeping this override also protects SimpleAgent users
+        from receiving an incompatible instruction.
+        """
+        lines = [
+            "You are shopping in WebShop.",
+            f"Instruction: {task_goal}",
+            "Return exactly one native action and no XML tags:",
+            "search[keywords], click[button or product], or think[brief reasoning].",
+        ]
+        if skill_section and skill_section != "(none)":
+            lines.extend(["", "Relevant experience:", skill_section])
+        for prior_observation, prior_action in recent[-history_window:]:
+            lines.extend(["", f"Action: {prior_action}", f"Observation: {prior_observation}"])
+        lines.extend([
+            "",
+            f"Current observation: {observation}",
+            "Available action forms: " + ", ".join(admissible_actions),
+            "Action:",
+        ])
+        return "\n".join(lines)
+
     @staticmethod
     def _goal_from_fixed_observation(observation: str, session: str) -> str:
         """Extract a WebShop instruction from its fixed-session landing page."""
